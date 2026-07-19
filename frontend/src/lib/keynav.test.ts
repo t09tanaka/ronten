@@ -1,59 +1,91 @@
 import { describe, expect, it } from 'vitest'
-import { interpretKey } from './keynav'
+import { interpretKey, type KeyInput } from './keynav'
+
+function input(overrides: Partial<KeyInput> & Pick<KeyInput, 'key'>): KeyInput {
+  return {
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    isComposing: false,
+    targetTag: 'BODY',
+    targetEditable: false,
+    ...overrides,
+  }
+}
 
 describe('interpretKey', () => {
   it('maps j to move +1', () => {
-    expect(interpretKey('j', 'BODY', false)).toEqual({ type: 'move', delta: 1 })
+    expect(interpretKey(input({ key: 'j' }))).toEqual({ type: 'move', delta: 1 })
   })
 
   it('maps k to move -1', () => {
-    expect(interpretKey('k', 'BODY', false)).toEqual({ type: 'move', delta: -1 })
+    expect(interpretKey(input({ key: 'k' }))).toEqual({ type: 'move', delta: -1 })
   })
 
   it('maps a to verdict approve', () => {
-    expect(interpretKey('a', 'BODY', false)).toEqual({ type: 'verdict', verdict: 'approve' })
+    expect(interpretKey(input({ key: 'a' }))).toEqual({ type: 'verdict', verdict: 'approve' })
   })
 
   it('maps x to verdict request-changes', () => {
-    expect(interpretKey('x', 'BODY', false)).toEqual({
+    expect(interpretKey(input({ key: 'x' }))).toEqual({
       type: 'verdict',
       verdict: 'request-changes',
     })
   })
 
   it('maps c to verdict comment', () => {
-    expect(interpretKey('c', 'BODY', false)).toEqual({ type: 'verdict', verdict: 'comment' })
+    expect(interpretKey(input({ key: 'c' }))).toEqual({ type: 'verdict', verdict: 'comment' })
   })
 
   it('maps i to focus-comment', () => {
-    expect(interpretKey('i', 'BODY', false)).toEqual({ type: 'focus-comment' })
+    expect(interpretKey(input({ key: 'i' }))).toEqual({ type: 'focus-comment' })
   })
 
   it('maps Enter to confirm-submit', () => {
-    expect(interpretKey('Enter', 'BODY', false)).toEqual({ type: 'confirm-submit' })
+    expect(interpretKey(input({ key: 'Enter' }))).toEqual({ type: 'confirm-submit' })
   })
 
   it('returns null for an unknown key', () => {
-    expect(interpretKey('q', 'BODY', false)).toBeNull()
+    expect(interpretKey(input({ key: 'q' }))).toBeNull()
+  })
+
+  it('returns null for Cmd+C (copy must not become a verdict)', () => {
+    expect(interpretKey(input({ key: 'c', metaKey: true }))).toBeNull()
+  })
+
+  it('returns null for Ctrl+A (select-all must not become approve)', () => {
+    expect(interpretKey(input({ key: 'a', ctrlKey: true }))).toBeNull()
+  })
+
+  it('returns null for Cmd+X', () => {
+    expect(interpretKey(input({ key: 'x', metaKey: true }))).toBeNull()
+  })
+
+  it('returns null for Alt+x', () => {
+    expect(interpretKey(input({ key: 'x', altKey: true }))).toBeNull()
+  })
+
+  it('returns null while an IME composition is in progress', () => {
+    expect(interpretKey(input({ key: 'j', isComposing: true }))).toBeNull()
   })
 
   it('returns null for a binding key typed inside a TEXTAREA', () => {
-    expect(interpretKey('j', 'TEXTAREA', false)).toBeNull()
+    expect(interpretKey(input({ key: 'j', targetTag: 'TEXTAREA' }))).toBeNull()
   })
 
   it('returns null for a binding key typed inside an INPUT', () => {
-    expect(interpretKey('a', 'INPUT', false)).toBeNull()
+    expect(interpretKey(input({ key: 'a', targetTag: 'INPUT' }))).toBeNull()
   })
 
   it('returns null for a binding key typed inside a SELECT', () => {
-    expect(interpretKey('Enter', 'SELECT', false)).toBeNull()
+    expect(interpretKey(input({ key: 'Enter', targetTag: 'SELECT' }))).toBeNull()
   })
 
   it('returns null for a binding key typed inside a contenteditable element', () => {
-    expect(interpretKey('a', 'DIV', true)).toBeNull()
+    expect(interpretKey(input({ key: 'a', targetTag: 'DIV', targetEditable: true }))).toBeNull()
   })
 
   it('returns null for an unknown key even when not editable', () => {
-    expect(interpretKey('z', 'BODY', false)).toBeNull()
+    expect(interpretKey(input({ key: 'z' }))).toBeNull()
   })
 })
