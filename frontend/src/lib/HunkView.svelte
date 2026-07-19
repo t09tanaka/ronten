@@ -1,6 +1,7 @@
 <script lang="ts">
   import { rs } from './state.svelte'
   import CommentEditor from './CommentEditor.svelte'
+  import { highlightLine, langForPath } from './highlight'
   import type { Comment, ConcernView, DiffLine, FileDiff, Hunk, HunkRef, Side } from './types'
 
   const COLLAPSE_THRESHOLD = 200
@@ -22,6 +23,7 @@
   let { file, hunk, hunkRef, concernId, oncommentline }: Props = $props()
 
   const path = $derived(file.new_path ?? file.old_path)
+  const lang = $derived(langForPath(path))
   const comments = $derived(rs.draft.concerns[concernId]?.comments ?? [])
 
   // Mirrors lineClick's side/line selection without firing the click
@@ -129,7 +131,10 @@
               <td class="gutter new-gutter" onclick={() => lineClick(line)}
                 >{line.new_no ?? ''}</td
               >
-              <td class="content">{line.content}</td>
+              <!-- highlightLine always returns HTML-escaped markup (hljs
+                   escapes its input; the fallback path escapes explicitly),
+                   so agent-supplied diff content cannot inject HTML here. -->
+              <td class="content">{@html highlightLine(line.content, lang)}</td>
             </tr>
             {#if target}
               {#each commentsFor(target) as comment (comment)}

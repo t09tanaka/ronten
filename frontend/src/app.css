@@ -123,3 +123,65 @@ body {
   font-weight: 600;
   text-transform: uppercase;
 }
+
+/* Syntax highlighting (diff view). Colors derive exclusively from existing
+   tokens — shu is the reviewer's mark and never appears in syntax. The
+   spans are injected via {@html} in HunkView, so these rules live here
+   globally rather than in a component's scoped styles. */
+.hljs-keyword,
+.hljs-built_in,
+.hljs-selector-tag,
+.hljs-name {
+  color: var(--c-ai);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: var(--c-matsuba);
+}
+
+.hljs-number,
+.hljs-literal,
+.hljs-symbol,
+.hljs-meta,
+.hljs-attr,
+.hljs-attribute,
+.hljs-selector-class,
+.hljs-selector-id,
+.hljs-variable,
+.hljs-template-variable {
+  color: var(--c-odo);
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--c-ink-2);
+  font-style: italic;
+}
+
+.hljs-tag {
+  color: var(--c-ink-2);
+}
+
+.hljs-title,
+.hljs-section {
+  color: var(--c-ink);
+  font-weight: 600;
+}
+
+.hljs-type,
+.hljs-title.class_ {
+  color: var(--c-ai);
+  font-weight: 600;
+}
+
+.hljs-doctag,
+.hljs-strong {
+  font-weight: 600;
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
