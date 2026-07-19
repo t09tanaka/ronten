@@ -3,9 +3,9 @@
   import type { Verdict } from './types'
 
   const MARK_LABELS: Record<Verdict, string> = {
-    approve: 'Approved',
-    'request-changes': 'Changes requested',
-    comment: 'Commented',
+    approve: 'Verdict: Approve',
+    'request-changes': 'Verdict: Request changes',
+    comment: 'Verdict: Comment',
   }
 
   function verdictOf(id: string): Verdict | null {
@@ -33,12 +33,15 @@
             <span class="unmapped-tag">unmapped</span>
           {/if}
           {#if verdict}
-            <span
-              class="verdict-mark mark-{verdict}"
-              role="img"
-              aria-label={MARK_LABELS[verdict]}
-              title={MARK_LABELS[verdict]}
-            >
+            <!-- Keyed by verdict so the stamp animation replays when the
+                 verdict changes, not only on first review. -->
+            {#key verdict}
+              <span
+                class="verdict-mark mark-{verdict}"
+                role="img"
+                aria-label={MARK_LABELS[verdict]}
+                title={MARK_LABELS[verdict]}
+              >
               <svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true">
                 {#if verdict === 'approve'}
                   <path
@@ -67,7 +70,8 @@
                   />
                 {/if}
               </svg>
-            </span>
+              </span>
+            {/key}
           {/if}
         </span>
       </button>
@@ -79,9 +83,7 @@
   .concern-list {
     list-style: none;
     margin: 0;
-    /* Bottom clearance so the last row scrolls clear of the fixed
-       shortcut-hint footer. */
-    padding: 0 0 40px;
+    padding: 0;
   }
 
   .concern-row {

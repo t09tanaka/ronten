@@ -5,7 +5,7 @@
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
   import { interpretKey } from './lib/keynav'
-  import { scrollToGeneralComments } from './lib/scroll'
+  import { focusGeneralComments } from './lib/scroll'
   import type { Verdict } from './lib/types'
 
   onMount(() => {
@@ -102,8 +102,8 @@
         if (rs.selected) {
           rs.setVerdict(rs.selected.id, action.verdict)
           // A comment verdict means "I have something to write" — bring the
-          // comment box into view so the next action is right there.
-          if (action.verdict === 'comment') scrollToGeneralComments()
+          // comment box into view and focus it, like the `i` shortcut.
+          if (action.verdict === 'comment') focusGeneralComments()
         }
         break
       case 'focus-comment':
@@ -318,6 +318,10 @@
         </section>
       </main>
     </div>
+    <footer class="shortcut-hint">
+      <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> approve · <kbd>x</kbd> request changes ·
+      <kbd>c</kbd> comment · <kbd>Enter</kbd> submit · <kbd>i</kbd> comment box · <kbd>Esc</kbd> close
+    </footer>
   </div>
 
   {#if showSubmitConfirm}
@@ -373,11 +377,6 @@
       </div>
     </div>
   {/if}
-
-  <footer class="shortcut-hint">
-    <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> approve · <kbd>x</kbd> request changes ·
-    <kbd>c</kbd> comment · <kbd>Enter</kbd> submit · <kbd>i</kbd> comment box · <kbd>Esc</kbd> close
-  </footer>
 {/if}
 
 <style>
@@ -601,9 +600,7 @@
   .main-pane {
     flex: 1;
     overflow-y: auto;
-    /* Bottom clearance keeps the last controls (Add comment) from being
-       covered by the fixed shortcut-hint footer. */
-    padding: 16px 20px 56px;
+    padding: 16px 20px 24px;
     min-width: 0;
   }
 
@@ -847,19 +844,16 @@
     justify-content: flex-end;
   }
 
+  /* A normal layout row (not an overlay), so it can never cover content
+     regardless of wrapping, zoom, or font size. */
   .shortcut-hint {
-    position: fixed;
-    left: 0;
-    right: 0;
-    bottom: 0;
+    flex-shrink: 0;
     padding: 4px 16px;
     font-size: 11px;
     color: var(--c-ink-2);
-    background: rgba(252, 251, 248, 0.92);
+    background: var(--c-paper);
     border-top: 1px solid var(--c-rule);
     text-align: center;
-    pointer-events: none;
-    z-index: 5;
   }
 
   .shortcut-hint kbd {
