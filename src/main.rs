@@ -2,6 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod gitdiff;
 mod model;
 mod schema_cmd;
 
