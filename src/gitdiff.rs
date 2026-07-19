@@ -130,13 +130,18 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
             continue;
         };
 
-        if let Some(rest) = line.strip_prefix("--- ") {
-            file.old_path = parse_diff_path(rest);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("+++ ") {
-            file.new_path = parse_diff_path(rest);
-            continue;
+        // `--- `/`+++ ` file headers only appear before the first hunk of a
+        // file; once hunks have started, lines with these prefixes are hunk
+        // content (e.g. a removed line whose content starts with "-- ").
+        if file.hunks.is_empty() {
+            if let Some(rest) = line.strip_prefix("--- ") {
+                file.old_path = parse_diff_path(rest);
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("+++ ") {
+                file.new_path = parse_diff_path(rest);
+                continue;
+            }
         }
         if line.starts_with("new file mode") {
             file.status = FileStatus::Added;
@@ -371,5 +376,38 @@ index 1..2 100644
     fn multiple_files() {
         let combined = format!("{MODIFIED}{ADDED}");
         assert_eq!(parse_unified_diff(&combined).len(), 2);
+    }
+
+    #[test]
+    fn header_like_content_lines_are_not_misparsed() {
+        // A removed line whose content starts with "-- " renders as "--- ..."
+        // and an added line whose content starts with "++ " renders as
+        // "+++ ..." — these must be treated as hunk content, not file headers.
+        let d = "\
+diff --git a/query.sql b/query.sql
+index 1111111..2222222 100644
+--- a/query.sql
++++ b/query.sql
+@@ -1,3 +1,3 @@
+ SELECT 1;
+--- old comment
++++ new comment
+ SELECT 2;
+";
+        let files = parse_unified_diff(d);
+        assert_eq!(files.len(), 1);
+        let f = &files[0];
+        assert_eq!(f.old_path.as_deref(), Some("query.sql"));
+        assert_eq!(f.new_path.as_deref(), Some("query.sql"));
+        let h = &f.hunks[0];
+        assert_eq!(h.lines.len(), 4);
+        assert_eq!(h.lines[0].kind as u8, LineKind::Context as u8);
+        assert_eq!(h.lines[1].kind as u8, LineKind::Remove as u8);
+        assert_eq!(h.lines[1].content, "-- old comment");
+        assert_eq!(h.lines[2].kind as u8, LineKind::Add as u8);
+        assert_eq!(h.lines[2].content, "++ new comment");
+        assert_eq!(h.lines[3].kind as u8, LineKind::Context as u8);
+        assert_eq!(h.lines[3].old_no, Some(3));
+        assert_eq!(h.lines[3].new_no, Some(3));
     }
 }
