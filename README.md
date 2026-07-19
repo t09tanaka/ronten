@@ -216,7 +216,7 @@ src/
   mapping.rs     — hunk × location intersection, _unmapped synthesis, warnings
   session.rs     — session state (diff + concerns + draft)
   server.rs      — axum routes, token check, static assets
-  review.rs       — orchestration for `ronten review`
+  review.rs      — orchestration for `ronten review`
   demo.rs        — orchestration for `ronten demo` (embedded fixtures, no git)
   schema_cmd.rs  — `ronten schema`
   assets.rs      — embedded frontend static assets
