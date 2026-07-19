@@ -69,6 +69,15 @@ struct DemoArgs {
     no_open: bool,
 }
 
+fn run(cli: Cli) -> u8 {
+    match cli {
+        Cli::Review(_) | Cli::Schema(_) | Cli::Demo(_) => {
+            eprintln!("not implemented yet");
+            exitcode::INPUT
+        }
+    }
+}
+
 fn main() {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -82,11 +91,5 @@ fn main() {
             std::process::exit(0);
         }
     };
-    let code = match cli {
-        Cli::Review(_) | Cli::Schema(_) | Cli::Demo(_) => {
-            eprintln!("not implemented yet");
-            exitcode::INPUT
-        }
-    };
-    std::process::exit(code as i32);
+    std::process::exit(run(cli) as i32);
 }
