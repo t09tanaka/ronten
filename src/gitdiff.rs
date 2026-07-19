@@ -8,6 +8,8 @@ pub enum FileStatus {
     Deleted,
     Renamed,
     Binary,
+    #[serde(rename = "too-large")]
+    TooLarge,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -454,50 +456,527 @@ pub fn current_branch(root: &std::path::Path) -> String {
     }
 }
 
-/// Runs `git -C <root> -c core.quotepath=off diff <base>...HEAD --no-color
-/// --unified=3 --find-renames` and parses the result. Empty stdout on
-/// success is an empty vec. Non-zero exit with a stderr indicating an
-/// unrecognized revision is classified as `BadBase`; any other non-zero
-/// exit is `GitFailed`.
-///
-/// `-c core.quotepath=off` is required so that non-ASCII paths (e.g.
-/// Japanese filenames) are emitted verbatim in `diff --git`/`---`/`+++`
-/// lines rather than quoted and octal-escaped (git's default
-/// `core.quotepath=true` behavior), which would otherwise prevent the
-/// paths parsed here from matching concern locations in mapping.rs.
-pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<Vec<FileDiff>, GitError> {
-    let output = std::process::Command::new("git")
-        .env("LC_ALL", "C")
+/// Largest single blob that will be rendered inline. Files with a bigger
+/// blob on either side are reported as `FileStatus::TooLarge` with a warning.
+pub const MAX_FILE_BYTES: usize = 1_048_576;
+
+/// Total blob-content budget for one diff. Once exceeded, remaining files
+/// are reported as `FileStatus::TooLarge` with a warning rather than being
+/// silently truncated.
+pub const MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024;
+
+/// Result of [`compute_diff`]: the per-file diffs plus non-fatal warnings
+/// (e.g. files skipped because they exceed size limits).
+#[derive(Debug)]
+pub struct DiffOutput {
+    pub files: Vec<FileDiff>,
+    pub warnings: Vec<String>,
+}
+
+/// One record of `git diff-tree -r -z --raw` output.
+struct RawEntry {
+    old_mode: String,
+    new_mode: String,
+    old_oid: String,
+    new_oid: String,
+    status: char,
+    path: String,
+    path2: Option<String>,
+}
+
+/// How a raw entry will be rendered, decided before blob contents are fetched.
+enum Plan {
+    /// Gitlink (mode 160000) on either side: synthesize `Subproject commit`
+    /// lines; never `cat-file` the oid (it usually doesn't exist locally).
+    Submodule,
+    /// Identical blob oids on both sides (pure rename or mode-only change):
+    /// no hunks, no content needed.
+    NoContent,
+    /// Over a size limit: `FileStatus::TooLarge`, no hunks.
+    TooLarge,
+    /// Fetch both blobs and diff them.
+    Content,
+}
+
+/// Base `git` invocation for this module: `LC_ALL=C` for stable message
+/// parsing, and the diff-affecting environment variables removed. All
+/// commands used here are plumbing that ignores diff drivers anyway, but
+/// removing them is cheap defense in depth.
+fn git_cmd(root: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    cmd.env("LC_ALL", "C")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_DIFF_OPTS")
         .arg("-C")
-        .arg(root)
+        .arg(root);
+    cmd
+}
+
+fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output, GitError> {
+    git_cmd(root)
+        .args(args)
+        .output()
+        .map_err(|e| GitError::GitFailed(e.to_string()))
+}
+
+/// Resolves `<rev>^{commit}` to a full oid. On failure returns the stderr
+/// text (the caller decides whether that is `BadBase` or `GitFailed`).
+fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, String> {
+    let output = git_cmd(root)
         .args([
-            "-c",
-            "core.quotepath=off",
-            "diff",
-            &format!("{base}...HEAD"),
-            "--no-color",
-            "--unified=3",
-            "--find-renames",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{rev}^{{commit}}"),
         ])
         .output()
-        .map_err(|e| GitError::GitFailed(e.to_string()))?;
-
+        .map_err(|e| e.to_string())?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        if stderr.contains("unknown revision")
-            || stderr.contains("bad revision")
-            || stderr.contains("ambiguous argument")
-        {
-            return Err(GitError::BadBase(stderr));
+        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn is_zero_oid(oid: &str) -> bool {
+    !oid.is_empty() && oid.bytes().all(|b| b == b'0')
+}
+
+/// Parses `git diff-tree -r -z --raw` output:
+/// `:<oldmode> <newmode> <oldoid> <newoid> <status>\0<path>\0[<path2>\0]`.
+/// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
+fn parse_raw_z(bytes: &[u8]) -> Vec<RawEntry> {
+    let mut tokens = bytes.split(|&b| b == 0);
+    let mut entries = Vec::new();
+    while let Some(token) = tokens.next() {
+        if token.is_empty() {
+            continue;
         }
-        return Err(GitError::GitFailed(stderr));
+        let meta = String::from_utf8_lossy(token).to_string();
+        let Some(meta) = meta.strip_prefix(':') else {
+            continue;
+        };
+        let parts: Vec<&str> = meta.split(' ').collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let status = parts[4].chars().next().unwrap_or('M');
+        let Some(path_token) = tokens.next() else {
+            break;
+        };
+        let path = String::from_utf8_lossy(path_token).to_string();
+        let path2 = if matches!(status, 'R' | 'C') {
+            tokens
+                .next()
+                .map(|t| String::from_utf8_lossy(t).to_string())
+        } else {
+            None
+        };
+        entries.push(RawEntry {
+            old_mode: parts[0].to_string(),
+            new_mode: parts[1].to_string(),
+            old_oid: parts[2].to_string(),
+            new_oid: parts[3].to_string(),
+            status,
+            path,
+            path2,
+        });
+    }
+    entries
+}
+
+fn is_submodule(entry: &RawEntry) -> bool {
+    entry.old_mode == "160000" || entry.new_mode == "160000"
+}
+
+/// Path to show in user-facing warnings: the post-change path when present.
+fn display_path(entry: &RawEntry) -> &str {
+    entry.path2.as_deref().unwrap_or(&entry.path)
+}
+
+fn entry_paths(entry: &RawEntry) -> (Option<String>, Option<String>) {
+    match entry.status {
+        'A' => (None, Some(entry.path.clone())),
+        'D' => (Some(entry.path.clone()), None),
+        'R' | 'C' => (Some(entry.path.clone()), entry.path2.clone()),
+        _ => (Some(entry.path.clone()), Some(entry.path.clone())),
+    }
+}
+
+fn entry_status(entry: &RawEntry) -> FileStatus {
+    match entry.status {
+        'A' => FileStatus::Added,
+        'D' => FileStatus::Deleted,
+        'R' => FileStatus::Renamed,
+        _ => FileStatus::Modified,
+    }
+}
+
+/// Runs `git cat-file <flag>` feeding `input` (one oid per line) on stdin
+/// and returning raw stdout. Stdin is written from a helper thread so a
+/// large response can't deadlock against a full stdin pipe.
+fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec<u8>, GitError> {
+    use std::io::Write;
+    let mut child = git_cmd(root)
+        .args(["cat-file", flag])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let input = input.to_string();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let _ = writer.join();
+    if !output.status.success() {
+        return Err(GitError::GitFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Object sizes via `git cat-file --batch-check`. Oids reported `missing`
+/// are simply absent from the map (callers treat that as an error).
+fn blob_sizes(
+    root: &std::path::Path,
+    oids: &[String],
+) -> Result<std::collections::HashMap<String, usize>, GitError> {
+    let mut sizes = std::collections::HashMap::new();
+    if oids.is_empty() {
+        return Ok(sizes);
+    }
+    let mut input = oids.join("\n");
+    input.push('\n');
+    let out = cat_file_stdin(root, "--batch-check", &input)?;
+    for line in String::from_utf8_lossy(&out).lines() {
+        let parts: Vec<&str> = line.split(' ').collect();
+        if parts.len() == 3 {
+            if let Ok(size) = parts[2].parse() {
+                sizes.insert(parts[0].to_string(), size);
+            }
+        }
+    }
+    Ok(sizes)
+}
+
+/// Blob contents via `git cat-file --batch`: for each requested oid the
+/// response is `<oid> <type> <size>\n<content>\n`.
+fn blob_contents(
+    root: &std::path::Path,
+    oids: &[String],
+) -> Result<std::collections::HashMap<String, Vec<u8>>, GitError> {
+    let mut contents = std::collections::HashMap::new();
+    if oids.is_empty() {
+        return Ok(contents);
+    }
+    let mut input = oids.join("\n");
+    input.push('\n');
+    let buf = cat_file_stdin(root, "--batch", &input)?;
+    let mut pos = 0;
+    while pos < buf.len() {
+        let nl = buf[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .ok_or_else(|| GitError::GitFailed("truncated cat-file --batch output".to_string()))?;
+        let header = String::from_utf8_lossy(&buf[pos..pos + nl]).to_string();
+        pos += nl + 1;
+        let parts: Vec<&str> = header.split(' ').collect();
+        if parts.len() < 3 {
+            return Err(GitError::GitFailed(format!("git cat-file: {header}")));
+        }
+        let size: usize = parts[2]
+            .parse()
+            .map_err(|_| GitError::GitFailed(format!("git cat-file: {header}")))?;
+        if pos + size > buf.len() {
+            return Err(GitError::GitFailed(
+                "truncated cat-file --batch output".to_string(),
+            ));
+        }
+        contents.insert(parts[0].to_string(), buf[pos..pos + size].to_vec());
+        pos += size + 1; // skip content and the trailing newline
+    }
+    Ok(contents)
+}
+
+fn blob_of<'a>(contents: &'a std::collections::HashMap<String, Vec<u8>>, oid: &str) -> &'a [u8] {
+    if is_zero_oid(oid) {
+        &[]
+    } else {
+        contents.get(oid).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+}
+
+/// Same heuristic git uses: a NUL byte within the first 8000 bytes.
+fn is_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(8000)].contains(&0)
+}
+
+/// Synthesizes the `Subproject commit <oid>` hunk for a gitlink entry,
+/// mirroring what `git diff` prints for submodule pointer changes.
+fn submodule_diff(entry: &RawEntry) -> (FileStatus, Vec<Hunk>) {
+    let mut lines = Vec::new();
+    if entry.old_mode == "160000" && !is_zero_oid(&entry.old_oid) {
+        lines.push(DiffLine {
+            kind: LineKind::Remove,
+            content: format!("Subproject commit {}", entry.old_oid),
+            old_no: Some(1),
+            new_no: None,
+        });
+    }
+    if entry.new_mode == "160000" && !is_zero_oid(&entry.new_oid) {
+        lines.push(DiffLine {
+            kind: LineKind::Add,
+            content: format!("Subproject commit {}", entry.new_oid),
+            old_no: None,
+            new_no: Some(1),
+        });
+    }
+    let old_count = lines
+        .iter()
+        .filter(|l| matches!(l.kind, LineKind::Remove))
+        .count() as u32;
+    let new_count = lines
+        .iter()
+        .filter(|l| matches!(l.kind, LineKind::Add))
+        .count() as u32;
+    let hunk = Hunk {
+        old_start: if old_count > 0 { 1 } else { 0 },
+        old_count,
+        new_start: if new_count > 0 { 1 } else { 0 },
+        new_count,
+        section: String::new(),
+        lines,
+    };
+    (entry_status(entry), vec![hunk])
+}
+
+/// Line-based text diff with 3 lines of context, built directly from blob
+/// contents (never from `git diff` porcelain output).
+fn text_hunks(old: &str, new: &str) -> Vec<Hunk> {
+    use similar::ChangeTag;
+    let diff = similar::TextDiff::from_lines(old, new);
+    let mut hunks = Vec::new();
+    for group in diff.grouped_ops(3) {
+        let (Some(first), Some(last)) = (group.first(), group.last()) else {
+            continue;
+        };
+        let old_count = (last.old_range().end - first.old_range().start) as u32;
+        let new_count = (last.new_range().end - first.new_range().start) as u32;
+        // Unified-diff convention: a zero-count side reports the line
+        // *before* the change (0 when at the top of the file).
+        let old_start = first.old_range().start as u32 + u32::from(old_count > 0);
+        let new_start = first.new_range().start as u32 + u32::from(new_count > 0);
+        let mut lines = Vec::new();
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let (kind, old_no, new_no) = match change.tag() {
+                    ChangeTag::Equal => (
+                        LineKind::Context,
+                        change.old_index().map(|i| i as u32 + 1),
+                        change.new_index().map(|i| i as u32 + 1),
+                    ),
+                    ChangeTag::Delete => (
+                        LineKind::Remove,
+                        change.old_index().map(|i| i as u32 + 1),
+                        None,
+                    ),
+                    ChangeTag::Insert => (
+                        LineKind::Add,
+                        None,
+                        change.new_index().map(|i| i as u32 + 1),
+                    ),
+                };
+                let value = change.value();
+                let content = value.strip_suffix('\n').unwrap_or(value);
+                let content = content.strip_suffix('\r').unwrap_or(content);
+                lines.push(DiffLine {
+                    kind,
+                    content: content.to_string(),
+                    old_no,
+                    new_no,
+                });
+            }
+        }
+        hunks.push(Hunk {
+            old_start,
+            old_count,
+            new_start,
+            new_count,
+            section: String::new(),
+            lines,
+        });
+    }
+    hunks
+}
+
+/// Computes the diff of `<base>...HEAD` (merge-base semantics) directly
+/// from blob contents instead of parsing `git diff` text output.
+///
+/// This is deliberate: the reviewed agent shares the working environment,
+/// and `git diff` porcelain output can be manipulated from inside the repo
+/// via `.gitattributes` (`-diff` makes files render as "Binary files
+/// differ"), textconv/external diff drivers (arbitrary fake content), and
+/// config like `diff.noprefix` (breaks `a/`/`b/` parsing). This pipeline
+/// only uses plumbing that reads object data:
+///
+/// 1. `rev-parse --verify` both endpoints (bad base -> `BadBase`),
+/// 2. `merge-base` to reproduce `...` semantics,
+/// 3. `diff-tree -r -z -M --full-index --raw` for the file list (NUL
+///    delimited, so paths arrive verbatim regardless of `core.quotepath`),
+/// 4. `cat-file --batch-check` / `--batch` for blob sizes and contents,
+/// 5. an in-process line diff (`similar`) with 3 context lines.
+///
+/// None of these read `.gitattributes`, diff drivers, or diff config, so
+/// what the reviewer sees is derived from the actual committed blobs.
+pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, GitError> {
+    let base_oid = rev_parse_commit(root, base).map_err(GitError::BadBase)?;
+    let head_oid = rev_parse_commit(root, "HEAD").map_err(GitError::GitFailed)?;
+
+    let out = run_git(root, &["merge-base", &base_oid, &head_oid])?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(GitError::GitFailed(format!(
+            "no merge base between {base} and HEAD{}{stderr}",
+            if stderr.is_empty() { "" } else { ": " }
+        )));
+    }
+    let merge_base = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if merge_base.is_empty() {
+        return Err(GitError::GitFailed(format!(
+            "no merge base between {base} and HEAD"
+        )));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.is_empty() {
-        return Ok(Vec::new());
+    let out = run_git(
+        root,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "-M",
+            "--full-index",
+            "--raw",
+            &merge_base,
+            &head_oid,
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(GitError::GitFailed(
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ));
     }
-    Ok(parse_unified_diff(&stdout))
+    let entries = parse_raw_z(&out.stdout);
+
+    // Sizes first (--batch-check), so oversized blobs are never ingested.
+    let mut size_oids: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for entry in &entries {
+        if is_submodule(entry) || entry.old_oid == entry.new_oid {
+            continue;
+        }
+        for oid in [&entry.old_oid, &entry.new_oid] {
+            if !is_zero_oid(oid) && seen.insert(oid.clone()) {
+                size_oids.push(oid.clone());
+            }
+        }
+    }
+    let sizes = blob_sizes(root, &size_oids)?;
+
+    let mut warnings = Vec::new();
+    let mut plans = Vec::with_capacity(entries.len());
+    let mut need_oids: Vec<String> = Vec::new();
+    let mut need_seen = std::collections::HashSet::new();
+    let mut total_bytes: usize = 0;
+    for entry in &entries {
+        if is_submodule(entry) {
+            plans.push(Plan::Submodule);
+            continue;
+        }
+        if entry.old_oid == entry.new_oid {
+            // Pure rename (R100) or mode-only change: nothing to show.
+            plans.push(Plan::NoContent);
+            continue;
+        }
+        let mut file_bytes = 0usize;
+        let mut max_blob = 0usize;
+        for oid in [&entry.old_oid, &entry.new_oid] {
+            if is_zero_oid(oid) {
+                continue;
+            }
+            let Some(&size) = sizes.get(oid.as_str()) else {
+                return Err(GitError::GitFailed(format!(
+                    "object {oid} missing (file {})",
+                    display_path(entry)
+                )));
+            };
+            file_bytes += size;
+            max_blob = max_blob.max(size);
+        }
+        if max_blob > MAX_FILE_BYTES {
+            warnings.push(format!(
+                "file too large to display inline: {} ({max_blob} bytes)",
+                display_path(entry)
+            ));
+            plans.push(Plan::TooLarge);
+            continue;
+        }
+        if total_bytes + file_bytes > MAX_TOTAL_BYTES {
+            warnings.push(format!(
+                "diff too large: {} not displayed",
+                display_path(entry)
+            ));
+            plans.push(Plan::TooLarge);
+            continue;
+        }
+        total_bytes += file_bytes;
+        for oid in [&entry.old_oid, &entry.new_oid] {
+            if !is_zero_oid(oid) && need_seen.insert(oid.clone()) {
+                need_oids.push(oid.clone());
+            }
+        }
+        plans.push(Plan::Content);
+    }
+
+    let contents = blob_contents(root, &need_oids)?;
+
+    let mut files = Vec::with_capacity(entries.len());
+    for (entry, plan) in entries.iter().zip(&plans) {
+        let (old_path, new_path) = entry_paths(entry);
+        let (status, hunks) = match plan {
+            Plan::Submodule => submodule_diff(entry),
+            Plan::NoContent => (entry_status(entry), Vec::new()),
+            Plan::TooLarge => (FileStatus::TooLarge, Vec::new()),
+            Plan::Content => {
+                let old = blob_of(&contents, &entry.old_oid);
+                let new = blob_of(&contents, &entry.new_oid);
+                if is_binary(old) || is_binary(new) {
+                    (FileStatus::Binary, Vec::new())
+                } else {
+                    let old_text = String::from_utf8_lossy(old);
+                    let new_text = String::from_utf8_lossy(new);
+                    (entry_status(entry), text_hunks(&old_text, &new_text))
+                }
+            }
+        };
+        files.push(FileDiff {
+            old_path,
+            new_path,
+            status,
+            hunks,
+        });
+    }
+
+    Ok(DiffOutput { files, warnings })
 }
 
 #[cfg(test)]
@@ -535,13 +1014,68 @@ mod git_tests {
         td
     }
 
+    /// Repo with just a base commit on `main` and a `feature` branch
+    /// checked out, ready for per-test changes.
+    fn base_repo() -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "feature"]);
+        td
+    }
+
+    fn find<'a>(files: &'a [FileDiff], new_path: &str) -> &'a FileDiff {
+        files
+            .iter()
+            .find(|f| f.new_path.as_deref() == Some(new_path))
+            .unwrap_or_else(|| panic!("no file with new_path {new_path}"))
+    }
+
+    fn hunk_contents(f: &FileDiff) -> Vec<&str> {
+        f.hunks
+            .iter()
+            .flat_map(|h| h.lines.iter().map(|l| l.content.as_str()))
+            .collect()
+    }
+
     #[test]
     fn computes_diff_against_base() {
         let td = fixture_repo();
-        let files = compute_diff(td.path(), "main").unwrap();
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|f| f.new_path.as_deref() == Some("a.txt")));
-        assert!(files.iter().any(|f| f.status == FileStatus::Added));
+        let out = compute_diff(td.path(), "main").unwrap();
+        assert!(out.warnings.is_empty());
+        assert_eq!(out.files.len(), 2);
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.status, FileStatus::Modified);
+        let h = &a.hunks[0];
+        assert_eq!(
+            (h.old_start, h.old_count, h.new_start, h.new_count),
+            (1, 3, 1, 4)
+        );
+        let contents = hunk_contents(a);
+        assert!(contents.contains(&"TWO"));
+        assert!(contents.contains(&"four"));
+        // line numbering: "one" is context 1/1, "two" removed at old 2,
+        // "TWO" added at new 2.
+        assert_eq!(h.lines[0].old_no, Some(1));
+        assert_eq!(h.lines[0].new_no, Some(1));
+        let removed = h
+            .lines
+            .iter()
+            .find(|l| matches!(l.kind, LineKind::Remove))
+            .unwrap();
+        assert_eq!((removed.old_no, removed.new_no), (Some(2), None));
+        let b = find(&out.files, "b.txt");
+        assert_eq!(b.status, FileStatus::Added);
+        assert_eq!(b.old_path, None);
+        assert_eq!(b.hunks[0].old_start, 0);
+        assert_eq!(b.hunks[0].old_count, 0);
+        assert_eq!(b.hunks[0].new_start, 1);
+        assert_eq!(b.hunks[0].new_count, 1);
     }
 
     #[test]
@@ -556,8 +1090,9 @@ mod git_tests {
     #[test]
     fn empty_diff_returns_empty_vec() {
         let td = fixture_repo();
-        let files = compute_diff(td.path(), "HEAD").unwrap();
-        assert!(files.is_empty());
+        let out = compute_diff(td.path(), "HEAD").unwrap();
+        assert!(out.files.is_empty());
+        assert!(out.warnings.is_empty());
     }
 
     #[test]
@@ -567,30 +1102,247 @@ mod git_tests {
     }
 
     #[test]
-    fn non_ascii_path_is_not_quoted_or_escaped() {
-        // With git's default `core.quotepath=true`, a non-ASCII filename is
-        // emitted quoted and octal-escaped (e.g. `"\346\227\245..."`) in
-        // `diff --git`/`---`/`+++` lines. compute_diff must pass
-        // `-c core.quotepath=off` so the path comes through verbatim and can
-        // be matched against concern locations.
+    fn non_ascii_path_is_verbatim() {
+        // The raw entries are NUL-delimited (`diff-tree -z`), so non-ASCII
+        // paths must arrive verbatim regardless of `core.quotepath`.
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("日本語.txt"), "hello\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "add japanese file"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = out
+            .files
+            .iter()
+            .find(|f| f.status == FileStatus::Added)
+            .expect("added file present");
+        assert_eq!(f.new_path.as_deref(), Some("日本語.txt"));
+    }
+
+    #[test]
+    fn gitattributes_no_diff_cannot_hide_content() {
+        // An agent marking files `-diff` via a committed .gitattributes
+        // must not turn text changes into "Binary files differ".
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join(".gitattributes"), "*.txt -diff\n").unwrap();
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "sneaky"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.status, FileStatus::Modified);
+        assert!(hunk_contents(a).contains(&"TWO"));
+    }
+
+    #[test]
+    fn worktree_gitattributes_cannot_hide_content() {
+        // Same attack via an uncommitted .gitattributes in the working tree
+        // (git's diff machinery reads attributes from the worktree).
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+        std::fs::write(d.join(".gitattributes"), "*.txt -diff\n").unwrap();
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.status, FileStatus::Modified);
+        assert!(hunk_contents(a).contains(&"TWO"));
+    }
+
+    #[test]
+    fn textconv_driver_cannot_fake_content() {
+        // A repo-local textconv driver would let `git diff` display
+        // arbitrary fake content; the blob-based diff must show the real
+        // committed bytes.
+        let td = base_repo();
+        let d = td.path();
+        git(d, &["config", "diff.x.textconv", "printf FAKE #"]);
+        std::fs::write(d.join(".gitattributes"), "*.txt diff=x\n").unwrap();
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "sneaky"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        let contents = hunk_contents(a);
+        assert!(contents.contains(&"TWO"));
+        assert!(!contents.iter().any(|c| c.contains("FAKE")));
+    }
+
+    #[test]
+    fn external_diff_env_var_has_no_effect() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+
+        // Would make `git diff` invoke a bogus external command; compute_diff
+        // strips it (and uses plumbing that ignores it anyway).
+        std::env::set_var("GIT_EXTERNAL_DIFF", "/nonexistent/fake-diff");
+        let result = compute_diff(d, "main");
+        std::env::remove_var("GIT_EXTERNAL_DIFF");
+        let out = result.unwrap();
+        let a = find(&out.files, "a.txt");
+        assert!(hunk_contents(a).contains(&"TWO"));
+    }
+
+    #[test]
+    fn noprefix_config_cannot_break_paths() {
+        // `diff.noprefix=true` breaks parsers expecting `a/`/`b/` prefixes;
+        // the raw pipeline never sees prefixes at all.
+        let td = base_repo();
+        let d = td.path();
+        git(d, &["config", "diff.noprefix", "true"]);
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.old_path.as_deref(), Some("a.txt"));
+        assert_eq!(a.new_path.as_deref(), Some("a.txt"));
+        assert!(!a.hunks.is_empty());
+    }
+
+    #[test]
+    fn pure_rename_has_no_hunks() {
+        let td = base_repo();
+        let d = td.path();
+        git(d, &["mv", "a.txt", "renamed.txt"]);
+        git(d, &["commit", "-m", "rename"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        assert_eq!(out.files.len(), 1);
+        let f = &out.files[0];
+        assert_eq!(f.status, FileStatus::Renamed);
+        assert_eq!(f.old_path.as_deref(), Some("a.txt"));
+        assert_eq!(f.new_path.as_deref(), Some("renamed.txt"));
+        assert!(f.hunks.is_empty());
+    }
+
+    #[test]
+    fn rename_with_modification_has_hunks() {
         let td = tempfile::tempdir().unwrap();
         let d = td.path();
         git(d, &["init", "-b", "main"]);
         git(d, &["config", "user.email", "t@example.com"]);
         git(d, &["config", "user.name", "t"]);
-        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        let body: String = (1..=10).map(|i| format!("line{i}\n")).collect();
+        std::fs::write(d.join("a.txt"), &body).unwrap();
         git(d, &["add", "."]);
         git(d, &["commit", "-m", "base"]);
         git(d, &["checkout", "-b", "feature"]);
-        std::fs::write(d.join("日本語.txt"), "hello\n").unwrap();
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        std::fs::write(d.join("moved.txt"), body.replace("line5", "LINE5")).unwrap();
         git(d, &["add", "."]);
-        git(d, &["commit", "-m", "add japanese file"]);
+        git(d, &["commit", "-m", "rename and edit"]);
 
-        let files = compute_diff(d, "main").unwrap();
-        let f = files
-            .iter()
-            .find(|f| f.status == FileStatus::Added)
-            .expect("added file present");
-        assert_eq!(f.new_path.as_deref(), Some("日本語.txt"));
+        let out = compute_diff(d, "main").unwrap();
+        assert_eq!(out.files.len(), 1);
+        let f = &out.files[0];
+        assert_eq!(f.status, FileStatus::Renamed);
+        assert_eq!(f.old_path.as_deref(), Some("a.txt"));
+        assert_eq!(f.new_path.as_deref(), Some("moved.txt"));
+        let contents = hunk_contents(f);
+        assert!(contents.contains(&"LINE5"));
+    }
+
+    #[test]
+    fn submodule_pointer_change_is_visible() {
+        let td = base_repo();
+        let d = td.path();
+        let sha = "1111111111111111111111111111111111111111";
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},sub"),
+            ],
+        );
+        git(d, &["commit", "-m", "add submodule pointer"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "sub");
+        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!(f.hunks.len(), 1);
+        let lines = &f.hunks[0].lines;
+        assert_eq!(lines.len(), 1);
+        assert!(matches!(lines[0].kind, LineKind::Add));
+        assert_eq!(lines[0].content, format!("Subproject commit {sha}"));
+        assert_eq!(lines[0].new_no, Some(1));
+    }
+
+    #[test]
+    fn nul_bytes_are_binary() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("blob.bin"), b"\x00\x01\x02text").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "binary"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "blob.bin");
+        assert_eq!(f.status, FileStatus::Binary);
+        assert!(f.hunks.is_empty());
+    }
+
+    #[test]
+    fn oversized_file_is_too_large_with_warning() {
+        let td = base_repo();
+        let d = td.path();
+        let big = "x".repeat(MAX_FILE_BYTES + 1);
+        std::fs::write(d.join("big.txt"), &big).unwrap();
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "big"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let big_file = find(&out.files, "big.txt");
+        assert_eq!(big_file.status, FileStatus::TooLarge);
+        assert!(big_file.hunks.is_empty());
+        assert_eq!(out.warnings.len(), 1);
+        assert!(
+            out.warnings[0].contains("file too large to display inline: big.txt"),
+            "unexpected warning: {}",
+            out.warnings[0]
+        );
+        // Other files in the same diff are unaffected.
+        let a = find(&out.files, "a.txt");
+        assert!(hunk_contents(a).contains(&"TWO"));
+    }
+
+    #[test]
+    fn three_dot_semantics_use_merge_base() {
+        // Commits on the base branch after the fork point must not appear
+        // in the diff (`<base>...HEAD` semantics, not `<base>..HEAD`).
+        let td = fixture_repo();
+        let d = td.path();
+        git(d, &["checkout", "main"]);
+        std::fs::write(d.join("main_only.txt"), "main moved on\n").unwrap();
+        std::fs::write(d.join("a.txt"), "one\ntwo\nthree\nmain edit\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "main advances"]);
+        git(d, &["checkout", "feature"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        assert!(
+            !out.files
+                .iter()
+                .any(|f| f.new_path.as_deref() == Some("main_only.txt")),
+            "base-side commit leaked into the diff"
+        );
+        // The feature-side change is still reported relative to the fork.
+        let a = find(&out.files, "a.txt");
+        let contents = hunk_contents(a);
+        assert!(contents.contains(&"TWO"));
+        assert!(!contents.iter().any(|c| c.contains("main edit")));
     }
 }

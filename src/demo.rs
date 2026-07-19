@@ -46,7 +46,7 @@ pub async fn run(args: DemoArgs) -> u8 {
         token: token.clone(),
         started_at: chrono::Utc::now(),
         draft: Mutex::new(Draft::default()),
-        finished: Mutex::new(false),
+        finished: Mutex::new(None),
         outcome_tx: tx,
     });
 

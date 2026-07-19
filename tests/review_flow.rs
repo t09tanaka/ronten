@@ -120,6 +120,8 @@ fn approve_all_exits_0() {
     let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["decision"], "approve");
     assert_eq!(result["concerns"].as_array().unwrap().len(), 2);
+    // The result carries the contract version ronten processed.
+    assert_eq!(result["version"], 1);
 }
 
 #[test]
@@ -325,6 +327,26 @@ fn invalid_concerns_exits_10() {
             "main",
             "--concerns",
             "bad.json",
+            "--no-open",
+        ],
+    );
+    assert_eq!(code, 10);
+}
+
+#[test]
+fn unsupported_version_exits_10() {
+    let td = fixture_repo();
+    let v2 = r#"{"version":2,"concerns":[
+      {"id":"edit","title":"Edit a.txt","risk":"low","locations":[{"path":"a.txt"}]}]}"#;
+    std::fs::write(td.path().join("v2.json"), v2).unwrap();
+    let code = expect_exit(
+        td.path(),
+        &[
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "v2.json",
             "--no-open",
         ],
     );
