@@ -1,7 +1,7 @@
 <script lang="ts">
   import { rs } from './state.svelte'
   import HunkView from './HunkView.svelte'
-  import type { HunkRef, Side } from './types'
+  import type { FileStatus, HunkRef, Side } from './types'
 
   interface FileGroup {
     fileIndex: number
@@ -32,8 +32,19 @@
     return out
   })
 
-  function statusCardText(status: string): string {
-    return status === 'binary' ? 'Binary file changed' : 'File renamed (no content changes)'
+  function statusCardText(status: FileStatus): string {
+    switch (status) {
+      case 'binary':
+        return 'Binary file changed'
+      case 'renamed':
+        return 'File renamed (no content changes)'
+      case 'added':
+        return 'Empty file added'
+      case 'deleted':
+        return 'Empty file deleted'
+      default:
+        return 'File changed (no content changes)'
+    }
   }
 
   function handleCommentLine(info: CommentLineInfo): void {
