@@ -14,6 +14,7 @@
   let showSubmitConfirm = $state(false)
   let showAbortConfirm = $state(false)
   let generalCommentText = $state('')
+  let warningsDismissed = $state(false)
 
   const VERDICT_LABELS: Record<Verdict, string> = {
     approve: 'Approve',
@@ -227,6 +228,24 @@
         <button type="button" onclick={openAbortConfirm}>Abort review</button>
       </div>
     </header>
+    {#if rs.session.warnings.length > 0 && !warningsDismissed}
+      <div class="warnings-banner">
+        <div class="warnings-banner-header">
+          <span class="warnings-banner-title">Mapping warnings</span>
+          <button
+            type="button"
+            class="warnings-banner-dismiss"
+            aria-label="Dismiss warnings"
+            onclick={() => (warningsDismissed = true)}>×</button
+          >
+        </div>
+        <ul class="warnings-banner-list">
+          {#each rs.session.warnings as warning, i (i)}
+            <li>{warning}</li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
     <div class="body">
       <aside class="left-pane">
         <ConcernList />
@@ -339,7 +358,7 @@
   {/if}
 
   <footer class="shortcut-hint">
-    j/k select · a approve · x request changes · c comment · Enter submit
+    j/k select · a approve · x request changes · c comment · Enter submit · i comment box · Esc close
   </footer>
 {/if}
 
@@ -402,6 +421,56 @@
   .topbar-actions button:disabled {
     color: #999;
     cursor: not-allowed;
+  }
+
+  .warnings-banner {
+    padding: 8px 16px;
+    background: #fff4e5;
+    border-bottom: 1px solid #f0dca6;
+    color: #9a6700;
+  }
+
+  .warnings-banner-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+  }
+
+  .warnings-banner-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+  }
+
+  .warnings-banner-dismiss {
+    flex-shrink: 0;
+    border: none;
+    background: none;
+    color: #9a6700;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+  }
+
+  .warnings-banner-dismiss:hover {
+    color: #6b4900;
+  }
+
+  .warnings-banner-list {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .warnings-banner-list li {
+    font-size: 12px;
+    line-height: 1.4;
   }
 
   .body {
