@@ -43,7 +43,11 @@ async fn get_index(State(state): State<Arc<SessionState>>, Path(token): Path<Str
 }
 
 async fn get_asset(Path(path): Path<String>) -> Response {
-    assets::serve(&path)
+    // `path` is the wildcard suffix captured after `/assets/` (e.g.
+    // `index-BFyEZ69R.js`), but rust-embed keys files under the `assets/`
+    // prefix they live at in `frontend/dist` on disk, so the lookup key must
+    // be re-prefixed to match.
+    assets::serve(&format!("assets/{path}"))
 }
 
 async fn get_session(
@@ -435,5 +439,40 @@ index 1111111..2222222 100644
 
         let outcome = rx.recv().await.unwrap();
         assert!(matches!(outcome, Outcome::Aborted));
+    }
+
+    /// Regression test for the embedded-asset 404 bug: the wildcard
+    /// `/assets/{*path}` route was passing the captured suffix straight to
+    /// `assets::serve`, but `rust-embed` keys assets under an `assets/`
+    /// prefix (matching `frontend/dist/assets/...` on disk), so every real
+    /// asset request 404'd. Picks a real key from the embedded set rather
+    /// than hardcoding a filename, since Vite's output hash changes on every
+    /// build.
+    #[tokio::test]
+    async fn get_asset_serves_embedded_file() {
+        let key = assets::Asset::iter()
+            .find(|p| p.starts_with("assets/"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no embedded asset under 'assets/' found; expected build.rs to have run vite build"
+                )
+            });
+        let suffix = key.strip_prefix("assets/").unwrap();
+
+        let (state, _rx) = build_state();
+        let app = build_router(state);
+        let res = app
+            .oneshot(get(&format!("/assets/{suffix}")))
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let content_type = res
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .expect("expected a Content-Type header");
+        assert!(!content_type.is_empty());
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(!bytes.is_empty(), "expected non-empty asset body");
     }
 }
