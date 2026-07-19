@@ -21,7 +21,6 @@ use std::sync::Arc;
 pub enum Outcome {
     Submitted(ResultOutput),
     Aborted,
-    #[allow(dead_code)]
     Timeout,
 }
 

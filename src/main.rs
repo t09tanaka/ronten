@@ -1,11 +1,10 @@
 use clap::Parser;
-use std::path::PathBuf;
-use std::time::Duration;
 
 mod assets;
 mod gitdiff;
 mod mapping;
 mod model;
+mod review;
 mod schema_cmd;
 mod server;
 mod session;
@@ -27,36 +26,11 @@ pub mod exitcode {
 #[command(name = "ronten", version, about = "Concern-based PR review viewer")]
 enum Cli {
     /// Start a review session for `git diff <base>...HEAD`
-    Review(ReviewArgs),
+    Review(review::ReviewArgs),
     /// Print JSON Schemas for the input/output contract
     Schema(SchemaArgs),
     /// Launch the UI with an embedded sample session (no git required)
     Demo(DemoArgs),
-}
-
-#[derive(clap::Args, Debug)]
-struct ReviewArgs {
-    /// Base ref; the diff reviewed is `git diff <base>...HEAD`
-    #[arg(long)]
-    base: String,
-    /// Path to concerns JSON; use `-` for stdin
-    #[arg(long)]
-    concerns: String,
-    /// Also write the result JSON to this file
-    #[arg(long)]
-    out: Option<PathBuf>,
-    /// Bind port (0 = OS-assigned)
-    #[arg(long, default_value_t = 0)]
-    port: u16,
-    /// Do not open the browser automatically
-    #[arg(long)]
-    no_open: bool,
-    /// Session display name (defaults to current branch name)
-    #[arg(long)]
-    title: Option<String>,
-    /// Exit 3 if nothing is submitted within this duration (e.g. "30m")
-    #[arg(long, value_parser = humantime::parse_duration)]
-    timeout: Option<Duration>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -80,7 +54,10 @@ struct DemoArgs {
 fn run(cli: Cli) -> u8 {
     match cli {
         Cli::Schema(a) => schema_cmd::run(a.input, a.output),
-        Cli::Review(_) | Cli::Demo(_) => {
+        Cli::Review(a) => tokio::runtime::Runtime::new()
+            .expect("failed to start tokio runtime")
+            .block_on(review::run(a)),
+        Cli::Demo(_) => {
             eprintln!("not implemented yet");
             exitcode::INPUT
         }
