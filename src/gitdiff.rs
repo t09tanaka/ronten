@@ -156,7 +156,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
             file.new_path = Some(rest.to_string());
             continue;
         }
-        if line.starts_with("Binary files") && line.ends_with("differ")
+        if (line.starts_with("Binary files") && line.ends_with("differ"))
             || line.starts_with("GIT binary patch")
         {
             file.status = FileStatus::Binary;
@@ -192,7 +192,9 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
         let content = chars.as_str().to_string();
 
         match marker {
-            Some(' ') => {
+            // A genuinely blank line in a hunk still counts as context;
+            // `chars.next()` returns `None` for it rather than `Some(' ')`.
+            Some(' ') | None => {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Context,
                     content,
@@ -220,17 +222,9 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
                 });
                 new_no += 1;
             }
-            _ => {
-                // Empty line within a hunk (git emits a bare context line
-                // with no marker when the original line is empty).
-                hunk.lines.push(DiffLine {
-                    kind: LineKind::Context,
-                    content: String::new(),
-                    old_no: Some(old_no),
-                    new_no: Some(new_no),
-                });
-                old_no += 1;
-                new_no += 1;
+            Some(_) => {
+                // Unrecognized marker character; not a valid diff content
+                // line, so skip it rather than misclassifying it.
             }
         }
     }
