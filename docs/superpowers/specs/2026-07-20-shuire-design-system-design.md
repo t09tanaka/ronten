@@ -37,8 +37,8 @@ ronten 固有の個性がない。ronten（論点）の由来と「人間が а�
 - `src/lib/VerdictBar.svelte` — 判子風 3 連ボタン
 - `src/lib/DiffView.svelte` / `src/lib/HunkView.svelte` — diff 配色の統一
 - `src/lib/CommentEditor.svelte` — トークン参照化
-- `index.html` — フォント読み込み
-- `src/assets/fonts/` — woff2 とライセンスファイルの追加
+- `src/assets/fonts/` — woff2 とライセンスファイルの追加（読み込みは `app.css` の
+  `@font-face` で行うため `index.html` は変更しない）
 
 ## 非スコープ / 不変条件
 
