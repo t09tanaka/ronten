@@ -287,7 +287,7 @@
           <button
             type="button"
             onclick={addGeneralComment}
-            disabled={!generalCommentText.trim()}>Add</button
+            disabled={!generalCommentText.trim()}>Add comment</button
           >
           {#if rs.draft.general_comments.length > 0}
             <ul class="general-comment-list">
@@ -326,7 +326,7 @@
         {/if}
         <div class="modal-actions">
           <button type="button" onclick={confirmSubmit} disabled={rs.submitting}
-            >{rs.submitting ? 'Submitting…' : 'Confirm submit'}</button
+            >{rs.submitting ? 'Submitting…' : 'Submit review'}</button
           >
           <button
             type="button"
@@ -347,7 +347,7 @@
         {/if}
         <div class="modal-actions">
           <button type="button" onclick={confirmAbort} disabled={rs.submitting}
-            >{rs.submitting ? 'Aborting…' : 'Confirm abort'}</button
+            >{rs.submitting ? 'Aborting…' : 'Abort review'}</button
           >
           <button type="button" onclick={() => (showAbortConfirm = false)} disabled={rs.submitting}
             >Cancel</button
