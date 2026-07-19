@@ -454,16 +454,25 @@ pub fn current_branch(root: &std::path::Path) -> String {
     }
 }
 
-/// Runs `git -C <root> diff <base>...HEAD --no-color --unified=3 --find-renames`
-/// and parses the result. Empty stdout on success is an empty vec. Non-zero
-/// exit with a stderr indicating an unrecognized revision is classified as
-/// `BadBase`; any other non-zero exit is `GitFailed`.
+/// Runs `git -C <root> -c core.quotepath=off diff <base>...HEAD --no-color
+/// --unified=3 --find-renames` and parses the result. Empty stdout on
+/// success is an empty vec. Non-zero exit with a stderr indicating an
+/// unrecognized revision is classified as `BadBase`; any other non-zero
+/// exit is `GitFailed`.
+///
+/// `-c core.quotepath=off` is required so that non-ASCII paths (e.g.
+/// Japanese filenames) are emitted verbatim in `diff --git`/`---`/`+++`
+/// lines rather than quoted and octal-escaped (git's default
+/// `core.quotepath=true` behavior), which would otherwise prevent the
+/// paths parsed here from matching concern locations in mapping.rs.
 pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<Vec<FileDiff>, GitError> {
     let output = std::process::Command::new("git")
         .env("LC_ALL", "C")
         .arg("-C")
         .arg(root)
         .args([
+            "-c",
+            "core.quotepath=off",
             "diff",
             &format!("{base}...HEAD"),
             "--no-color",
@@ -555,5 +564,33 @@ mod git_tests {
     fn current_branch_name() {
         let td = fixture_repo();
         assert_eq!(current_branch(td.path()), "feature");
+    }
+
+    #[test]
+    fn non_ascii_path_is_not_quoted_or_escaped() {
+        // With git's default `core.quotepath=true`, a non-ASCII filename is
+        // emitted quoted and octal-escaped (e.g. `"\346\227\245..."`) in
+        // `diff --git`/`---`/`+++` lines. compute_diff must pass
+        // `-c core.quotepath=off` so the path comes through verbatim and can
+        // be matched against concern locations.
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "feature"]);
+        std::fs::write(d.join("日本語.txt"), "hello\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "add japanese file"]);
+
+        let files = compute_diff(d, "main").unwrap();
+        let f = files
+            .iter()
+            .find(|f| f.status == FileStatus::Added)
+            .expect("added file present");
+        assert_eq!(f.new_path.as_deref(), Some("日本語.txt"));
     }
 }
