@@ -1,6 +1,7 @@
 <script lang="ts">
   import { rs } from './state.svelte'
-  import type { ConcernView, DiffLine, FileDiff, Hunk, HunkRef, Side } from './types'
+  import CommentEditor from './CommentEditor.svelte'
+  import type { Comment, ConcernView, DiffLine, FileDiff, Hunk, HunkRef, Side } from './types'
 
   const COLLAPSE_THRESHOLD = 200
 
@@ -19,6 +20,38 @@
   }
 
   let { file, hunk, hunkRef, concernId, oncommentline }: Props = $props()
+
+  const path = $derived(file.new_path ?? file.old_path)
+  const comments = $derived(rs.draft.concerns[concernId]?.comments ?? [])
+
+  // Mirrors lineClick's side/line selection without firing the click
+  // callback, so saved comments and the pending editor can be located
+  // under the right row.
+  function lineTarget(line: DiffLine): CommentLineInfo | null {
+    if (!path) return null
+    if (line.kind === 'remove') {
+      return line.old_no != null ? { path, side: 'old', line: line.old_no } : null
+    }
+    return line.new_no != null ? { path, side: 'new', line: line.new_no } : null
+  }
+
+  function commentsFor(target: CommentLineInfo): Comment[] {
+    return comments.filter(
+      (c) => c.path === target.path && c.side === target.side && c.line === target.line,
+    )
+  }
+
+  function isPending(target: CommentLineInfo): boolean {
+    const p = rs.pendingCommentTarget
+    return p != null && p.path === target.path && p.side === target.side && p.line === target.line
+  }
+
+  function deleteComment(comment: Comment): void {
+    const all = rs.draft.concerns[concernId]?.comments
+    if (!all) return
+    const idx = all.indexOf(comment)
+    if (idx >= 0) rs.removeComment(concernId, idx)
+  }
 
   // Deliberately captures only the initial value: each hunk gets its own
   // component instance (keyed by hunkRef.hunk in DiffView), so this seeds
@@ -88,6 +121,7 @@
       <table class="hunk-table">
         <tbody>
           {#each hunk.lines as line, i (i)}
+            {@const target = lineTarget(line)}
             <tr class="line line-{line.kind}">
               <td class="gutter old-gutter" onclick={() => lineClick(line)}
                 >{line.old_no ?? ''}</td
@@ -97,6 +131,35 @@
               >
               <td class="content">{line.content}</td>
             </tr>
+            {#if target}
+              {#each commentsFor(target) as comment (comment)}
+                <tr class="comment-row">
+                  <td colspan="3">
+                    <div class="comment-block">
+                      <span class="comment-body">{comment.body}</span>
+                      <button
+                        type="button"
+                        class="comment-delete"
+                        aria-label="Delete comment"
+                        onclick={() => deleteComment(comment)}>×</button
+                      >
+                    </div>
+                  </td>
+                </tr>
+              {/each}
+              {#if isPending(target)}
+                <tr class="comment-editor-row">
+                  <td colspan="3">
+                    <CommentEditor
+                      {concernId}
+                      path={target.path}
+                      side={target.side}
+                      line={target.line}
+                    />
+                  </td>
+                </tr>
+              {/if}
+            {/if}
           {/each}
         </tbody>
       </table>
@@ -207,5 +270,50 @@
 
   .line-remove {
     background: #ffebe9;
+  }
+
+  .comment-row td {
+    padding: 0;
+    border: none;
+  }
+
+  .comment-block {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 12px;
+    margin: 2px 8px;
+    background: #fff8c5;
+    border: 1px solid #d4c76a;
+    border-radius: 4px;
+    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-size: 13px;
+    color: #333;
+    white-space: pre-wrap;
+  }
+
+  .comment-body {
+    flex: 1;
+  }
+
+  .comment-delete {
+    flex-shrink: 0;
+    border: none;
+    background: none;
+    color: #666;
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    padding: 0 2px;
+  }
+
+  .comment-delete:hover {
+    color: #cf222e;
+  }
+
+  .comment-editor-row td {
+    padding: 4px 8px;
+    border: none;
   }
 </style>

@@ -48,9 +48,14 @@
   }
 
   function handleCommentLine(info: CommentLineInfo): void {
-    // Wired up fully in Task 12; for now just log so the callback path is
-    // exercised end-to-end.
-    console.log('comment line', info)
+    // Clicking the same line again re-opens the same target — toggle it
+    // closed instead of leaving a no-op editor mount in place.
+    const p = rs.pendingCommentTarget
+    if (p != null && p.path === info.path && p.side === info.side && p.line === info.line) {
+      rs.pendingCommentTarget = null
+    } else {
+      rs.pendingCommentTarget = info
+    }
   }
 </script>
 
