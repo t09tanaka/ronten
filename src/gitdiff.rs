@@ -422,6 +422,7 @@ pub enum GitError {
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
 pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     let output = std::process::Command::new("git")
+        .env("LC_ALL", "C")
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|_| GitError::NotARepo)?;
@@ -436,6 +437,7 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
 /// on any failure returns `"review"`.
 pub fn current_branch(root: &std::path::Path) -> String {
     let output = std::process::Command::new("git")
+        .env("LC_ALL", "C")
         .current_dir(root)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output();
@@ -458,6 +460,7 @@ pub fn current_branch(root: &std::path::Path) -> String {
 /// `BadBase`; any other non-zero exit is `GitFailed`.
 pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<Vec<FileDiff>, GitError> {
     let output = std::process::Command::new("git")
+        .env("LC_ALL", "C")
         .arg("-C")
         .arg(root)
         .args([
