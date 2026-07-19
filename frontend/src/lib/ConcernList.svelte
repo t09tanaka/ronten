@@ -21,7 +21,11 @@
             <span class="unmapped-tag">unmapped</span>
           {/if}
           {#if rs.draft.concerns[concern.id]?.verdict}
-            <span class="reviewed-check" aria-label="reviewed" title="reviewed">✓</span>
+            <span class="reviewed-mark" role="img" aria-label="reviewed" title="reviewed">
+              <svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true">
+                <circle cx="7" cy="7" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" />
+              </svg>
+            </span>
           {/if}
         </span>
       </button>
@@ -42,31 +46,34 @@
     align-items: center;
     gap: 8px;
     width: 100%;
-    padding: 10px 14px;
+    padding: 10px 14px 10px 11px;
     border: none;
-    border-bottom: 1px solid #ececec;
+    border-bottom: 1px solid var(--c-rule);
+    border-left: 3px solid transparent;
     background: none;
     text-align: left;
     cursor: pointer;
     font: inherit;
     font-size: 13px;
-    color: #1a1a1a;
+    color: var(--c-ink);
   }
 
   .concern-row:hover {
-    background: #f0f1f3;
+    background: #efece3;
   }
 
   .concern-row.selected {
-    background: #e8f0fe;
+    border-left-color: var(--c-shu);
+    background: var(--c-ai-tint);
   }
 
   .concern-row.unmapped {
-    background: #fff9ee;
+    background: var(--c-odo-tint);
   }
 
   .concern-row.unmapped.selected {
-    background: #ffe9c7;
+    border-left-color: var(--c-shu);
+    background: #f3e7c4;
   }
 
   .concern-title {
@@ -82,8 +89,26 @@
     flex-shrink: 0;
   }
 
-  .reviewed-check {
-    color: #1a7f37;
-    font-weight: 700;
+  .reviewed-mark {
+    display: inline-flex;
+    color: var(--c-shu);
+    animation: stamp 120ms ease-out;
+  }
+
+  @keyframes stamp {
+    from {
+      transform: scale(1.25);
+      opacity: 0;
+    }
+    to {
+      transform: scale(1);
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .reviewed-mark {
+      animation: none;
+    }
   }
 </style>
