@@ -135,14 +135,16 @@
               {#each commentsFor(target) as comment (comment)}
                 <tr class="comment-row">
                   <td colspan="3">
-                    <div class="comment-block">
-                      <span class="comment-body">{comment.body}</span>
-                      <button
-                        type="button"
-                        class="comment-delete"
-                        aria-label="Delete comment"
-                        onclick={() => deleteComment(comment)}>×</button
-                      >
+                    <div class="inline-anchor">
+                      <div class="comment-block">
+                        <span class="comment-body">{comment.body}</span>
+                        <button
+                          type="button"
+                          class="comment-delete"
+                          aria-label="Delete comment"
+                          onclick={() => deleteComment(comment)}>×</button
+                        >
+                      </div>
                     </div>
                   </td>
                 </tr>
@@ -150,12 +152,14 @@
               {#if isPending(target)}
                 <tr class="comment-editor-row">
                   <td colspan="3">
-                    <CommentEditor
-                      {concernId}
-                      path={target.path}
-                      side={target.side}
-                      line={target.line}
-                    />
+                    <div class="inline-anchor">
+                      <CommentEditor
+                        {concernId}
+                        path={target.path}
+                        side={target.side}
+                        line={target.line}
+                      />
+                    </div>
                   </td>
                 </tr>
               {/if}
@@ -235,17 +239,30 @@
 
   .hunk-body {
     overflow-x: auto;
+    /* Inline-size container so .inline-anchor can size itself against the
+       visible scrollport width (100cqw) instead of the full table width. */
+    container-type: inline-size;
   }
 
   .hunk-table {
+    /* Shared fixed gutter width: the second sticky gutter's `left` offset
+       must equal the first gutter's width, so both come from one value. */
+    --gutter-w: 3.5em;
     width: 100%;
     border-collapse: collapse;
     font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
     font-size: 12.5px;
   }
 
+  /* Gutters stay pinned while the code content scrolls horizontally, so the
+     line numbers (the comment click targets) remain visible and clickable. */
   .gutter {
-    width: 1%;
+    position: sticky;
+    z-index: 1;
+    width: var(--gutter-w);
+    min-width: var(--gutter-w);
+    max-width: var(--gutter-w);
+    box-sizing: border-box;
     white-space: nowrap;
     padding: 0 8px;
     text-align: right;
@@ -255,8 +272,15 @@
     background: #fafbfc;
   }
 
-  .gutter:hover {
-    background: #eaeef2;
+  .old-gutter {
+    left: 0;
+  }
+
+  .new-gutter {
+    left: var(--gutter-w);
+    /* Separator drawn as an inset shadow instead of a border: with
+       border-collapse, collapsed borders don't travel with sticky cells. */
+    box-shadow: inset -1px 0 0 #e2e2e2;
   }
 
   .content {
@@ -272,9 +296,35 @@
     background: #ffebe9;
   }
 
+  /* Sticky cells need opaque backgrounds matching their row tint so the
+     scrolled code doesn't bleed through underneath them. */
+  .line-add .gutter {
+    background: #ccffd8;
+  }
+
+  .line-remove .gutter {
+    background: #ffd7d5;
+  }
+
+  .gutter:hover {
+    background: #eaeef2;
+  }
+
   .comment-row td {
     padding: 0;
     border: none;
+  }
+
+  /* Pins inline comment blocks and the comment editor to the visible
+     scrollport: sticky so they don't ride along with horizontal code
+     scroll, 100cqw (width of .hunk-body, the container) so they never
+     extend past the visible area even though the row spans the full
+     (possibly much wider) table. */
+  .inline-anchor {
+    position: sticky;
+    left: 0;
+    max-width: 100cqw;
+    box-sizing: border-box;
   }
 
   .comment-block {
@@ -313,7 +363,14 @@
   }
 
   .comment-editor-row td {
-    padding: 4px 8px;
+    padding: 0;
     border: none;
+  }
+
+  /* Horizontal inset lives on the anchor (inside its border-box width)
+     rather than on the td, so the anchor's natural position starts at the
+     scrollport's left edge and 100cqw spans exactly the visible width. */
+  .comment-editor-row .inline-anchor {
+    padding: 4px 8px;
   }
 </style>
