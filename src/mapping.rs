@@ -95,7 +95,11 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
                         Side::New => (h.new_start, h.new_count),
                         Side::Old => (h.old_start, h.old_count),
                     };
-                    let he = if hc == 0 { hs } else { hs + hc - 1 };
+                    let he = if hc == 0 {
+                        hs
+                    } else {
+                        hs.saturating_add(hc - 1)
+                    };
                     let ls = loc.start.unwrap_or(1);
                     let le = loc.end.unwrap_or(u32::MAX);
                     if hs.max(ls) <= he.min(le) {
@@ -111,7 +115,8 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
                 let range = match (loc.start, loc.end) {
                     (Some(s), Some(e)) => format!(":{s}-{e}"),
                     (Some(s), None) => format!(":{s}-"),
-                    _ => String::new(),
+                    (None, Some(e)) => format!(":-{e}"),
+                    (None, None) => String::new(),
                 };
                 warnings.push(format!("location matched no hunks: {}{}", loc.path, range));
             }
@@ -368,6 +373,77 @@ mod tests {
                 file: 1,
                 hunk: None
             }]
+        );
+    }
+
+    #[test]
+    fn end_only_location_warning_keeps_the_end_bound() {
+        // Hunk new range [100, 104]; an end-only location covering [1, 30]
+        // matches nothing and must warn with the end bound preserved.
+        let files = vec![fd("a.ts", &[(100, 5, 100, 5)])];
+        let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, Some(30))])]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert_eq!(mapping.concerns[0].hunks, Vec::new());
+        assert_eq!(
+            mapping.warnings,
+            vec!["location matched no hunks: a.ts:-30".to_string()]
+        );
+    }
+
+    #[test]
+    fn two_locations_matching_same_hunk_dedupe_to_one_ref() {
+        // Both locations overlap the single hunk's new range [1, 10];
+        // the concern must list the hunk exactly once.
+        let files = vec![fd("a.ts", &[(1, 10, 1, 10)])];
+        let inp = input(vec![concern(
+            "c1",
+            vec![
+                loc("a.ts", None, Some(1), Some(5)),
+                loc("a.ts", None, Some(4), Some(8)),
+            ],
+        )]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert_eq!(
+            mapping.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert!(mapping.warnings.is_empty());
+    }
+
+    #[test]
+    fn zero_count_hunk_collapses_to_start_on_matched_side() {
+        // Deletion hunk: new side has new_start=5, new_count=0, so its new
+        // range collapses to [5, 5]. A side-new location 5-5 matches; 6-6
+        // does not (the collapse changes the outcome: without it the range
+        // would be empty or extend past 5).
+        let files = vec![fd("a.ts", &[(5, 3, 5, 0)])];
+
+        let hit = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(5), Some(5))],
+        )]);
+        let mapping_hit = resolve_mapping(&files, &hit);
+        assert_eq!(
+            mapping_hit.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert!(mapping_hit.warnings.is_empty());
+
+        let miss = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(6), Some(6))],
+        )]);
+        let mapping_miss = resolve_mapping(&files, &miss);
+        assert_eq!(mapping_miss.concerns[0].hunks, Vec::new());
+        assert_eq!(
+            mapping_miss.warnings,
+            vec!["location matched no hunks: a.ts:6-6".to_string()]
         );
     }
 
