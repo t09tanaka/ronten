@@ -142,7 +142,7 @@ class ReviewState {
   }
 
   async submitReview(): Promise<void> {
-    if (this.#locked) return
+    if (this.#locked || this.submitting) return
     this.#cancelPendingSave()
     this.submitting = true
     this.submitError = null
@@ -163,7 +163,7 @@ class ReviewState {
   }
 
   async abortReview(): Promise<void> {
-    if (this.#locked) return
+    if (this.#locked || this.submitting) return
     this.#cancelPendingSave()
     this.submitting = true
     this.submitError = null
