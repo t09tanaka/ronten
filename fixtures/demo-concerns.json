@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "summary": "Adds bearer-token auth middleware and wires it into the widget routes.",
+  "concerns": [
+    {
+      "id": "auth-core",
+      "title": "New auth middleware",
+      "description": "Reviews the new `requireAuth` middleware: token validation, the public-path allowlist, and error handling on failure.",
+      "risk": "high",
+      "locations": [
+        { "path": "src/middleware/auth.ts" }
+      ]
+    },
+    {
+      "id": "route-wiring",
+      "title": "Widget routes now require auth",
+      "description": "The new middleware needs to be wired into the widget routes correctly.\n\n- `GET /widgets` and `POST /widgets` now require a valid bearer token\n- A new `DELETE /widgets/:id` route was added, also gated behind `requireAuth`\n- Check that the 401 response shape matches what the frontend expects",
+      "risk": "medium",
+      "locations": [
+        { "path": "src/routes/index.ts" }
+      ]
+    },
+    {
+      "id": "logging",
+      "title": "Auth failures are logged",
+      "description": "Failed auth attempts call `logRequest`; make sure the log line never ends up including the bearer token itself.",
+      "risk": "low",
+      "locations": [
+        { "path": "src/middleware/auth.ts", "side": "new", "start": 23, "end": 34 }
+      ]
+    }
+  ]
+}
