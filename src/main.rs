@@ -7,6 +7,8 @@ mod gitdiff;
 mod mapping;
 mod model;
 mod schema_cmd;
+mod server;
+mod session;
 
 pub mod exitcode {
     pub const APPROVED: u8 = 0;
