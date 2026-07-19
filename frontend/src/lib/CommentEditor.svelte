@@ -54,7 +54,7 @@
     font-family: inherit;
     font-size: 13px;
     padding: 8px;
-    border: 1px solid var(--c-rule);
+    border: 1px solid var(--c-control-border);
     border-radius: 4px;
     background: var(--c-paper);
     color: var(--c-ink);
@@ -100,7 +100,7 @@
   }
 
   .editor-cancel:hover {
-    background: #efece3;
+    background: var(--c-hover-wash);
     color: var(--c-ink);
   }
 </style>

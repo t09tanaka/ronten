@@ -25,7 +25,7 @@
   --c-paper: #fcfbf8;
   --c-panel: #f6f4ee;
   --c-ink: #211f1c;
-  --c-ink-2: #6e6a61;
+  --c-ink-2: #615d54;
   --c-ink-3: #9b968a;
   --c-rule: #e5e1d6;
 
@@ -33,7 +33,7 @@
   --c-shu: #b93d1e;
   --c-matsuba: #42704e;
   --c-ai: #2e4c66;
-  --c-odo: #9a6700;
+  --c-odo: #8a5c00;
 
   /* 淡色トーン */
   --c-shu-tint: #f9ece7;
@@ -42,8 +42,14 @@
   --c-matsuba-tint-2: #dde9dd;
   --c-ai-tint: #eaf0f5;
   --c-odo-tint: #fbf3e0;
+  --c-odo-tint-2: #f3e7c4;
   --c-neutral-tint: #eceae1;
   --c-gutter: #faf8f2;
+
+  /* 状態・境界の派生色 */
+  --c-hover-wash: #efece3;
+  --c-ai-border: #cfdce8;
+  --c-control-border: #c4beaf;
 
   /* 書体 */
   --font-display: 'Shippori Mincho', 'Hiragino Mincho ProN', 'Yu Mincho', Georgia, serif;

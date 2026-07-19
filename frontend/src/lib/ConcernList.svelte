@@ -59,7 +59,7 @@
   }
 
   .concern-row:hover {
-    background: #efece3;
+    background: var(--c-hover-wash);
   }
 
   .concern-row.selected {
@@ -73,7 +73,7 @@
 
   .concern-row.unmapped.selected {
     border-left-color: var(--c-shu);
-    background: #f3e7c4;
+    background: var(--c-odo-tint-2);
   }
 
   .concern-title {

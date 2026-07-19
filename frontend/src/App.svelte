@@ -354,7 +354,7 @@
           <p class="modal-error">{rs.submitError}</p>
         {/if}
         <div class="modal-actions">
-          <button type="button" class="btn-primary" onclick={confirmAbort} disabled={rs.submitting}
+          <button type="button" class="btn-danger" onclick={confirmAbort} disabled={rs.submitting}
             >{rs.submitting ? 'Aborting…' : 'Abort review'}</button
           >
           <button
@@ -476,7 +476,7 @@
   }
 
   .btn-ghost:hover:not(:disabled) {
-    background: #efece3;
+    background: var(--c-hover-wash);
     color: var(--c-ink);
   }
 
@@ -503,6 +503,28 @@
   .btn-outline:disabled {
     border-color: var(--c-rule);
     color: var(--c-ink-3);
+    cursor: not-allowed;
+  }
+
+  /* Destructive confirm (abort): shu outline, never filled — the filled
+     shu treatment is reserved for Submit alone. */
+  .btn-danger {
+    padding: 6px 14px;
+    border: 1px solid var(--c-shu);
+    border-radius: 3px;
+    background: var(--c-paper);
+    color: var(--c-shu);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .btn-danger:hover:not(:disabled) {
+    background: var(--c-shu-tint);
+  }
+
+  .btn-danger:disabled {
+    opacity: 0.6;
     cursor: not-allowed;
   }
 
@@ -643,7 +665,7 @@
     font-size: 13px;
     color: var(--c-ink);
     background: var(--c-ai-tint);
-    border: 1px solid #cfdce8;
+    border: 1px solid var(--c-ai-border);
     border-radius: 4px;
     padding: 6px 10px;
   }
@@ -675,7 +697,7 @@
     font-family: inherit;
     font-size: 13px;
     padding: 8px;
-    border: 1px solid var(--c-rule);
+    border: 1px solid var(--c-control-border);
     border-radius: 4px;
     background: var(--c-paper);
     color: var(--c-ink);

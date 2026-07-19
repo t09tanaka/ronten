@@ -9,7 +9,8 @@ UI を追加・変更するときは必ずここのトークンと規則から�
 ## 1. カラートークン
 
 すべて `frontend/src/app.css` の `:root` に CSS カスタムプロパティとして定義する。
-生の hex をコンポーネント内に直書きしない。
+複数箇所で使う色は必ずトークン化する。コンポーネント内の生 hex は、1 箇所でしか
+使わない状態派生色（hover の濃色・無効背景・警告枠など）と `#fff` のみ許す。
 
 ### 基調色（紙と墨）
 
@@ -18,8 +19,8 @@ UI を追加・変更するときは必ずここのトークンと規則から�
 | 紙 kami | `--c-paper` | `#FCFBF8` | メイン背景 |
 | 半紙 hanshi | `--c-panel` | `#F6F4EE` | サイドバー・パネル・ヘッダー背景 |
 | 墨 sumi | `--c-ink` | `#211F1C` | 本文テキスト |
-| 薄墨 usuzumi | `--c-ink-2` | `#6E6A61` | 補助テキスト・メタ情報 |
-| 白鼠 shironezu | `--c-ink-3` | `#9B968A` | 行番号・無効状態の文字 |
+| 薄墨 usuzumi | `--c-ink-2` | `#615D54` | 補助テキスト・メタ情報・行番号・diff メタ |
+| 白鼠 shironezu | `--c-ink-3` | `#9B968A` | 無効状態の文字（無効状態のみ。通常文字には使わない） |
 | 罫 kei | `--c-rule` | `#E5E1D6` | 罫線・境界（1px ヘアライン） |
 
 ### 意味色（判定の三色 + 警告）
@@ -29,7 +30,7 @@ UI を追加・変更するときは必ずここのトークンと規則から�
 | 朱 shu | `--c-shu` | `#B93D1E` | request changes・落款印・Submit・削除行 |
 | 松葉 matsuba | `--c-matsuba` | `#42704E` | approve・追加行 |
 | 藍 ai | `--c-ai` | `#2E4C66` | comment・リンク・情報 |
-| 黄土 ōdo | `--c-odo` | `#9A6700` | unmapped・mapping warning |
+| 黄土 ōdo | `--c-odo` | `#8A5C00` | unmapped・mapping warning |
 
 ### 淡色トーン（背景用ティント）
 
@@ -43,8 +44,17 @@ UI を追加・変更するときは必ずここのトークンと規則から�
 | `--c-matsuba-tint-2` | `#DDE9DD` | 追加行ガター |
 | `--c-ai-tint` | `#EAF0F5` | comment 確定時背景・選択行 |
 | `--c-odo-tint` | `#FBF3E0` | unmapped 背景・警告バナー |
+| `--c-odo-tint-2` | `#F3E7C4` | unmapped 論点の選択時背景 |
 | `--c-neutral-tint` | `#ECEAE1` | low リスクバッジ・ファイルステータス背景 |
 | `--c-gutter` | `#FAF8F2` | diff ガター基調背景 |
+
+### 状態・境界の派生色
+
+| 変数 | 値 | 用途 |
+|---|---|---|
+| `--c-hover-wash` | `#EFECE3` | ゴースト要素・リスト行の hover 背景 |
+| `--c-ai-border` | `#CFDCE8` | コメント面（藍系）の枠線 |
+| `--c-control-border` | `#C4BEAF` | textarea 等フォーム部品の境界（罫より 1 段濃い） |
 
 ### 使用規則
 
@@ -61,7 +71,8 @@ UI を追加・変更するときは必ずここのトークンと規則から�
 | 本文 / UI | `-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Kaku Gothic ProN', Helvetica, Arial, sans-serif` | 説明文・ボタン・リスト |
 | コード | `ui-monospace, 'SF Mono', Menlo, Consolas, monospace` | diff・パス・hunk ヘッダー |
 
-- Shippori Mincho は Latin サブセット woff2（OFL）を `frontend/src/assets/fonts/` に同梱し、バイナリに埋め込む。ネットワークからフォントを読み込まない
+- Shippori Mincho は Latin サブセット woff2（OFL）を `frontend/src/assets/fonts/` に同梱し、バイナリに埋め込む。ネットワークからフォントを読み込まない。OFL ライセンス全文は
+  `frontend/public/shippori-mincho-OFL.txt` として配布物（埋め込みアセット）に含める
 - 見出しは明朝、それ以外はサンセリフ。明朝を本文に使わない（可読性優先）
 
 ### 型スケール
@@ -86,11 +97,13 @@ UI を追加・変更するときは必ずここのトークンと規則から�
 ## 4. コンポーネント規則
 
 - **選択中の論点行**: 左に 3px の朱縦罫（校閲者の欄外マーク）+ `--c-ai-tint` 背景。
-  unmapped 論点の選択時は背景を `#F3E7C4`（黄土の濃淡）にする
+  unmapped 論点の選択時は背景を `--c-odo-tint-2` にする
 - **判定バー**: 3 連ボタン。未確定はヘアライン枠 + 紙背景、確定時はその意味色の淡色背景 + 意味色の枠と文字
 - **Submit ボタン**: 朱の塗り（白文字）。UI で唯一の塗りつぶし主要アクション。
   無効時は `#E9E6DD` 背景 + 白鼠（`--c-ink-3`）文字
-- **Abort・Cancel**: ヘアライン枠のゴーストボタン
+- **Abort（最終確認）**: 朱のアウトライン（`--c-shu` の枠と文字、塗りは使わない。
+  塗りつぶしは Submit 専用）
+- **Cancel・Abort（トップバー）**: ヘアライン枠のゴーストボタン
 - **リスクバッジ**: high=朱 / medium=黄土 / low=薄墨 の淡色背景 + 意味色文字（現行踏襲、トークン参照に置換）
 - **罫線**: すべて 1px `--c-rule`。影は原則使わずモーダルのみ（`0 8px 30px rgba(33,31,28,.18)`）
 - **角丸**: ボタン・バッジ 3–4px、パネル・モーダル 6px。大きい角丸を使わない

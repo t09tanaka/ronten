@@ -39,4 +39,12 @@ mod tests {
     fn index_html_is_embedded() {
         assert!(Asset::get("index.html").is_some());
     }
+
+    // The bundled Shippori Mincho subsets are OFL-licensed; the license text
+    // must ship with the font in every distribution, including the single
+    // self-contained binary.
+    #[test]
+    fn font_license_is_embedded() {
+        assert!(Asset::get("shippori-mincho-OFL.txt").is_some());
+    }
 }

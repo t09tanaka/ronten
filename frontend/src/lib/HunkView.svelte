@@ -188,7 +188,7 @@
     gap: 10px;
     padding: 4px 10px;
     background: var(--c-panel);
-    color: var(--c-ink-3);
+    color: var(--c-ink-2);
     font-family: var(--font-mono);
     font-size: 12px;
     border-bottom: 1px solid var(--c-rule);
@@ -196,11 +196,11 @@
   }
 
   .hunk-range {
-    color: var(--c-ink-3);
+    color: var(--c-ink-2);
   }
 
   .hunk-section {
-    color: var(--c-ink-3);
+    color: var(--c-ink-2);
   }
 
   .shared-badge {
@@ -266,7 +266,7 @@
     white-space: nowrap;
     padding: 0 8px;
     text-align: right;
-    color: var(--c-ink-3);
+    color: var(--c-ink-2);
     user-select: none;
     cursor: pointer;
     background: var(--c-gutter);
@@ -335,7 +335,7 @@
     padding: 8px 12px;
     margin: 2px 8px;
     background: var(--c-ai-tint);
-    border: 1px solid #cfdce8;
+    border: 1px solid var(--c-ai-border);
     border-radius: 4px;
     font-family: var(--font-body);
     font-size: 13px;
