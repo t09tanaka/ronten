@@ -210,10 +210,13 @@
   <div class="app">
     <header class="topbar">
       <div class="topbar-title">
-        <h1>{rs.session.title}</h1>
-        {#if rs.session.summary}
-          <p class="summary">{rs.session.summary}</p>
-        {/if}
+        <span class="seal" aria-hidden="true">論</span>
+        <div class="topbar-text">
+          <h1>{rs.session.title}</h1>
+          {#if rs.session.summary}
+            <p class="summary">{rs.session.summary}</p>
+          {/if}
+        </div>
       </div>
       <div class="topbar-actions">
         <span class="reviewed-counter"
@@ -221,11 +224,12 @@
         >
         <button
           type="button"
+          class="btn-primary"
           disabled={!rs.allReviewed}
           title={submitTitle}
           onclick={openSubmitConfirm}>Submit review</button
         >
-        <button type="button" onclick={openAbortConfirm}>Abort review</button>
+        <button type="button" class="btn-ghost" onclick={openAbortConfirm}>Abort review</button>
       </div>
     </header>
     {#if rs.session.warnings.length > 0 && !warningsDismissed}
@@ -286,6 +290,7 @@
           ></textarea>
           <button
             type="button"
+            class="btn-outline"
             onclick={addGeneralComment}
             disabled={!generalCommentText.trim()}>Add comment</button
           >
@@ -317,7 +322,9 @@
           {#each rs.session.concerns as c (c.id)}
             <li>
               <span class="vs-title">{c.title}</span>
-              <span class="vs-verdict">{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span>
+              <span class="vs-verdict vs-{rs.draft.concerns[c.id]?.verdict ?? 'none'}"
+                >{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span
+              >
             </li>
           {/each}
         </ul>
@@ -325,11 +332,12 @@
           <p class="modal-error">{rs.submitError}</p>
         {/if}
         <div class="modal-actions">
-          <button type="button" onclick={confirmSubmit} disabled={rs.submitting}
+          <button type="button" class="btn-primary" onclick={confirmSubmit} disabled={rs.submitting}
             >{rs.submitting ? 'Submitting…' : 'Submit review'}</button
           >
           <button
             type="button"
+            class="btn-ghost"
             onclick={() => (showSubmitConfirm = false)}
             disabled={rs.submitting}>Cancel</button
           >
@@ -346,11 +354,14 @@
           <p class="modal-error">{rs.submitError}</p>
         {/if}
         <div class="modal-actions">
-          <button type="button" onclick={confirmAbort} disabled={rs.submitting}
+          <button type="button" class="btn-primary" onclick={confirmAbort} disabled={rs.submitting}
             >{rs.submitting ? 'Aborting…' : 'Abort review'}</button
           >
-          <button type="button" onclick={() => (showAbortConfirm = false)} disabled={rs.submitting}
-            >Cancel</button
+          <button
+            type="button"
+            class="btn-ghost"
+            onclick={() => (showAbortConfirm = false)}
+            disabled={rs.submitting}>Cancel</button
           >
         </div>
       </div>
@@ -358,7 +369,8 @@
   {/if}
 
   <footer class="shortcut-hint">
-    j/k select · a approve · x request changes · c comment · Enter submit · i comment box · Esc close
+    <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> approve · <kbd>x</kbd> request changes ·
+    <kbd>c</kbd> comment · <kbd>Enter</kbd> submit · <kbd>i</kbd> comment box · <kbd>Esc</kbd> close
   </footer>
 {/if}
 
@@ -375,20 +387,45 @@
     align-items: center;
     gap: 16px;
     padding: 10px 16px;
-    border-bottom: 1px solid #e2e2e2;
-    background: #fafafa;
+    border-bottom: 1px solid var(--c-rule);
+    background: var(--c-panel);
     flex-wrap: wrap;
   }
 
-  .topbar-title h1 {
-    margin: 0;
-    font-size: 16px;
+  .topbar-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
   }
 
-  .topbar-title .summary {
+  .seal {
+    flex-shrink: 0;
+    width: 28px;
+    height: 28px;
+    border-radius: 2px;
+    background: var(--c-shu);
+    color: var(--c-paper);
+    font-family: var(--font-display);
+    font-size: 16px;
+    font-weight: 600;
+    display: grid;
+    place-items: center;
+    user-select: none;
+  }
+
+  .topbar-text h1 {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .topbar-text .summary {
     margin: 2px 0 0;
     font-size: 12px;
-    color: #666;
+    color: var(--c-ink-2);
     max-width: 60ch;
   }
 
@@ -400,34 +437,80 @@
 
   .reviewed-counter {
     font-size: 13px;
-    color: #444;
+    color: var(--c-ink-2);
     font-variant-numeric: tabular-nums;
   }
 
-  .topbar-actions button {
-    padding: 6px 12px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background: #fff;
+  .btn-primary {
+    padding: 6px 14px;
+    border: 1px solid var(--c-shu);
+    border-radius: 3px;
+    background: var(--c-shu);
+    color: #fff;
     font-size: 13px;
-    color: #333;
+    font-family: inherit;
     cursor: pointer;
   }
 
-  .topbar-actions button:hover:not(:disabled) {
-    background: #f0f1f3;
+  .btn-primary:hover:not(:disabled) {
+    background: #a83619;
+    border-color: #a83619;
   }
 
-  .topbar-actions button:disabled {
-    color: #999;
+  .btn-primary:disabled {
+    background: #e9e6dd;
+    border-color: #e9e6dd;
+    color: var(--c-ink-3);
+    cursor: not-allowed;
+  }
+
+  .btn-ghost {
+    padding: 6px 14px;
+    border: 1px solid var(--c-rule);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--c-ink-2);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .btn-ghost:hover:not(:disabled) {
+    background: #efece3;
+    color: var(--c-ink);
+  }
+
+  .btn-ghost:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .btn-outline {
+    padding: 6px 14px;
+    border: 1px solid var(--c-ai);
+    border-radius: 3px;
+    background: var(--c-paper);
+    color: var(--c-ai);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .btn-outline:hover:not(:disabled) {
+    background: var(--c-ai-tint);
+  }
+
+  .btn-outline:disabled {
+    border-color: var(--c-rule);
+    color: var(--c-ink-3);
     cursor: not-allowed;
   }
 
   .warnings-banner {
     padding: 8px 16px;
-    background: #fff4e5;
-    border-bottom: 1px solid #f0dca6;
-    color: #9a6700;
+    background: var(--c-odo-tint);
+    border-bottom: 1px solid #ead9ab;
+    color: var(--c-odo);
   }
 
   .warnings-banner-header {
@@ -441,14 +524,14 @@
     font-size: 12px;
     font-weight: 700;
     text-transform: uppercase;
-    letter-spacing: 0.02em;
+    letter-spacing: 0.04em;
   }
 
   .warnings-banner-dismiss {
     flex-shrink: 0;
     border: none;
     background: none;
-    color: #9a6700;
+    color: var(--c-odo);
     cursor: pointer;
     font-size: 14px;
     line-height: 1;
@@ -482,9 +565,9 @@
   .left-pane {
     width: 280px;
     flex: 0 0 280px;
-    border-right: 1px solid #e2e2e2;
+    border-right: 1px solid var(--c-rule);
     overflow-y: auto;
-    background: #fafafa;
+    background: var(--c-panel);
   }
 
   .main-pane {
@@ -503,13 +586,15 @@
 
   .concern-header h2 {
     margin: 0;
-    font-size: 18px;
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 600;
   }
 
   .concern-description {
     font-size: 14px;
-    line-height: 1.5;
-    color: #333;
+    line-height: 1.55;
+    color: var(--c-ink);
     margin-bottom: 16px;
     max-width: 80ch;
   }
@@ -524,15 +609,16 @@
   }
 
   .concern-description :global(code) {
-    background: #f0f0f0;
+    background: var(--c-neutral-tint);
     padding: 1px 4px;
     border-radius: 3px;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 13px;
   }
 
   .concern-description :global(pre) {
-    background: #f6f8fa;
+    background: var(--c-panel);
+    border: 1px solid var(--c-rule);
     padding: 10px;
     border-radius: 4px;
     overflow-x: auto;
@@ -541,6 +627,7 @@
   .concern-description :global(pre code) {
     background: none;
     padding: 0;
+    border: none;
   }
 
   .concern-comment-list {
@@ -554,30 +641,32 @@
 
   .concern-comment-list li {
     font-size: 13px;
-    color: #333;
-    background: #fff8c5;
-    border: 1px solid #d4c76a;
+    color: var(--c-ink);
+    background: var(--c-ai-tint);
+    border: 1px solid #cfdce8;
     border-radius: 4px;
     padding: 6px 10px;
   }
 
   .comment-loc {
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
-    color: #666;
+    color: var(--c-ink-2);
     margin-right: 6px;
   }
 
   .general-comments {
     margin-top: 32px;
     padding-top: 16px;
-    border-top: 1px solid #e2e2e2;
+    border-top: 1px solid var(--c-rule);
     max-width: 80ch;
   }
 
   .general-comments h3 {
     margin: 0 0 10px;
+    font-family: var(--font-display);
     font-size: 15px;
+    font-weight: 600;
   }
 
   .general-comments textarea {
@@ -586,26 +675,15 @@
     font-family: inherit;
     font-size: 13px;
     padding: 8px;
-    border: 1px solid #ccc;
+    border: 1px solid var(--c-rule);
     border-radius: 4px;
+    background: var(--c-paper);
+    color: var(--c-ink);
     resize: vertical;
   }
 
-  .general-comments > button {
+  .general-comments > .btn-outline {
     margin-top: 8px;
-    padding: 6px 14px;
-    border: 1px solid #0969da;
-    border-radius: 4px;
-    background: #0969da;
-    color: #fff;
-    font-size: 13px;
-    cursor: pointer;
-  }
-
-  .general-comments > button:disabled {
-    background: #a8c8e8;
-    border-color: #a8c8e8;
-    cursor: not-allowed;
   }
 
   .general-comment-list {
@@ -623,9 +701,9 @@
     justify-content: space-between;
     gap: 10px;
     font-size: 13px;
-    color: #333;
-    background: #f6f8fa;
-    border: 1px solid #d0d7de;
+    color: var(--c-ink);
+    background: var(--c-panel);
+    border: 1px solid var(--c-rule);
     border-radius: 4px;
     padding: 8px 12px;
     white-space: pre-wrap;
@@ -635,7 +713,7 @@
     flex-shrink: 0;
     border: none;
     background: none;
-    color: #666;
+    color: var(--c-ink-2);
     cursor: pointer;
     font-size: 14px;
     line-height: 1;
@@ -643,22 +721,13 @@
   }
 
   .comment-delete:hover {
-    color: #cf222e;
-  }
-
-  .center-message {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    height: 100vh;
-    font-size: 15px;
-    color: #444;
+    color: var(--c-shu);
   }
 
   .modal-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.4);
+    background: rgba(33, 31, 28, 0.45);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -666,25 +735,27 @@
   }
 
   .modal-panel {
-    background: #fff;
-    border-radius: 8px;
+    background: var(--c-paper);
+    border-radius: 6px;
     padding: 20px 24px;
     max-width: 440px;
     width: 90%;
     max-height: 80vh;
     overflow-y: auto;
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 8px 30px rgba(33, 31, 28, 0.18);
   }
 
   .modal-panel h2 {
     margin: 0 0 12px;
-    font-size: 16px;
+    font-family: var(--font-display);
+    font-size: 17px;
+    font-weight: 600;
   }
 
   .modal-panel p {
     margin: 0 0 12px;
     font-size: 14px;
-    color: #333;
+    color: var(--c-ink);
   }
 
   .verdict-summary {
@@ -704,7 +775,7 @@
     gap: 10px;
     font-size: 13px;
     padding: 4px 0;
-    border-bottom: 1px solid #eee;
+    border-bottom: 1px solid var(--c-rule);
   }
 
   .vs-title {
@@ -715,14 +786,26 @@
 
   .vs-verdict {
     flex-shrink: 0;
-    color: #666;
+    color: var(--c-ink-2);
+  }
+
+  .vs-approve {
+    color: var(--c-matsuba);
+  }
+
+  .vs-request-changes {
+    color: var(--c-shu);
+  }
+
+  .vs-comment {
+    color: var(--c-ai);
   }
 
   .modal-error {
     font-size: 13px;
-    color: #cf222e;
-    background: #ffebe9;
-    border: 1px solid #ffc1bc;
+    color: var(--c-shu);
+    background: var(--c-shu-tint);
+    border: 1px solid var(--c-shu-tint-2);
     border-radius: 4px;
     padding: 8px 10px;
     margin: 0 0 12px;
@@ -734,38 +817,29 @@
     justify-content: flex-end;
   }
 
-  .modal-actions button {
-    padding: 6px 14px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background: #fff;
-    font-size: 13px;
-    cursor: pointer;
-  }
-
-  .modal-actions button:first-child {
-    background: #0969da;
-    border-color: #0969da;
-    color: #fff;
-  }
-
-  .modal-actions button:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
-  }
-
   .shortcut-hint {
     position: fixed;
     left: 0;
     right: 0;
     bottom: 0;
-    padding: 3px 16px;
+    padding: 4px 16px;
     font-size: 11px;
-    color: #888;
-    background: rgba(250, 250, 250, 0.9);
-    border-top: 1px solid #e2e2e2;
+    color: var(--c-ink-2);
+    background: rgba(252, 251, 248, 0.92);
+    border-top: 1px solid var(--c-rule);
     text-align: center;
     pointer-events: none;
     z-index: 5;
+  }
+
+  .shortcut-hint kbd {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    padding: 1px 4px;
+    border: 1px solid var(--c-rule);
+    border-bottom-width: 2px;
+    border-radius: 3px;
+    background: #fff;
+    color: var(--c-ink-2);
   }
 </style>
