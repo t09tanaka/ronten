@@ -4,6 +4,7 @@
   import ConcernList from './lib/ConcernList.svelte'
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
+  import { interpretKey } from './lib/keynav'
   import type { Verdict } from './lib/types'
 
   onMount(() => {
@@ -47,6 +48,61 @@
   function addGeneralComment(): void {
     rs.addGeneralComment(generalCommentText)
     generalCommentText = ''
+  }
+
+  function scrollSelectedIntoView(): void {
+    document.querySelector(`[data-idx="${rs.selectedIdx}"]`)?.scrollIntoView({ block: 'nearest' })
+  }
+
+  // Global keyboard shortcuts for the review flow. Escape is handled here
+  // directly (not via interpretKey — that contract only maps binding keys)
+  // so it can close confirm panels / the inline comment editor regardless
+  // of focus. All other keys go through interpretKey, which already
+  // returns null while typing in an input/textarea/select/contenteditable.
+  function handleKeydown(e: KeyboardEvent): void {
+    if (rs.phase !== 'review') return
+
+    if (e.key === 'Escape') {
+      if (showSubmitConfirm) {
+        showSubmitConfirm = false
+      } else if (showAbortConfirm) {
+        showAbortConfirm = false
+      } else if (rs.pendingCommentTarget) {
+        rs.pendingCommentTarget = null
+      }
+      return
+    }
+
+    const confirmOpen = showSubmitConfirm || showAbortConfirm
+    const target = e.target as HTMLElement | null
+    const action = interpretKey(e.key, target?.tagName ?? '', target?.isContentEditable ?? false)
+    if (!action) return
+
+    switch (action.type) {
+      case 'move':
+        if (confirmOpen) return
+        e.preventDefault()
+        rs.move(action.delta)
+        scrollSelectedIntoView()
+        break
+      case 'verdict':
+        if (confirmOpen) return
+        if (rs.selected) rs.setVerdict(rs.selected.id, action.verdict)
+        break
+      case 'focus-comment':
+        if (confirmOpen) return
+        e.preventDefault()
+        document.getElementById('general-comment-textarea')?.focus()
+        break
+      case 'confirm-submit':
+        e.preventDefault()
+        if (showSubmitConfirm) {
+          void confirmSubmit()
+        } else if (!confirmOpen && rs.allReviewed) {
+          openSubmitConfirm()
+        }
+        break
+    }
   }
 
   // Tiny hand-rolled markdown converter for concern descriptions: paragraphs,
@@ -129,6 +185,8 @@
   )
 </script>
 
+<svelte:window onkeydown={handleKeydown} />
+
 {#if rs.phase === 'loading'}
   <div class="center-message">Loading…</div>
 {:else if rs.phase === 'error'}
@@ -192,6 +250,7 @@
         <section class="general-comments">
           <h3>General comments</h3>
           <textarea
+            id="general-comment-textarea"
             bind:value={generalCommentText}
             placeholder="Add a general comment…"
             rows="3"
@@ -268,6 +327,10 @@
       </div>
     </div>
   {/if}
+
+  <footer class="shortcut-hint">
+    j/k select · a approve · x request changes · c comment · Enter submit
+  </footer>
 {/if}
 
 <style>
@@ -610,5 +673,20 @@
   .modal-actions button:disabled {
     opacity: 0.6;
     cursor: not-allowed;
+  }
+
+  .shortcut-hint {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    padding: 3px 16px;
+    font-size: 11px;
+    color: #888;
+    background: rgba(250, 250, 250, 0.9);
+    border-top: 1px solid #e2e2e2;
+    text-align: center;
+    pointer-events: none;
+    z-index: 5;
   }
 </style>

@@ -4,7 +4,7 @@
 
 <ul class="concern-list">
   {#each rs.session?.concerns ?? [] as concern, i (concern.id)}
-    <li>
+    <li data-idx={i}>
       <button
         type="button"
         class="concern-row"
