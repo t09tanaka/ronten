@@ -2,6 +2,9 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::time::Duration;
 
+mod model;
+mod schema_cmd;
+
 pub mod exitcode {
     pub const APPROVED: u8 = 0;
     pub const REQUEST_CHANGES: u8 = 1;
@@ -71,7 +74,8 @@ struct DemoArgs {
 
 fn run(cli: Cli) -> u8 {
     match cli {
-        Cli::Review(_) | Cli::Schema(_) | Cli::Demo(_) => {
+        Cli::Schema(a) => schema_cmd::run(a.input, a.output),
+        Cli::Review(_) | Cli::Demo(_) => {
             eprintln!("not implemented yet");
             exitcode::INPUT
         }
