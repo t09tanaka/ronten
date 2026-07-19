@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 mod gitdiff;
+mod mapping;
 mod model;
 mod schema_cmd;
 
