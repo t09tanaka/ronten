@@ -1,5 +1,6 @@
 <script lang="ts">
   import { rs } from './state.svelte'
+  import { scrollToGeneralComments } from './scroll'
   import type { Verdict } from './types'
 
   interface Props {
@@ -24,7 +25,10 @@
       class="verdict-btn verdict-{opt.value}"
       class:active={verdict === opt.value}
       aria-pressed={verdict === opt.value}
-      onclick={() => rs.setVerdict(concernId, opt.value)}
+      onclick={() => {
+        rs.setVerdict(concernId, opt.value)
+        if (opt.value === 'comment') scrollToGeneralComments()
+      }}
     >
       {opt.label}
     </button>

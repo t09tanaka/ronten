@@ -5,6 +5,7 @@
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
   import { interpretKey } from './lib/keynav'
+  import { scrollToGeneralComments } from './lib/scroll'
   import type { Verdict } from './lib/types'
 
   onMount(() => {
@@ -98,7 +99,12 @@
       case 'verdict':
         if (confirmOpen) return
         e.preventDefault()
-        if (rs.selected) rs.setVerdict(rs.selected.id, action.verdict)
+        if (rs.selected) {
+          rs.setVerdict(rs.selected.id, action.verdict)
+          // A comment verdict means "I have something to write" — bring the
+          // comment box into view so the next action is right there.
+          if (action.verdict === 'comment') scrollToGeneralComments()
+        }
         break
       case 'focus-comment':
         if (confirmOpen) return
@@ -595,7 +601,9 @@
   .main-pane {
     flex: 1;
     overflow-y: auto;
-    padding: 16px 20px;
+    /* Bottom clearance keeps the last controls (Add comment) from being
+       covered by the fixed shortcut-hint footer. */
+    padding: 16px 20px 56px;
     min-width: 0;
   }
 

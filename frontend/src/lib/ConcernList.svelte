@@ -1,9 +1,21 @@
 <script lang="ts">
   import { rs } from './state.svelte'
+  import type { Verdict } from './types'
+
+  const MARK_LABELS: Record<Verdict, string> = {
+    approve: 'Approved',
+    'request-changes': 'Changes requested',
+    comment: 'Commented',
+  }
+
+  function verdictOf(id: string): Verdict | null {
+    return rs.draft.concerns[id]?.verdict ?? null
+  }
 </script>
 
 <ul class="concern-list">
   {#each rs.session?.concerns ?? [] as concern, i (concern.id)}
+    {@const verdict = verdictOf(concern.id)}
     <li data-idx={i}>
       <button
         type="button"
@@ -20,10 +32,40 @@
           {#if concern.unmapped}
             <span class="unmapped-tag">unmapped</span>
           {/if}
-          {#if rs.draft.concerns[concern.id]?.verdict}
-            <span class="reviewed-mark" role="img" aria-label="reviewed" title="reviewed">
+          {#if verdict}
+            <span
+              class="verdict-mark mark-{verdict}"
+              role="img"
+              aria-label={MARK_LABELS[verdict]}
+              title={MARK_LABELS[verdict]}
+            >
               <svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true">
-                <circle cx="7" cy="7" r="5.5" fill="none" stroke="currentColor" stroke-width="1.8" />
+                {#if verdict === 'approve'}
+                  <path
+                    d="M2.5 7.5 L5.5 10.5 L11.5 3.5"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                {:else if verdict === 'request-changes'}
+                  <path
+                    d="M3.5 3.5 L10.5 10.5 M10.5 3.5 L3.5 10.5"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.8"
+                    stroke-linecap="round"
+                  />
+                {:else}
+                  <path
+                    d="M2.5 3 h9 v6.5 h-5 l-2.5 2.2 v-2.2 h-1.5 z"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                    stroke-linejoin="round"
+                  />
+                {/if}
               </svg>
             </span>
           {/if}
@@ -37,7 +79,9 @@
   .concern-list {
     list-style: none;
     margin: 0;
-    padding: 0;
+    /* Bottom clearance so the last row scrolls clear of the fixed
+       shortcut-hint footer. */
+    padding: 0 0 40px;
   }
 
   .concern-row {
@@ -89,10 +133,21 @@
     flex-shrink: 0;
   }
 
-  .reviewed-mark {
+  .verdict-mark {
     display: inline-flex;
-    color: var(--c-shu);
     animation: stamp 120ms ease-out;
+  }
+
+  .mark-approve {
+    color: var(--c-matsuba);
+  }
+
+  .mark-request-changes {
+    color: var(--c-shu);
+  }
+
+  .mark-comment {
+    color: var(--c-ai);
   }
 
   @keyframes stamp {
@@ -107,7 +162,7 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
-    .reviewed-mark {
+    .verdict-mark {
       animation: none;
     }
   }
