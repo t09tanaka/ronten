@@ -79,7 +79,11 @@ result JSON — goes to stdout only, and only stdout. An agent can always do
 | 1 | one or more request-changes |
 | 2 | reviewer aborted |
 | 3 | timeout |
-| 10+ | input errors (invalid JSON, unresolvable base, outside a git repo, empty diff, …) |
+| 10 | invalid usage or invalid concerns JSON |
+| 11 | base ref not resolvable |
+| 12 | not a git repository |
+| 13 | empty diff (nothing to review) |
+| 14 | git invocation failed |
 
 ### `ronten schema`
 
@@ -103,15 +107,22 @@ echo "$result" | jq -r '.decision'
 ```
 
 **Background + polling** — for agent shells with hard command timeouts (e.g. Claude Code's
-bash tool), where the review may take longer than the shell will wait:
+bash tool), where the review may take longer than the shell will wait. `--out` is only
+written on a successful submission (exit 0/1); on abort (exit 2) or timeout (exit 3) no
+file ever appears, so the loop must also watch the process itself rather than only the
+file:
 
 ```sh
 ronten review --base main --concerns concerns.json --out result.json --no-open &
+RONTEN_PID=$!
 
-while [ ! -f result.json ]; do
+while [ ! -f result.json ] && kill -0 "$RONTEN_PID" 2>/dev/null; do
   sleep 5
 done
-cat result.json | jq -r '.decision'
+wait "$RONTEN_PID"
+EXIT_CODE=$?
+# result.json exists only when EXIT_CODE is 0 or 1; on abort/timeout there is
+# no result file and the exit code is the only signal.
 ```
 
 Either way, `ronten review` remains a single foreground-equivalent process for the duration
@@ -169,7 +180,8 @@ of the review — nothing is left running once a result exists.
 
 `decision` is derived from the per-concern verdicts: any `request-changes` verdict makes
 the overall decision `request-changes`. Agents can feed `concerns[].comments` directly into
-a fix loop.
+a fix loop. On abort or timeout, no result JSON is produced at all — the exit code (2 or 3)
+is the only signal; the `abort` decision value is reserved and not currently emitted.
 
 ## Keyboard shortcuts
 
