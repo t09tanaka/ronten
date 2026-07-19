@@ -62,7 +62,10 @@
   function handleKeydown(e: KeyboardEvent): void {
     if (rs.phase !== 'review') return
 
+    const target = e.target as HTMLElement | null
+
     if (e.key === 'Escape') {
+      e.preventDefault()
       if (showSubmitConfirm) {
         showSubmitConfirm = false
       } else if (showAbortConfirm) {
@@ -73,8 +76,14 @@
       return
     }
 
+    // A focused button keeps its native key handling: Enter must activate
+    // the button itself (e.g. Cancel in the submit confirm — intercepting
+    // it as confirm-submit would turn "cancel" into an accidental,
+    // irreversible submission). j/k/a/x/c fall through here too; the
+    // global shortcuts remain active for body/other targets.
+    if (target?.tagName === 'BUTTON') return
+
     const confirmOpen = showSubmitConfirm || showAbortConfirm
-    const target = e.target as HTMLElement | null
     const action = interpretKey(e.key, target?.tagName ?? '', target?.isContentEditable ?? false)
     if (!action) return
 
@@ -87,6 +96,7 @@
         break
       case 'verdict':
         if (confirmOpen) return
+        e.preventDefault()
         if (rs.selected) rs.setVerdict(rs.selected.id, action.verdict)
         break
       case 'focus-comment':
