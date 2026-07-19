@@ -1,5 +1,4 @@
-// Single shared review store (Svelte 5 runes). See task-11-brief.md for the
-// contract this class implements.
+// Single shared review store (Svelte 5 runes).
 
 import { abortSession, fetchSession, saveDraft, submit } from './api'
 import type {
