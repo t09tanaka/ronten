@@ -81,7 +81,7 @@
       aria-label="Expand"
       onclick={() => (collapsed = false)}
     >
-      &#9656; {hunk.lines.length} lines &mdash; click to expand
+      ▸ {hunk.lines.length} lines — click to expand
     </button>
   {:else}
     <div class="hunk-body">
