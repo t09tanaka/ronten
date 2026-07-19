@@ -411,3 +411,146 @@ index 1111111..2222222 100644
         assert_eq!(h.lines[3].new_no, Some(3));
     }
 }
+
+#[derive(Debug)]
+pub enum GitError {
+    NotARepo,
+    BadBase(String),
+    GitFailed(String),
+}
+
+/// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
+pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .map_err(|_| GitError::NotARepo)?;
+    if !output.status.success() {
+        return Err(GitError::NotARepo);
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(std::path::PathBuf::from(path))
+}
+
+/// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
+/// on any failure returns `"review"`.
+pub fn current_branch(root: &std::path::Path) -> String {
+    let output = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if branch.is_empty() {
+                "review".to_string()
+            } else {
+                branch
+            }
+        }
+        _ => "review".to_string(),
+    }
+}
+
+/// Runs `git -C <root> diff <base>...HEAD --no-color --unified=3 --find-renames`
+/// and parses the result. Empty stdout on success is an empty vec. Non-zero
+/// exit with a stderr indicating an unrecognized revision is classified as
+/// `BadBase`; any other non-zero exit is `GitFailed`.
+pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<Vec<FileDiff>, GitError> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "diff",
+            &format!("{base}...HEAD"),
+            "--no-color",
+            "--unified=3",
+            "--find-renames",
+        ])
+        .output()
+        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if stderr.contains("unknown revision")
+            || stderr.contains("bad revision")
+            || stderr.contains("ambiguous argument")
+        {
+            return Err(GitError::BadBase(stderr));
+        }
+        return Err(GitError::GitFailed(stderr));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(parse_unified_diff(&stdout))
+}
+
+#[cfg(test)]
+mod git_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let st = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            st.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+    }
+
+    fn fixture_repo() -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "feature"]);
+        std::fs::write(d.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        std::fs::write(d.join("b.txt"), "new file\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+        td
+    }
+
+    #[test]
+    fn computes_diff_against_base() {
+        let td = fixture_repo();
+        let files = compute_diff(td.path(), "main").unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|f| f.new_path.as_deref() == Some("a.txt")));
+        assert!(files.iter().any(|f| f.status == FileStatus::Added));
+    }
+
+    #[test]
+    fn bad_base_is_distinguished() {
+        let td = fixture_repo();
+        assert!(matches!(
+            compute_diff(td.path(), "no-such-ref"),
+            Err(GitError::BadBase(_))
+        ));
+    }
+
+    #[test]
+    fn empty_diff_returns_empty_vec() {
+        let td = fixture_repo();
+        let files = compute_diff(td.path(), "HEAD").unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn current_branch_name() {
+        let td = fixture_repo();
+        assert_eq!(current_branch(td.path()), "feature");
+    }
+}
