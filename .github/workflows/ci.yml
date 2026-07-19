@@ -27,7 +27,12 @@ jobs:
       - name: Test
         run: cargo test
       - name: Package
-        run: cargo package --locked
+        # cargo auto-includes LICENSE/README files found anywhere in the
+        # package directory; drop node_modules (created by the Test step's
+        # frontend build) so dependency license files stay out of the crate.
+        run: |
+          rm -rf frontend/node_modules
+          cargo package --locked
 
   frontend:
     runs-on: ubuntu-latest

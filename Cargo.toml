@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2021"
 description = "Concern-based PR review viewer: agents propose concerns, humans review in the browser, agents get JSON back"
 license = "MIT"
+# The published crate ships the prebuilt frontend (frontend/dist) instead of
+# the frontend sources, so `cargo install ronten` needs no Node.js and
+# build.rs never modifies the package source tree during verification.
+# Note: cargo auto-includes LICENSE/README files it finds anywhere in the
+# package directory, so remove frontend/node_modules before `cargo package`
+# / `cargo publish` (CI does this) to keep dependency license files out.
+include = [
+    "Cargo.toml",
+    "build.rs",
+    "src/**",
+    "fixtures/**",
+    "frontend/dist/**",
+    "README.md",
+    "LICENSE",
+]
 
 [dependencies]
 axum = "0.8"

@@ -29,9 +29,11 @@ parallel worktrees can run simultaneous sessions on their own ports without conf
 cargo install ronten
 ```
 
-Building from source requires **Node.js >= 20** at build time — the embedded frontend
-(Svelte, built to static assets) is compiled by `cargo build`/`cargo install` via a
-build script and embedded into the binary. No Node.js is required at runtime.
+The published crate ships the prebuilt frontend, so `cargo install ronten` needs only a
+Rust toolchain — no Node.js. Building from a **git checkout** requires **Node.js >= 20**
+at build time: the embedded frontend (Svelte, built to static assets) is compiled by
+`cargo build` via a build script and embedded into the binary. No Node.js is required
+at runtime either way.
 
 ### From source
 

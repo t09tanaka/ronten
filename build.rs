@@ -4,6 +4,20 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
+    // Published crates contain the prebuilt `frontend/dist` but none of the
+    // frontend sources (see `include` in Cargo.toml). In that case there is
+    // nothing to build — and running npm here would modify the package
+    // source tree, which `cargo package`/`cargo publish` verification
+    // rejects.
+    if !Path::new("frontend/package.json").exists() {
+        assert!(
+            Path::new("frontend/dist/index.html").exists(),
+            "frontend/dist is missing from this package; it must be built \
+             (cargo build in a git checkout) before packaging"
+        );
+        println!("cargo:rerun-if-changed=frontend/dist");
+        return;
+    }
     println!("cargo:rerun-if-changed=frontend/src");
     println!("cargo:rerun-if-changed=frontend/index.html");
     println!("cargo:rerun-if-changed=frontend/package.json");
