@@ -84,7 +84,10 @@ export function langForPath(path: string | null | undefined): string | null {
   const base = path.slice(path.lastIndexOf('/') + 1)
   const dot = base.lastIndexOf('.')
   if (dot <= 0) return null
-  return EXT_TO_LANG[base.slice(dot + 1).toLowerCase()] ?? null
+  const ext = base.slice(dot + 1).toLowerCase()
+  // hasOwn guard: a file named e.g. `x.constructor` would otherwise hit
+  // Object.prototype and return a function instead of a language name.
+  return Object.hasOwn(EXT_TO_LANG, ext) ? EXT_TO_LANG[ext] : null
 }
 
 function escapeHtml(s: string): string {
@@ -98,10 +101,15 @@ function escapeHtml(s: string): string {
 
 /// Highlight one diff line. Always returns HTML-safe markup: hljs escapes
 /// the input, and the no-language / error paths escape it explicitly.
+// Lines longer than this render as plain text: grammar regexes over
+// megabyte-scale single lines (minified bundles, data blobs) cost hundreds
+// of milliseconds and tens of MB, and such lines aren't hand-read anyway.
+const MAX_HIGHLIGHT_LINE_LENGTH = 2000
+
 export function highlightLine(content: string, lang: string | null): string {
   // getLanguage guard keeps hljs from logging a console warning for
   // unregistered languages; the catch covers grammar failures.
-  if (lang && hljs.getLanguage(lang)) {
+  if (lang && content.length <= MAX_HIGHLIGHT_LINE_LENGTH && hljs.getLanguage(lang)) {
     try {
       return hljs.highlight(content, { language: lang, ignoreIllegals: true }).value
     } catch {

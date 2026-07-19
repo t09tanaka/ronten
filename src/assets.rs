@@ -47,4 +47,11 @@ mod tests {
     fn font_license_is_embedded() {
         assert!(Asset::get("shippori-mincho-OFL.txt").is_some());
     }
+
+    // highlight.js is BSD-3-Clause; its copyright notice must ship with the
+    // binary that bundles it.
+    #[test]
+    fn highlight_js_license_is_embedded() {
+        assert!(Asset::get("highlight-js-BSD-3-Clause.txt").is_some());
+    }
 }

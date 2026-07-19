@@ -25,6 +25,12 @@ describe('langForPath', () => {
     expect(langForPath('.gitignore')).toBeNull()
     expect(langForPath('.config/app.yaml')).toBe('yaml')
   })
+
+  it('does not resolve prototype-chain properties as languages', () => {
+    expect(langForPath('payload.constructor')).toBeNull()
+    expect(langForPath('payload.__proto__')).toBeNull()
+    expect(langForPath('payload.hasOwnProperty')).toBeNull()
+  })
 })
 
 describe('highlightLine', () => {
@@ -43,5 +49,12 @@ describe('highlightLine', () => {
   it('falls back to escaped plain text for unregistered languages', () => {
     const out = highlightLine('let a = <b>', 'no-such-lang')
     expect(out).toBe('let a = &lt;b&gt;')
+  })
+
+  it('skips highlighting for very long lines', () => {
+    const long = 'x'.repeat(500_000) + '<script>'
+    const out = highlightLine(long, 'typescript')
+    expect(out).not.toContain('hljs-')
+    expect(out).toContain('&lt;script&gt;')
   })
 })
