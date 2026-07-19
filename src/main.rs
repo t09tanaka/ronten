@@ -1,6 +1,7 @@
 use clap::Parser;
 
 mod assets;
+mod demo;
 mod gitdiff;
 mod mapping;
 mod model;
@@ -30,7 +31,7 @@ enum Cli {
     /// Print JSON Schemas for the input/output contract
     Schema(SchemaArgs),
     /// Launch the UI with an embedded sample session (no git required)
-    Demo(DemoArgs),
+    Demo(demo::DemoArgs),
 }
 
 #[derive(clap::Args, Debug)]
@@ -43,24 +44,15 @@ struct SchemaArgs {
     output: bool,
 }
 
-#[derive(clap::Args, Debug)]
-struct DemoArgs {
-    #[arg(long, default_value_t = 0)]
-    port: u16,
-    #[arg(long)]
-    no_open: bool,
-}
-
 fn run(cli: Cli) -> u8 {
     match cli {
         Cli::Schema(a) => schema_cmd::run(a.input, a.output),
         Cli::Review(a) => tokio::runtime::Runtime::new()
             .expect("failed to start tokio runtime")
             .block_on(review::run(a)),
-        Cli::Demo(_) => {
-            eprintln!("not implemented yet");
-            exitcode::INPUT
-        }
+        Cli::Demo(a) => tokio::runtime::Runtime::new()
+            .expect("failed to start tokio runtime")
+            .block_on(demo::run(a)),
     }
 }
 
