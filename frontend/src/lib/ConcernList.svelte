@@ -72,6 +72,23 @@
               </svg>
               </span>
             {/key}
+          {:else}
+            <!-- Same-size placeholder so the mark column is stable: rows
+                 don't shift when a verdict lands, and pending items are
+                 visible at a glance. -->
+            <span class="verdict-mark mark-pending" role="img" aria-label="No verdict">
+              <svg width="13" height="13" viewBox="0 0 14 14" aria-hidden="true">
+                <circle
+                  cx="7"
+                  cy="7"
+                  r="5"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.2"
+                  stroke-dasharray="2.2 2.2"
+                />
+              </svg>
+            </span>
           {/if}
         </span>
       </button>
@@ -150,6 +167,13 @@
 
   .mark-comment {
     color: var(--c-ai);
+  }
+
+  /* Pending placeholder: quiet, and never stamp-animated (it appears on
+     load, not as the result of a reviewer action). */
+  .mark-pending {
+    color: var(--c-ink-3);
+    animation: none;
   }
 
   @keyframes stamp {
