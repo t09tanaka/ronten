@@ -226,19 +226,6 @@
           {/if}
         </div>
       </div>
-      <div class="topbar-actions">
-        <span class="reviewed-counter"
-          >{rs.reviewedCount}/{rs.session.concerns.length} reviewed</span
-        >
-        <button
-          type="button"
-          class="btn-primary"
-          disabled={!rs.allReviewed}
-          title={submitTitle}
-          onclick={openSubmitConfirm}>Submit review</button
-        >
-        <button type="button" class="btn-ghost" onclick={openAbortConfirm}>Abort review</button>
-      </div>
     </header>
     {#if rs.session.warnings.length > 0 && !warningsDismissed}
       <div class="warnings-banner">
@@ -260,7 +247,25 @@
     {/if}
     <div class="body">
       <aside class="left-pane">
-        <ConcernList />
+        <div class="concern-scroll">
+          <ConcernList />
+        </div>
+        <!-- Actions live at the end of the concern list — the natural
+             stopping point of the review flow — not in the topbar where
+             they get overlooked. -->
+        <div class="sidebar-footer">
+          <span class="reviewed-counter"
+            >{rs.reviewedCount}/{rs.session.concerns.length} reviewed</span
+          >
+          <button
+            type="button"
+            class="btn-primary"
+            disabled={!rs.allReviewed}
+            title={submitTitle}
+            onclick={openSubmitConfirm}>Submit review</button
+          >
+          <button type="button" class="btn-ghost" onclick={openAbortConfirm}>Abort review</button>
+        </div>
       </aside>
       <main class="main-pane">
         {#if rs.selected}
@@ -436,12 +441,6 @@
     max-width: 60ch;
   }
 
-  .topbar-actions {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-
   .reviewed-counter {
     font-size: 13px;
     color: var(--c-ink-2);
@@ -594,9 +593,35 @@
   .left-pane {
     width: 280px;
     flex: 0 0 280px;
+    display: flex;
+    flex-direction: column;
     border-right: 1px solid var(--c-rule);
-    overflow-y: auto;
     background: var(--c-panel);
+    min-height: 0;
+  }
+
+  .concern-scroll {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+  }
+
+  .sidebar-footer {
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--c-rule);
+  }
+
+  .sidebar-footer .reviewed-counter {
+    text-align: center;
+  }
+
+  .sidebar-footer .btn-primary,
+  .sidebar-footer .btn-ghost {
+    width: 100%;
   }
 
   .main-pane {
