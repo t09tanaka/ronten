@@ -6,7 +6,7 @@ use crate::gitdiff::{compute_diff, current_branch, repo_root, GitError};
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
-use crate::session::{Draft, SessionState};
+use crate::session::{Draft, SessionState, Terminal};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -83,8 +83,8 @@ pub async fn run(args: ReviewArgs) -> u8 {
     }
 
     // 3. Compute the diff.
-    let files = match compute_diff(&root, &args.base) {
-        Ok(files) => files,
+    let diff_output = match compute_diff(&root, &args.base) {
+        Ok(output) => output,
         Err(GitError::BadBase(msg)) => {
             eprintln!("bad base ref {:?}: {}", args.base, msg.trim());
             return exitcode::BAD_BASE;
@@ -98,13 +98,22 @@ pub async fn run(args: ReviewArgs) -> u8 {
             return exitcode::NOT_A_REPO;
         }
     };
+    let files = diff_output.files;
+    let diff_warnings = diff_output.warnings;
     if files.is_empty() {
         eprintln!("nothing to review: no diff between {} and HEAD", args.base);
         return exitcode::EMPTY_DIFF;
     }
 
     // 4. Build the session state.
-    let mapping = resolve_mapping(&files, &input);
+    let mut mapping = resolve_mapping(&files, &input);
+    // Surface diff-level warnings (e.g. files too large to display) ahead
+    // of mapping warnings.
+    if !diff_warnings.is_empty() {
+        let mut merged = diff_warnings;
+        merged.append(&mut mapping.warnings);
+        mapping.warnings = merged;
+    }
     let title = args.title.clone().unwrap_or_else(|| current_branch(&root));
     let token = new_token();
     let summary = input.summary.clone();
@@ -118,7 +127,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
         token: token.clone(),
         started_at: chrono::Utc::now(),
         draft: Mutex::new(Draft::default()),
-        finished: Mutex::new(false),
+        finished: Mutex::new(None),
         outcome_tx: tx,
     });
 
@@ -176,17 +185,34 @@ pub async fn serve_session(
     // is known, so in-flight responses (e.g. the submit ack) flush cleanly.
     let notify = Arc::new(tokio::sync::Notify::new());
     let shutdown = notify.clone();
-    let router = build_router(state);
+    let router = build_router(state.clone());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.notified().await });
     let server_handle = tokio::spawn(async move {
         let _ = server.await;
     });
 
+    // Every exit path races through the same compare-and-set terminal state.
+    // If ctrl-c or the deadline loses the race (a submit/abort handler
+    // already claimed the terminal), the handler's outcome is authoritative
+    // and is already in flight on `rx` — HTTP 200 must never coexist with a
+    // timeout/abort exit.
     let outcome = tokio::select! {
         o = rx.recv() => o.expect("outcome channel closed before an outcome was sent"),
-        _ = tokio::signal::ctrl_c() => Outcome::Aborted,
-        _ = async { tokio::time::sleep(timeout.unwrap()).await }, if timeout.is_some() => Outcome::Timeout,
+        _ = tokio::signal::ctrl_c() => {
+            if state.try_finish(Terminal::Aborted) {
+                Outcome::Aborted
+            } else {
+                rx.recv().await.expect("outcome channel closed before an outcome was sent")
+            }
+        }
+        _ = async { tokio::time::sleep(timeout.unwrap()).await }, if timeout.is_some() => {
+            if state.try_finish(Terminal::TimedOut) {
+                Outcome::Timeout
+            } else {
+                rx.recv().await.expect("outcome channel closed before an outcome was sent")
+            }
+        }
     };
 
     notify.notify_one();

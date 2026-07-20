@@ -8,8 +8,11 @@ back to the agent as machine-readable JSON.
 
 Reviewing a large agent-generated diff hunk-by-hunk is tedious and loses the "why". ronten
 flips that: the agent proposes a small set of concerns (what changed and why), and the
-diff itself is never agent-supplied — ronten computes it directly from
-`git diff <base>...HEAD`, so the agent cannot hide or misrepresent changes. Any hunk that
+diff itself is never agent-supplied — ronten reads the changed files and their blobs
+directly via git plumbing (`rev-parse`, `merge-base`, `diff-tree --raw`, `cat-file`) and
+computes the text diff with its own diff engine. Nothing in `.gitattributes` (`-diff`,
+diff drivers, textconv), `diff.*` config, or `GIT_EXTERNAL_DIFF` can alter or hide what
+is displayed. Any hunk that
 doesn't map to a concern the agent proposed is never silently dropped; it is placed into an
 auto-generated, warning-styled `_unmapped` concern that still requires a verdict from the
 human before submission. The agent then reads the result JSON — including line-anchored
@@ -26,9 +29,11 @@ parallel worktrees can run simultaneous sessions on their own ports without conf
 cargo install ronten
 ```
 
-Building from source requires **Node.js >= 20** at build time — the embedded frontend
-(Svelte, built to static assets) is compiled by `cargo build`/`cargo install` via a
-build script and embedded into the binary. No Node.js is required at runtime.
+The published crate ships the prebuilt frontend, so `cargo install ronten` needs only a
+Rust toolchain — no Node.js. Building from a **git checkout** requires **Node.js >= 20**
+at build time: the embedded frontend (Svelte, built to static assets) is compiled by
+`cargo build` via a build script and embedded into the binary. No Node.js is required
+at runtime either way.
 
 ### From source
 
@@ -58,7 +63,7 @@ ronten review --base <ref> --concerns <file|-> [options]
 
 | Option | Default | Description |
 |---|---|---|
-| `--base <ref>` | required | Comparison base; computes `git diff <ref>...HEAD` |
+| `--base <ref>` | required | Comparison base; diffs `<ref>...HEAD` (merge-base semantics) |
 | `--concerns <path>` | required | Concerns JSON path; `-` for stdin |
 | `--out <path>` | none | Also write result JSON to a file (in addition to stdout) |
 | `--port <n>` | `0` (OS-assigned) | Bind port, for fixed allocation (e.g. portool) |
@@ -204,6 +209,13 @@ The UI is keyboard-first — a full review pass is possible without a mouse:
   (`/r/<token>`); all API routes require it, preventing same-machine snooping or forged
   submissions via port scanning.
 - Submission is accepted once per process lifetime; a second `submit` call gets `409`.
+
+**Trust boundary**: the token (together with the localhost bind and single-submit rule)
+protects against port scanning and accidental access by other processes on the same
+machine. It does not protect against the agent that launched ronten: the session URL is
+printed to stderr, so that agent necessarily knows the token. The design assumes a
+trusted-but-fallible agent — it keeps an honest agent from misrepresenting the diff, but
+it cannot stop a malicious (or prompt-injected) agent from forging the human's verdict.
 
 ## Non-goals for v0.1
 

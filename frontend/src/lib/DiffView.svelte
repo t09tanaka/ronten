@@ -1,17 +1,12 @@
 <script lang="ts">
   import { rs } from './state.svelte'
   import HunkView from './HunkView.svelte'
-  import type { FileStatus, HunkRef, Side } from './types'
+  import type { CommentLineInfo } from './anchors'
+  import type { FileStatus, HunkRef } from './types'
 
   interface FileGroup {
     fileIndex: number
     refs: HunkRef[]
-  }
-
-  interface CommentLineInfo {
-    path: string
-    side: Side
-    line: number
   }
 
   // Concern.hunks is already sorted/deduped by (file, hunk) on the server
@@ -36,6 +31,8 @@
     switch (status) {
       case 'binary':
         return 'Binary file changed'
+      case 'too-large':
+        return 'File too large to display'
       case 'renamed':
         return 'File renamed (no content changes)'
       case 'added':
@@ -68,7 +65,11 @@
     {@const file = rs.session.files[group.fileIndex]}
     <section class="file-group">
       <header class="file-header">
-        <span class="file-path">{file.new_path ?? file.old_path}</span>
+        {#if file.old_path && file.new_path && file.old_path !== file.new_path}
+          <span class="file-path">{file.old_path} → {file.new_path}</span>
+        {:else}
+          <span class="file-path">{file.new_path ?? file.old_path}</span>
+        {/if}
         <span class="file-status status-{file.status}">{file.status}</span>
       </header>
       {#each group.refs as hunkRef (hunkRef.hunk ?? -1)}

@@ -16,6 +16,26 @@
   let generalCommentText = $state('')
   let warningsDismissed = $state(false)
 
+  // Native <dialog> elements driven by the show* flags. showModal()/close()
+  // are imperative, so an effect keeps the DOM in sync with the state, and
+  // the dialogs' close events sync the state back (e.g. native Escape).
+  let submitDialog = $state<HTMLDialogElement | null>(null)
+  let abortDialog = $state<HTMLDialogElement | null>(null)
+
+  $effect(() => {
+    const d = submitDialog
+    if (!d) return
+    if (showSubmitConfirm && !d.open) d.showModal()
+    else if (!showSubmitConfirm && d.open) d.close()
+  })
+
+  $effect(() => {
+    const d = abortDialog
+    if (!d) return
+    if (showAbortConfirm && !d.open) d.showModal()
+    else if (!showAbortConfirm && d.open) d.close()
+  })
+
   const VERDICT_LABELS: Record<Verdict, string> = {
     approve: 'Approve',
     'request-changes': 'Request changes',
@@ -66,12 +86,11 @@
     const target = e.target as HTMLElement | null
 
     if (e.key === 'Escape') {
+      // While a confirm dialog is open the native <dialog> handles Escape
+      // itself (cancel event) — don't preventDefault or double-handle.
+      if (showSubmitConfirm || showAbortConfirm) return
       e.preventDefault()
-      if (showSubmitConfirm) {
-        showSubmitConfirm = false
-      } else if (showAbortConfirm) {
-        showAbortConfirm = false
-      } else if (rs.pendingCommentTarget) {
+      if (rs.pendingCommentTarget) {
         rs.pendingCommentTarget = null
       }
       return
@@ -85,7 +104,15 @@
     if (target?.tagName === 'BUTTON') return
 
     const confirmOpen = showSubmitConfirm || showAbortConfirm
-    const action = interpretKey(e.key, target?.tagName ?? '', target?.isContentEditable ?? false)
+    const action = interpretKey({
+      key: e.key,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      altKey: e.altKey,
+      isComposing: e.isComposing,
+      targetTag: target?.tagName ?? '',
+      targetEditable: target?.isContentEditable ?? false,
+    })
     if (!action) return
 
     switch (action.type) {
@@ -114,6 +141,14 @@
         }
         break
     }
+  }
+
+  // Warn before leaving while draft changes may not be persisted yet
+  // (debounced save pending, save in flight, or last save failed).
+  function handleBeforeUnload(e: BeforeUnloadEvent): void {
+    if (rs.phase !== 'review') return
+    if (!rs.hasUnsavedChanges) return
+    e.preventDefault()
   }
 
   // Tiny hand-rolled markdown converter for concern descriptions: paragraphs,
@@ -196,7 +231,7 @@
   )
 </script>
 
-<svelte:window onkeydown={handleKeydown} />
+<svelte:window onkeydown={handleKeydown} onbeforeunload={handleBeforeUnload} />
 
 {#if rs.phase === 'loading'}
   <div class="center-message">Loading…</div>
@@ -216,6 +251,13 @@
         {/if}
       </div>
       <div class="topbar-actions">
+        <span
+          class="save-indicator"
+          class:save-indicator-error={rs.saveState === 'error'}
+          aria-live="polite"
+        >
+          {#if rs.saveState === 'saving'}Saving…{:else if rs.saveState === 'saved'}Saved{:else if rs.saveState === 'error'}Save failed{/if}
+        </span>
         <span class="reviewed-counter"
           >{rs.reviewedCount}/{rs.session.concerns.length} reviewed</span
         >
@@ -309,53 +351,57 @@
     </div>
   </div>
 
-  {#if showSubmitConfirm}
-    <div class="modal-overlay">
-      <div class="modal-panel">
-        <h2>Submit review</h2>
-        <ul class="verdict-summary">
-          {#each rs.session.concerns as c (c.id)}
-            <li>
-              <span class="vs-title">{c.title}</span>
-              <span class="vs-verdict">{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span>
-            </li>
-          {/each}
-        </ul>
-        {#if rs.submitError}
-          <p class="modal-error">{rs.submitError}</p>
-        {/if}
-        <div class="modal-actions">
-          <button type="button" onclick={confirmSubmit} disabled={rs.submitting}
-            >{rs.submitting ? 'Submitting…' : 'Submit review'}</button
-          >
-          <button
-            type="button"
-            onclick={() => (showSubmitConfirm = false)}
-            disabled={rs.submitting}>Cancel</button
-          >
-        </div>
-      </div>
+  <dialog
+    bind:this={submitDialog}
+    class="modal-panel"
+    aria-labelledby="submit-dialog-title"
+    oncancel={() => (showSubmitConfirm = false)}
+    onclose={() => (showSubmitConfirm = false)}
+  >
+    <h2 id="submit-dialog-title">Submit review</h2>
+    <ul class="verdict-summary">
+      {#each rs.session.concerns as c (c.id)}
+        <li>
+          <span class="vs-title">{c.title}</span>
+          <span class="vs-verdict">{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span>
+        </li>
+      {/each}
+    </ul>
+    {#if rs.submitError}
+      <p class="modal-error">{rs.submitError}</p>
+    {/if}
+    <div class="modal-actions">
+      <button type="button" onclick={confirmSubmit} disabled={rs.submitting}
+        >{rs.submitting ? 'Submitting…' : 'Submit review'}</button
+      >
+      <button
+        type="button"
+        onclick={() => (showSubmitConfirm = false)}
+        disabled={rs.submitting}>Cancel</button
+      >
     </div>
-  {/if}
+  </dialog>
 
-  {#if showAbortConfirm}
-    <div class="modal-overlay">
-      <div class="modal-panel">
-        <p>Abort review? The agent will receive exit code 2 and no result.</p>
-        {#if rs.submitError}
-          <p class="modal-error">{rs.submitError}</p>
-        {/if}
-        <div class="modal-actions">
-          <button type="button" onclick={confirmAbort} disabled={rs.submitting}
-            >{rs.submitting ? 'Aborting…' : 'Abort review'}</button
-          >
-          <button type="button" onclick={() => (showAbortConfirm = false)} disabled={rs.submitting}
-            >Cancel</button
-          >
-        </div>
-      </div>
+  <dialog
+    bind:this={abortDialog}
+    class="modal-panel"
+    aria-label="Abort review"
+    oncancel={() => (showAbortConfirm = false)}
+    onclose={() => (showAbortConfirm = false)}
+  >
+    <p>Abort review? The agent will receive exit code 2 and no result.</p>
+    {#if rs.submitError}
+      <p class="modal-error">{rs.submitError}</p>
+    {/if}
+    <div class="modal-actions">
+      <button type="button" onclick={confirmAbort} disabled={rs.submitting}
+        >{rs.submitting ? 'Aborting…' : 'Abort review'}</button
+      >
+      <button type="button" onclick={() => (showAbortConfirm = false)} disabled={rs.submitting}
+        >Cancel</button
+      >
     </div>
-  {/if}
+  </dialog>
 
   <footer class="shortcut-hint">
     j/k select · a approve · x request changes · c comment · Enter submit · i comment box · Esc close
@@ -402,6 +448,15 @@
     font-size: 13px;
     color: #444;
     font-variant-numeric: tabular-nums;
+  }
+
+  .save-indicator {
+    font-size: 12px;
+    color: #666;
+  }
+
+  .save-indicator-error {
+    color: #cf222e;
   }
 
   .topbar-actions button {
@@ -655,17 +710,10 @@
     color: #444;
   }
 
-  .modal-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.4);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 10;
-  }
-
+  /* Native <dialog>: showModal() centers it in the top layer and provides
+     the focus trap + focus restore; only the panel look is ours. */
   .modal-panel {
+    border: none;
     background: #fff;
     border-radius: 8px;
     padding: 20px 24px;
@@ -674,6 +722,10 @@
     max-height: 80vh;
     overflow-y: auto;
     box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
+  }
+
+  .modal-panel::backdrop {
+    background: rgba(0, 0, 0, 0.4);
   }
 
   .modal-panel h2 {

@@ -2,7 +2,7 @@
 
 use crate::assets;
 use crate::model::ResultOutput;
-use crate::session::{Draft, SessionPayload, SessionState};
+use crate::session::{Draft, SessionPayload, SessionState, Terminal};
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -86,7 +86,7 @@ async fn get_session(
     }
 
     let draft = state.draft.lock().unwrap().clone();
-    let submitted = *state.finished.lock().unwrap();
+    let submitted = state.finished.lock().unwrap().is_some();
     let payload = SessionPayload {
         title: &state.title,
         summary: state.summary.as_deref(),
@@ -120,33 +120,39 @@ async fn post_submit(
         return not_found();
     }
 
-    let result = {
-        let mut finished = state.finished.lock().unwrap();
-        if *finished {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "already submitted"})),
-            )
-                .into_response();
-        }
+    let missing: Vec<String> = state
+        .required_ids()
+        .into_iter()
+        .filter(|id| draft.concerns.get(id).is_none_or(|cd| cd.verdict.is_none()))
+        .collect();
+    if !missing.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "missing verdicts", "missing": missing})),
+        )
+            .into_response();
+    }
 
-        let missing: Vec<String> = state
-            .required_ids()
-            .into_iter()
-            .filter(|id| draft.concerns.get(id).is_none_or(|cd| cd.verdict.is_none()))
-            .collect();
-        if !missing.is_empty() {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(json!({"error": "missing verdicts", "missing": missing})),
-            )
-                .into_response();
-        }
+    let details = state.validate_draft(&draft);
+    if !details.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "invalid draft", "details": details})),
+        )
+            .into_response();
+    }
 
-        *finished = true;
-        state.build_result(&draft)
-    };
+    // Claim the single terminal state only after full validation, so a
+    // rejected submit never consumes the session.
+    if !state.try_finish(Terminal::Submitted) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "already submitted"})),
+        )
+            .into_response();
+    }
 
+    let result = state.build_result(&draft);
     let _ = state.outcome_tx.send(Outcome::Submitted(result)).await;
     Json(json!({"ok": true})).into_response()
 }
@@ -156,16 +162,12 @@ async fn post_abort(State(state): State<Arc<SessionState>>, Path(token): Path<St
         return not_found();
     }
 
-    {
-        let mut finished = state.finished.lock().unwrap();
-        if *finished {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({"error": "already submitted"})),
-            )
-                .into_response();
-        }
-        *finished = true;
+    if !state.try_finish(Terminal::Aborted) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "already submitted"})),
+        )
+            .into_response();
     }
 
     let _ = state.outcome_tx.send(Outcome::Aborted).await;
@@ -253,7 +255,60 @@ index 1111111..2222222 100644
             token: TOKEN.to_string(),
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
-            finished: std::sync::Mutex::new(false),
+            finished: std::sync::Mutex::new(None),
+            outcome_tx: tx,
+        });
+        (state, rx)
+    }
+
+    /// A rename+modify diff, so old-side anchors live on `old-name.ts` and
+    /// new-side anchors on `new-name.ts`.
+    const RENAMED: &str = "\
+diff --git a/old-name.ts b/new-name.ts
+similarity index 90%
+rename from old-name.ts
+rename to new-name.ts
+index 1111111..2222222 100644
+--- a/old-name.ts
++++ b/new-name.ts
+@@ -1,2 +1,2 @@
+ keep
+-alpha
++beta
+";
+
+    fn build_rename_state() -> (Arc<SessionState>, tokio::sync::mpsc::Receiver<Outcome>) {
+        let files = parse_unified_diff(RENAMED);
+        let input = ConcernsInput {
+            version: 1,
+            summary: None,
+            concerns: vec![Concern {
+                id: "r1".to_string(),
+                title: "Rename".to_string(),
+                description: None,
+                risk: Risk::Low,
+                locations: vec![Location {
+                    path: "new-name.ts".to_string(),
+                    side: None,
+                    start: None,
+                    end: None,
+                }],
+            }],
+        };
+        let mapping = resolve_mapping(&files, &input);
+        assert!(mapping.unmapped.is_empty());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let state = Arc::new(SessionState {
+            title: "rename review".to_string(),
+            summary: None,
+            files,
+            mapping,
+            input,
+            token: TOKEN.to_string(),
+            started_at: chrono::Utc::now(),
+            draft: std::sync::Mutex::new(Draft::default()),
+            finished: std::sync::Mutex::new(None),
             outcome_tx: tx,
         });
         (state, rx)
@@ -439,6 +494,175 @@ index 1111111..2222222 100644
 
         let outcome = rx.recv().await.unwrap();
         assert!(matches!(outcome, Outcome::Aborted));
+    }
+
+    /// Draft with all three verdicts set and the given comments on `c1`.
+    fn draft_with_c1_comments(comments: serde_json::Value) -> serde_json::Value {
+        json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": comments },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": []
+        })
+    }
+
+    /// Submits `draft` and asserts a 422 "invalid draft" whose details all
+    /// mention every string in `expect_in_details`.
+    async fn assert_invalid_draft(draft: serde_json::Value, expect_in_details: &[&str]) {
+        let (state, _rx) = build_state();
+        let app = build_router(state);
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "invalid draft");
+        let details = body["details"].as_array().unwrap();
+        assert!(!details.is_empty());
+        let joined = details
+            .iter()
+            .map(|d| d.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in expect_in_details {
+            assert!(
+                joined.contains(needle),
+                "details missing {needle:?}: {joined}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_comment_on_nonexistent_path_422() {
+        let comments = json!([
+            {"path": "nope.ts", "side": "new", "line": 1, "body": "x"}
+        ]);
+        assert_invalid_draft(draft_with_c1_comments(comments), &["c1", "nope.ts"]).await;
+    }
+
+    #[tokio::test]
+    async fn submit_comment_on_nonexistent_line_422() {
+        let comments = json!([
+            {"path": "src/app.ts", "side": "new", "line": 999, "body": "x"}
+        ]);
+        assert_invalid_draft(
+            draft_with_c1_comments(comments),
+            &["c1", "src/app.ts", "999"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn submit_comment_on_unassigned_hunk_line_422() {
+        // New line 12 exists in the diff, but in hunk 1, which belongs to
+        // `_unmapped`, not to c1.
+        let comments = json!([
+            {"path": "src/app.ts", "side": "new", "line": 12, "body": "x"}
+        ]);
+        assert_invalid_draft(
+            draft_with_c1_comments(comments),
+            &["c1", "src/app.ts", "12"],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn submit_blank_comment_body_422() {
+        let comments = json!([
+            {"path": "src/app.ts", "side": "new", "line": 1, "body": "   "}
+        ]);
+        assert_invalid_draft(draft_with_c1_comments(comments), &["c1", "blank"]).await;
+    }
+
+    #[tokio::test]
+    async fn submit_unknown_concern_id_422() {
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": [] },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] },
+                "ghost": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": []
+        });
+        assert_invalid_draft(draft, &["ghost"]).await;
+    }
+
+    #[tokio::test]
+    async fn submit_blank_general_comment_422() {
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": [] },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": [" "]
+        });
+        assert_invalid_draft(draft, &["general comment"]).await;
+    }
+
+    #[tokio::test]
+    async fn submit_valid_anchors_200() {
+        let (state, mut rx) = build_state();
+        let app = build_router(state);
+
+        // Hunk 0 (c1): context line old side, removed line old side, added
+        // line new side. Hunk 1 (_unmapped): added line new side.
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": [
+                    {"path": "src/app.ts", "side": "old", "line": 1, "body": "context old side"},
+                    {"path": "src/app.ts", "side": "old", "line": 2, "body": "removed line old side"},
+                    {"path": "src/app.ts", "side": "new", "line": 2, "body": "added line new side"}
+                ]},
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "comment", "comments": [
+                    {"path": "src/app.ts", "side": "new", "line": 12, "body": "unmapped hunk line"}
+                ]}
+            },
+            "general_comments": []
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        let outcome = rx.recv().await.unwrap();
+        match outcome {
+            Outcome::Submitted(r) => {
+                assert_eq!(r.version, 1);
+                assert_eq!(r.concerns[0].comments.len(), 3);
+            }
+            other => panic!("expected Submitted, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_old_side_against_new_path_422_then_old_path_200() {
+        let (state, mut rx) = build_rename_state();
+        let app = build_router(state);
+
+        // The old side of a renamed file anchors on old-name.ts, so the
+        // same line addressed via new-name.ts on the old side must fail...
+        let bad = json!({
+            "concerns": { "r1": { "verdict": "approve", "comments": [
+                {"path": "new-name.ts", "side": "old", "line": 2, "body": "x"}
+            ]}},
+            "general_comments": []
+        });
+        let (status, body) =
+            call(app.clone(), post_json(&format!("/api/{TOKEN}/submit"), bad)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "invalid draft");
+
+        // ...and a rejected submit must not consume the session: the same
+        // anchor via old-name.ts succeeds afterwards.
+        let good = json!({
+            "concerns": { "r1": { "verdict": "approve", "comments": [
+                {"path": "old-name.ts", "side": "old", "line": 2, "body": "x"}
+            ]}},
+            "general_comments": []
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), good)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
     }
 
     /// Regression test for the embedded-asset 404 bug: the wildcard

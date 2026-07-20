@@ -5,7 +5,7 @@
 //! are reported in `Mapping.unmapped`.
 
 use crate::gitdiff::FileDiff;
-use crate::model::{ConcernsInput, Side};
+use crate::model::{ConcernsInput, Side, SUPPORTED_VERSION};
 use serde::Serialize;
 
 /// Reserved concern id for the synthetic "everything nobody claimed" bucket
@@ -36,11 +36,41 @@ pub struct Mapping {
     pub warnings: Vec<String>,
 }
 
-/// Validates the concerns list itself (not against a diff): rejects
-/// duplicate ids, use of the reserved `_unmapped` id, and an empty list.
+/// True when `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` (hand-rolled to
+/// avoid pulling in a regex crate).
+fn valid_id_pattern(id: &str) -> bool {
+    let mut chars = id.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Validates the concerns list itself (not against a diff): rejects an
+/// unsupported contract version, an empty or oversized list, duplicate ids,
+/// malformed ids (including the reserved `_unmapped`), over-long text
+/// fields, and invalid location ranges.
 pub fn validate_concerns(input: &ConcernsInput) -> Result<(), String> {
+    if input.version != SUPPORTED_VERSION {
+        return Err(format!(
+            "unsupported version {} (this ronten supports version {SUPPORTED_VERSION})",
+            input.version
+        ));
+    }
     if input.concerns.is_empty() {
         return Err("concerns list must not be empty".to_string());
+    }
+    if input.concerns.len() > 200 {
+        return Err(format!(
+            "too many concerns: {} (maximum 200)",
+            input.concerns.len()
+        ));
+    }
+    if let Some(summary) = &input.summary {
+        if summary.chars().count() > 2_000 {
+            return Err("summary exceeds 2000 characters".to_string());
+        }
     }
     let mut seen = std::collections::HashSet::new();
     for c in &input.concerns {
@@ -49,8 +79,51 @@ pub fn validate_concerns(input: &ConcernsInput) -> Result<(), String> {
                 "concern id \"{UNMAPPED_ID}\" is reserved and cannot be used"
             ));
         }
+        if c.id.is_empty() || c.id.chars().count() > 64 || !valid_id_pattern(&c.id) {
+            return Err(format!(
+                "invalid concern id {:?}: must be 1-64 characters matching ^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                c.id
+            ));
+        }
         if !seen.insert(c.id.as_str()) {
             return Err(format!("duplicate concern id: {}", c.id));
+        }
+        if c.title.trim().is_empty() {
+            return Err(format!("concern {:?}: title must not be blank", c.id));
+        }
+        if c.title.chars().count() > 200 {
+            return Err(format!("concern {:?}: title exceeds 200 characters", c.id));
+        }
+        if let Some(description) = &c.description {
+            if description.chars().count() > 20_000 {
+                return Err(format!(
+                    "concern {:?}: description exceeds 20000 characters",
+                    c.id
+                ));
+            }
+        }
+        if c.locations.len() > 200 {
+            return Err(format!(
+                "concern {:?}: too many locations: {} (maximum 200)",
+                c.id,
+                c.locations.len()
+            ));
+        }
+        for loc in &c.locations {
+            if loc.start == Some(0) || loc.end == Some(0) {
+                return Err(format!(
+                    "concern {:?}: location {}: line numbers are 1-based (0 is invalid)",
+                    c.id, loc.path
+                ));
+            }
+            if let (Some(start), Some(end)) = (loc.start, loc.end) {
+                if start > end {
+                    return Err(format!(
+                        "concern {:?}: location {}: start {start} is greater than end {end}",
+                        c.id, loc.path
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -460,5 +533,88 @@ mod tests {
 
         let valid = input(vec![concern("c1", vec![]), concern("c2", vec![])]);
         assert!(validate_concerns(&valid).is_ok());
+    }
+
+    #[test]
+    fn validate_concerns_rejects_unsupported_version() {
+        let mut inp = input(vec![concern("c1", vec![])]);
+        inp.version = 2;
+        let err = validate_concerns(&inp).unwrap_err();
+        assert!(
+            err.contains("version 1"),
+            "error should name the supported version: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_concerns_rejects_bad_id_patterns() {
+        let long_id = "x".repeat(65);
+        for bad in [
+            "",
+            "-leading-dash",
+            ".leading-dot",
+            "_leading-underscore",
+            "has space",
+            "emoji✨",
+            long_id.as_str(),
+        ] {
+            let inp = input(vec![concern(bad, vec![])]);
+            assert!(
+                validate_concerns(&inp).is_err(),
+                "id {bad:?} should be rejected"
+            );
+        }
+        let ok = input(vec![concern("A1.b_c-d", vec![])]);
+        assert!(validate_concerns(&ok).is_ok());
+    }
+
+    #[test]
+    fn validate_concerns_rejects_bad_location_ranges() {
+        let start_gt_end = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(5), Some(4))],
+        )]);
+        assert!(validate_concerns(&start_gt_end).is_err());
+
+        let zero_start = input(vec![concern("c1", vec![loc("a.ts", None, Some(0), None)])]);
+        assert!(validate_concerns(&zero_start).is_err());
+
+        let zero_end = input(vec![concern("c1", vec![loc("a.ts", None, None, Some(0))])]);
+        assert!(validate_concerns(&zero_end).is_err());
+
+        let equal = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(3), Some(3))],
+        )]);
+        assert!(validate_concerns(&equal).is_ok());
+    }
+
+    #[test]
+    fn validate_concerns_enforces_length_limits() {
+        let mut long_title = concern("c1", vec![]);
+        long_title.title = "x".repeat(201);
+        assert!(validate_concerns(&input(vec![long_title])).is_err());
+
+        let mut blank_title = concern("c1", vec![]);
+        blank_title.title = "   ".to_string();
+        assert!(validate_concerns(&input(vec![blank_title])).is_err());
+
+        let mut long_desc = concern("c1", vec![]);
+        long_desc.description = Some("x".repeat(20_001));
+        assert!(validate_concerns(&input(vec![long_desc])).is_err());
+
+        let mut long_summary = input(vec![concern("c1", vec![])]);
+        long_summary.summary = Some("x".repeat(2_001));
+        assert!(validate_concerns(&long_summary).is_err());
+
+        let many = input(
+            (0..201)
+                .map(|i| concern(&format!("c{i}"), vec![]))
+                .collect(),
+        );
+        assert!(validate_concerns(&many).is_err());
+
+        let locs = (0..201).map(|_| loc("a.ts", None, None, None)).collect();
+        assert!(validate_concerns(&input(vec![concern("c1", locs)])).is_err());
     }
 }

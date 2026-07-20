@@ -1,15 +1,10 @@
 <script lang="ts">
   import { rs } from './state.svelte'
   import CommentEditor from './CommentEditor.svelte'
-  import type { Comment, ConcernView, DiffLine, FileDiff, Hunk, HunkRef, Side } from './types'
+  import { newTarget, oldTarget, type CommentLineInfo } from './anchors'
+  import type { Comment, ConcernView, FileDiff, Hunk, HunkRef } from './types'
 
   const COLLAPSE_THRESHOLD = 200
-
-  interface CommentLineInfo {
-    path: string
-    side: Side
-    line: number
-  }
 
   interface Props {
     file: FileDiff
@@ -21,27 +16,17 @@
 
   let { file, hunk, hunkRef, concernId, oncommentline }: Props = $props()
 
-  const path = $derived(file.new_path ?? file.old_path)
   const comments = $derived(rs.draft.concerns[concernId]?.comments ?? [])
 
-  // Mirrors lineClick's side/line selection without firing the click
-  // callback, so saved comments and the pending editor can be located
-  // under the right row.
-  function lineTarget(line: DiffLine): CommentLineInfo | null {
-    if (!path) return null
-    if (line.kind === 'remove') {
-      return line.old_no != null ? { path, side: 'old', line: line.old_no } : null
-    }
-    return line.new_no != null ? { path, side: 'new', line: line.new_no } : null
-  }
-
-  function commentsFor(target: CommentLineInfo): Comment[] {
+  function commentsFor(target: CommentLineInfo | null): Comment[] {
+    if (!target) return []
     return comments.filter(
       (c) => c.path === target.path && c.side === target.side && c.line === target.line,
     )
   }
 
-  function isPending(target: CommentLineInfo): boolean {
+  function isPending(target: CommentLineInfo | null): boolean {
+    if (!target) return false
     const p = rs.pendingCommentTarget
     return p != null && p.path === target.path && p.side === target.side && p.line === target.line
   }
@@ -67,18 +52,6 @@
       .map((id) => rs.session?.concerns.find((c) => c.id === id))
       .filter((c): c is ConcernView => c != null),
   )
-
-  function lineClick(line: DiffLine): void {
-    const path = file.new_path ?? file.old_path
-    if (!path) return
-    if (line.kind === 'remove') {
-      if (line.old_no == null) return
-      oncommentline({ path, side: 'old', line: line.old_no })
-    } else {
-      if (line.new_no == null) return
-      oncommentline({ path, side: 'new', line: line.new_no })
-    }
-  }
 
   function jumpTo(id: string): void {
     const idx = rs.session?.concerns.findIndex((c) => c.id === id) ?? -1
@@ -121,48 +94,62 @@
       <table class="hunk-table">
         <tbody>
           {#each hunk.lines as line, i (i)}
-            {@const target = lineTarget(line)}
+            {@const oldT = oldTarget(file, line)}
+            {@const newT = newTarget(file, line)}
+            {@const pendingT = isPending(oldT) ? oldT : isPending(newT) ? newT : null}
             <tr class="line line-{line.kind}">
-              <td class="gutter old-gutter" onclick={() => lineClick(line)}
-                >{line.old_no ?? ''}</td
-              >
-              <td class="gutter new-gutter" onclick={() => lineClick(line)}
-                >{line.new_no ?? ''}</td
-              >
+              <td class="gutter old-gutter">
+                {#if oldT}
+                  <button
+                    type="button"
+                    class="gutter-btn"
+                    aria-label="Add a comment on old line {oldT.line}"
+                    onclick={() => oncommentline(oldT)}>{line.old_no}</button
+                  >
+                {/if}
+              </td>
+              <td class="gutter new-gutter">
+                {#if newT}
+                  <button
+                    type="button"
+                    class="gutter-btn"
+                    aria-label="Add a comment on new line {newT.line}"
+                    onclick={() => oncommentline(newT)}>{line.new_no}</button
+                  >
+                {/if}
+              </td>
               <td class="content">{line.content}</td>
             </tr>
-            {#if target}
-              {#each commentsFor(target) as comment (comment)}
-                <tr class="comment-row">
-                  <td colspan="3">
-                    <div class="inline-anchor">
-                      <div class="comment-block">
-                        <span class="comment-body">{comment.body}</span>
-                        <button
-                          type="button"
-                          class="comment-delete"
-                          aria-label="Delete comment"
-                          onclick={() => deleteComment(comment)}>×</button
-                        >
-                      </div>
+            {#each [...commentsFor(oldT), ...commentsFor(newT)] as comment (comment)}
+              <tr class="comment-row">
+                <td colspan="3">
+                  <div class="inline-anchor">
+                    <div class="comment-block">
+                      <span class="comment-body">{comment.body}</span>
+                      <button
+                        type="button"
+                        class="comment-delete"
+                        aria-label="Delete comment"
+                        onclick={() => deleteComment(comment)}>×</button
+                      >
                     </div>
-                  </td>
-                </tr>
-              {/each}
-              {#if isPending(target)}
-                <tr class="comment-editor-row">
-                  <td colspan="3">
-                    <div class="inline-anchor">
-                      <CommentEditor
-                        {concernId}
-                        path={target.path}
-                        side={target.side}
-                        line={target.line}
-                      />
-                    </div>
-                  </td>
-                </tr>
-              {/if}
+                  </div>
+                </td>
+              </tr>
+            {/each}
+            {#if pendingT}
+              <tr class="comment-editor-row">
+                <td colspan="3">
+                  <div class="inline-anchor">
+                    <CommentEditor
+                      {concernId}
+                      path={pendingT.path}
+                      side={pendingT.side}
+                      line={pendingT.line}
+                    />
+                  </div>
+                </td>
+              </tr>
             {/if}
           {/each}
         </tbody>
@@ -264,12 +251,38 @@
     max-width: var(--gutter-w);
     box-sizing: border-box;
     white-space: nowrap;
-    padding: 0 8px;
+    padding: 0;
     text-align: right;
     color: #8b949e;
     user-select: none;
-    cursor: pointer;
     background: #fafbfc;
+  }
+
+  /* The whole gutter cell is one native button (keyboard-focusable,
+     Enter/Space activate) styled to look like the plain line-number
+     gutter: transparent background, full-cell click area, right-aligned
+     number. */
+  .gutter-btn {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0 8px;
+    margin: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: right;
+    cursor: pointer;
+  }
+
+  .gutter-btn:hover {
+    background: #eaeef2;
+  }
+
+  .gutter-btn:focus-visible {
+    outline: 2px solid #0969da;
+    outline-offset: -2px;
   }
 
   .old-gutter {
@@ -304,10 +317,6 @@
 
   .line-remove .gutter {
     background: #ffd7d5;
-  }
-
-  .gutter:hover {
-    background: #eaeef2;
   }
 
   .comment-row td {
