@@ -37,14 +37,29 @@
     showAbortConfirm = true
   }
 
+  // Best-effort auto-close once the review is finished in THIS tab (not on
+  // reloading an already-finished session). Browsers only honor
+  // window.close() for tabs they consider script-closable — typically ones
+  // with a single history entry, like the tab the CLI opened. When the
+  // browser refuses, the terminal-state message stays as the fallback.
+  function closeTabSoon(): void {
+    setTimeout(() => window.close(), 800)
+  }
+
   async function confirmSubmit(): Promise<void> {
     await rs.submitReview()
-    if (rs.phase === 'submitted') showSubmitConfirm = false
+    if (rs.phase === 'submitted') {
+      showSubmitConfirm = false
+      closeTabSoon()
+    }
   }
 
   async function confirmAbort(): Promise<void> {
     await rs.abortReview()
-    if (rs.phase === 'aborted') showAbortConfirm = false
+    if (rs.phase === 'aborted') {
+      showAbortConfirm = false
+      closeTabSoon()
+    }
   }
 
   function addGeneralComment(): void {
