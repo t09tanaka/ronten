@@ -522,15 +522,27 @@ const SCRUBBED_GIT_ENV: &[&str] = &[
     // GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> are dynamically named and
     // cannot be enumerated here, but git only reads them up to
     // GIT_CONFIG_COUNT, so scrubbing that count var alone neutralizes them.
+    // A fake shallow boundary can cut ancestry short; scrubbing this leaves
+    // only the repo's real shallow state (if any) in effect.
+    "GIT_SHALLOW_FILE",
+    // Overrides the ref storage backend on newer git; scrubbing is free
+    // defense in depth even on git versions that don't support it yet.
+    "GIT_REFERENCE_BACKEND",
 ];
 
 /// Base `git` invocation: replacement refs disabled (an in-repo agent can
-/// `git replace` HEAD with an innocent-looking commit), repo-redirection
-/// env stripped, and `LC_ALL=C` for stable message parsing.
+/// `git replace` HEAD with an innocent-looking commit), commit grafts
+/// disabled (`$GIT_DIR/info/grafts` / `GIT_GRAFT_FILE` can rewrite commit
+/// parentage and move the merge-base so the diff collapses; unlike replace
+/// refs, `--no-replace-objects` does not cover grafts — pinning the graft
+/// file to `/dev/null` overrides the default path and disables repo-local
+/// grafts too), repo-redirection env stripped, and `LC_ALL=C` for stable
+/// message parsing.
 fn base_git() -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.arg("--no-replace-objects")
         .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
         .env("LC_ALL", "C");
     for var in SCRUBBED_GIT_ENV {
         cmd.env_remove(var);
@@ -583,7 +595,8 @@ fn is_zero_oid(oid: &str) -> bool {
 /// Any structurally malformed record is a hard error: this parser feeds the
 /// review gate, so partial success is worse than failing the whole diff.
 fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
-    let malformed = |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
+    let malformed =
+        |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
     let mut tokens = bytes.split(|&b| b == 0);
     let mut entries = Vec::new();
     while let Some(token) = tokens.next() {
@@ -594,23 +607,30 @@ fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
         }
         let meta = String::from_utf8_lossy(token).to_string();
         let Some(meta) = meta.strip_prefix(':') else {
-            return Err(malformed(&format!("record does not start with ':': {meta:?}")));
+            return Err(malformed(&format!(
+                "record does not start with ':': {meta:?}"
+            )));
         };
         let parts: Vec<&str> = meta.split(' ').collect();
         if parts.len() < 5 {
-            return Err(malformed(&format!("record has {} fields (expected 5): {meta:?}", parts.len())));
+            return Err(malformed(&format!(
+                "record has {} fields (expected 5): {meta:?}",
+                parts.len()
+            )));
         }
-        let status = parts[4].chars().next().ok_or_else(|| malformed("empty status field"))?;
+        let status = parts[4]
+            .chars()
+            .next()
+            .ok_or_else(|| malformed("empty status field"))?;
         let path_token = tokens
             .next()
             .filter(|t| !t.is_empty())
             .ok_or_else(|| malformed(&format!("record {meta:?} has no path")))?;
         let path = String::from_utf8_lossy(path_token).to_string();
         let path2 = if matches!(status, 'R' | 'C') {
-            let token = tokens
-                .next()
-                .filter(|t| !t.is_empty())
-                .ok_or_else(|| malformed(&format!("rename/copy record {meta:?} has no second path")))?;
+            let token = tokens.next().filter(|t| !t.is_empty()).ok_or_else(|| {
+                malformed(&format!("rename/copy record {meta:?} has no second path"))
+            })?;
             Some(String::from_utf8_lossy(token).to_string())
         } else {
             None
@@ -1160,12 +1180,36 @@ mod git_tests {
         git(d, &["commit", "-m", "evil change"]);
         let head = git_stdout(d, &["rev-parse", "HEAD"]);
         let base_tree = git_stdout(d, &["rev-parse", "main^{tree}"]);
-        let fake = git_stdout(d, &["commit-tree", &base_tree, "-p", "main", "-m", "innocent"]);
+        let fake = git_stdout(
+            d,
+            &["commit-tree", &base_tree, "-p", "main", "-m", "innocent"],
+        );
         git(d, &["replace", &head, &fake]);
 
         let out = compute_diff(d, "main").unwrap();
         let a = find(&out.files, "a.txt");
         assert_eq!(a.status, FileStatus::Modified);
+        assert!(hunk_contents(a).contains(&"EVIL"));
+    }
+
+    #[test]
+    fn grafts_cannot_move_the_merge_base() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a.txt"), "one\nEVIL\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "evil change"]);
+        let head = git_stdout(d, &["rev-parse", "HEAD"]);
+        let main_oid = git_stdout(d, &["rev-parse", "main"]);
+        // Graft main's tip to claim HEAD as its parent: HEAD becomes an ancestor
+        // of main, so merge-base(main, HEAD) = HEAD and the diff collapses to
+        // empty — unless grafts are disabled.
+        let graft_dir = d.join(".git").join("info");
+        std::fs::create_dir_all(&graft_dir).unwrap();
+        std::fs::write(graft_dir.join("grafts"), format!("{main_oid} {head}\n")).unwrap();
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
         assert!(hunk_contents(a).contains(&"EVIL"));
     }
 
