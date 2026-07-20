@@ -8,6 +8,8 @@ pub enum FileStatus {
     Deleted,
     Renamed,
     Binary,
+    #[serde(rename = "non-utf8")]
+    NonUtf8,
     #[serde(rename = "too-large")]
     TooLarge,
 }
@@ -423,8 +425,7 @@ pub enum GitError {
 
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
 pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
-    let output = std::process::Command::new("git")
-        .env("LC_ALL", "C")
+    let output = base_git()
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|_| GitError::NotARepo)?;
@@ -438,9 +439,7 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
 /// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
 /// on any failure returns `"review"`.
 pub fn current_branch(root: &std::path::Path) -> String {
-    let output = std::process::Command::new("git")
-        .env("LC_ALL", "C")
-        .current_dir(root)
+    let output = git_cmd(root)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output();
     match output {
@@ -486,29 +485,79 @@ struct RawEntry {
 
 /// How a raw entry will be rendered, decided before blob contents are fetched.
 enum Plan {
-    /// Gitlink (mode 160000) on either side: synthesize `Subproject commit`
-    /// lines; never `cat-file` the oid (it usually doesn't exist locally).
-    Submodule,
-    /// Identical blob oids on both sides (pure rename or mode-only change):
-    /// no hunks, no content needed.
+    /// Identical oids on both sides (pure rename, mode-only change, or a
+    /// gitlink pointing at the same commit on both sides): no hunks, no
+    /// content needed.
     NoContent,
     /// Over a size limit: `FileStatus::TooLarge`, no hunks.
     TooLarge,
-    /// Fetch both blobs and diff them.
+    /// Diff two text representations. Gitlink (mode 160000) sides never have
+    /// their oid fetched (it usually doesn't exist locally as a blob);
+    /// instead they contribute the synthetic `Subproject commit <oid>` line.
+    /// See [`side_bytes`].
     Content,
 }
 
-/// Base `git` invocation for this module: `LC_ALL=C` for stable message
-/// parsing, and the diff-affecting environment variables removed. All
-/// commands used here are plumbing that ignores diff drivers anyway, but
-/// removing them is cheap defense in depth.
-fn git_cmd(root: &std::path::Path) -> std::process::Command {
+/// Environment variables that can redirect which repository/objects git
+/// reads, alter diff output, or inject arbitrary git config. The reviewed
+/// agent shares this process environment, so all of them are stripped
+/// before running git.
+const SCRUBBED_GIT_ENV: &[&str] = &[
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    // GIT_CONFIG_PARAMETERS can itself encode arbitrary key/value pairs
+    // (including fake GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> style
+    // injection) that git decodes directly, independent of the count var.
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    // GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> are dynamically named and
+    // cannot be enumerated here, but git only reads them up to
+    // GIT_CONFIG_COUNT, so scrubbing that count var alone neutralizes them.
+    // A fake shallow boundary can cut ancestry short; scrubbing this leaves
+    // only the repo's real shallow state (if any) in effect.
+    "GIT_SHALLOW_FILE",
+    // Overrides the ref storage backend on newer git; scrubbing is free
+    // defense in depth even on git versions that don't support it yet.
+    "GIT_REFERENCE_BACKEND",
+];
+
+/// Base `git` invocation: replacement refs disabled (an in-repo agent can
+/// `git replace` HEAD with an innocent-looking commit), commit grafts
+/// disabled (`$GIT_DIR/info/grafts` / `GIT_GRAFT_FILE` can rewrite commit
+/// parentage and move the merge-base so the diff collapses; unlike replace
+/// refs, `--no-replace-objects` does not cover grafts — pinning the graft
+/// file to `/dev/null` overrides the default path and disables repo-local
+/// grafts too), repo-redirection env stripped, and `LC_ALL=C` for stable
+/// message parsing.
+fn base_git() -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
-    cmd.env("LC_ALL", "C")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_DIFF_OPTS")
-        .arg("-C")
-        .arg(root);
+    cmd.arg("--no-replace-objects")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_GRAFT_FILE", "/dev/null")
+        .env("LC_ALL", "C");
+    for var in SCRUBBED_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Base `git` invocation for this module, scoped to `root` via `-C`. See
+/// [`base_git`] for the hardening this applies (replacement refs disabled,
+/// repo-redirection env scrubbed). All commands used here are plumbing that
+/// ignores diff drivers anyway, but removing them is cheap defense in depth.
+fn git_cmd(root: &std::path::Path) -> std::process::Command {
+    let mut cmd = base_git();
+    cmd.arg("-C").arg(root);
     cmd
 }
 
@@ -541,51 +590,161 @@ fn is_zero_oid(oid: &str) -> bool {
     !oid.is_empty() && oid.bytes().all(|b| b == b'0')
 }
 
+fn is_octal_mode_field(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| (b'0'..=b'7').contains(&b))
+}
+
+fn is_hex_oid_field(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Parses `git diff-tree -r -z --raw` output:
 /// `:<oldmode> <newmode> <oldoid> <newoid> <status>\0<path>\0[<path2>\0]`.
 /// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
-fn parse_raw_z(bytes: &[u8]) -> Vec<RawEntry> {
-    let mut tokens = bytes.split(|&b| b == 0);
+/// Any structurally malformed record is a hard error: this parser feeds the
+/// review gate, so partial success is worse than failing the whole diff.
+fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
+    let malformed =
+        |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
+    let mut tokens = bytes.split(|&b| b == 0).peekable();
     let mut entries = Vec::new();
     while let Some(token) = tokens.next() {
         if token.is_empty() {
+            // An empty token is only legal as the very last one (the
+            // trailing NUL after the final record); anything after it would
+            // desynchronize the field/path token stream.
+            if tokens.peek().is_some() {
+                return Err(malformed("unexpected empty token before end of output"));
+            }
             continue;
         }
         let meta = String::from_utf8_lossy(token).to_string();
         let Some(meta) = meta.strip_prefix(':') else {
-            continue;
+            return Err(malformed(&format!(
+                "record does not start with ':': {meta:?}"
+            )));
         };
+        // The `-z` raw format packs the rename/copy score into field 5
+        // itself (e.g. `R100`), so a well-formed record is always exactly 5
+        // space-separated fields.
         let parts: Vec<&str> = meta.split(' ').collect();
-        if parts.len() < 5 {
-            continue;
+        if parts.len() != 5 {
+            return Err(malformed(&format!(
+                "record has {} fields (expected 5): {meta:?}",
+                parts.len()
+            )));
         }
-        let status = parts[4].chars().next().unwrap_or('M');
-        let Some(path_token) = tokens.next() else {
-            break;
-        };
+        let (old_mode, new_mode, old_oid, new_oid, status_field) =
+            (parts[0], parts[1], parts[2], parts[3], parts[4]);
+        if !is_octal_mode_field(old_mode) || !is_octal_mode_field(new_mode) {
+            return Err(malformed(&format!("non-octal mode field: {meta:?}")));
+        }
+        if !is_hex_oid_field(old_oid) || !is_hex_oid_field(new_oid) {
+            return Err(malformed(&format!("non-hex oid field: {meta:?}")));
+        }
+        let mut status_chars = status_field.chars();
+        let status = status_chars
+            .next()
+            .ok_or_else(|| malformed("empty status field"))?;
+        if !matches!(status, 'A' | 'D' | 'M' | 'R' | 'C' | 'T' | 'U' | 'X') {
+            return Err(malformed(&format!("unknown status letter: {meta:?}")));
+        }
+        if !status_chars.as_str().bytes().all(|b| b.is_ascii_digit()) {
+            return Err(malformed(&format!(
+                "invalid rename/copy score in status field: {meta:?}"
+            )));
+        }
+        let path_token = tokens
+            .next()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| malformed(&format!("record {meta:?} has no path")))?;
         let path = String::from_utf8_lossy(path_token).to_string();
         let path2 = if matches!(status, 'R' | 'C') {
-            tokens
-                .next()
-                .map(|t| String::from_utf8_lossy(t).to_string())
+            let token = tokens.next().filter(|t| !t.is_empty()).ok_or_else(|| {
+                malformed(&format!("rename/copy record {meta:?} has no second path"))
+            })?;
+            Some(String::from_utf8_lossy(token).to_string())
         } else {
             None
         };
         entries.push(RawEntry {
-            old_mode: parts[0].to_string(),
-            new_mode: parts[1].to_string(),
-            old_oid: parts[2].to_string(),
-            new_oid: parts[3].to_string(),
+            old_mode: old_mode.to_string(),
+            new_mode: new_mode.to_string(),
+            old_oid: old_oid.to_string(),
+            new_oid: new_oid.to_string(),
             status,
             path,
             path2,
         });
     }
-    entries
+    Ok(entries)
 }
 
-fn is_submodule(entry: &RawEntry) -> bool {
-    entry.old_mode == "160000" || entry.new_mode == "160000"
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+
+    #[test]
+    fn parse_raw_z_valid_record() {
+        let raw = b":100644 100755 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0";
+        let entries = parse_raw_z(raw).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a.txt");
+        assert_eq!(entries[0].status, 'M');
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_garbage_meta() {
+        // A token that isn't `:`-prefixed is not a diff-tree raw record;
+        // silently skipping it would desynchronize the path tokens.
+        assert!(parse_raw_z(b"garbage\0a.txt\0").is_err());
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_truncated_record() {
+        // Meta token with no following path token.
+        assert!(parse_raw_z(b":100644 100644 111 222 M\0").is_err());
+        // Rename record missing its second path.
+        assert!(parse_raw_z(
+            b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 R90\0old.txt\0"
+        )
+        .is_err());
+        // Meta with fewer than 5 fields.
+        assert!(parse_raw_z(b":100644 100644 M\0a.txt\0").is_err());
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_bad_fields() {
+        // 6 fields
+        assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M extra\0a.txt\0").is_err());
+        // non-octal mode
+        assert!(parse_raw_z(b":10z644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0").is_err());
+        // non-hex oid
+        assert!(parse_raw_z(
+            b":100644 100644 zzzz 2222222222222222222222222222222222222222 M\0a.txt\0"
+        )
+        .is_err());
+        // unknown status letter
+        assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 Q\0a.txt\0").is_err());
+        // interior empty token
+        assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0\0b.txt\0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod blob_of_tests {
+    use super::*;
+
+    #[test]
+    fn blob_of_missing_oid_is_an_error() {
+        let contents = std::collections::HashMap::new();
+        assert!(blob_of(&contents, "0000000000000000000000000000000000000000").is_ok());
+        assert!(blob_of(&contents, "1234567890123456789012345678901234567890").is_err());
+    }
+}
+
+fn is_gitlink_mode(mode: &str) -> bool {
+    mode == "160000"
 }
 
 /// Path to show in user-facing warnings: the post-change path when present.
@@ -613,7 +772,9 @@ fn entry_status(entry: &RawEntry) -> FileStatus {
 
 /// Runs `git cat-file <flag>` feeding `input` (one oid per line) on stdin
 /// and returning raw stdout. Stdin is written from a helper thread so a
-/// large response can't deadlock against a full stdin pipe.
+/// large response can't deadlock against a full stdin pipe. A write failure
+/// (e.g. git exiting early) means the response git did produce is for a
+/// truncated request, not a complete one, so it must not be trusted.
 fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec<u8>, GitError> {
     use std::io::Write;
     let mut child = git_cmd(root)
@@ -625,18 +786,21 @@ fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec
         .map_err(|e| GitError::GitFailed(e.to_string()))?;
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let input = input.to_string();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(input.as_bytes());
-    });
+    let writer =
+        std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(input.as_bytes()) });
     let output = child
         .wait_with_output()
         .map_err(|e| GitError::GitFailed(e.to_string()))?;
-    let _ = writer.join();
+    let write_result = writer
+        .join()
+        .map_err(|_| GitError::GitFailed("cat-file stdin writer thread panicked".to_string()))?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
+    write_result
+        .map_err(|e| GitError::GitFailed(format!("failed to write cat-file stdin request: {e}")))?;
     Ok(output.stdout)
 }
 
@@ -703,12 +867,22 @@ fn blob_contents(
     Ok(contents)
 }
 
-fn blob_of<'a>(contents: &'a std::collections::HashMap<String, Vec<u8>>, oid: &str) -> &'a [u8] {
+/// Looks up a fetched blob's content by oid. The all-zero oid (added/deleted
+/// side) is the one legitimate case with no fetched content and returns
+/// `&[]`; any other oid missing from `contents` is a bug in the fetch/lookup
+/// pipeline (or a tampered `cat-file` response) and must fail closed rather
+/// than silently rendering as an empty file.
+fn blob_of<'a>(
+    contents: &'a std::collections::HashMap<String, Vec<u8>>,
+    oid: &str,
+) -> Result<&'a [u8], GitError> {
     if is_zero_oid(oid) {
-        &[]
-    } else {
-        contents.get(oid).map(|v| v.as_slice()).unwrap_or(&[])
+        return Ok(&[]);
     }
+    contents
+        .get(oid)
+        .map(|v| v.as_slice())
+        .ok_or_else(|| GitError::GitFailed(format!("object {oid} missing from cat-file response")))
 }
 
 /// Same heuristic git uses: a NUL byte within the first 8000 bytes.
@@ -716,43 +890,23 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8000)].contains(&0)
 }
 
-/// Synthesizes the `Subproject commit <oid>` hunk for a gitlink entry,
-/// mirroring what `git diff` prints for submodule pointer changes.
-fn submodule_diff(entry: &RawEntry) -> (FileStatus, Vec<Hunk>) {
-    let mut lines = Vec::new();
-    if entry.old_mode == "160000" && !is_zero_oid(&entry.old_oid) {
-        lines.push(DiffLine {
-            kind: LineKind::Remove,
-            content: format!("Subproject commit {}", entry.old_oid),
-            old_no: Some(1),
-            new_no: None,
-        });
+/// Text representation of one side (old or new) of a raw entry, used as
+/// input to [`text_hunks`]. Never `cat-file`s a gitlink oid (it usually
+/// doesn't exist locally as a blob) — a gitlink side becomes the same
+/// synthetic `Subproject commit <oid>` line `git diff` prints, so
+/// converting a regular file to/from a gitlink still shows the blob content
+/// on the non-gitlink side instead of hiding it behind a submodule-only view.
+fn side_bytes<'a>(
+    mode: &str,
+    oid: &str,
+    contents: &'a std::collections::HashMap<String, Vec<u8>>,
+) -> Result<std::borrow::Cow<'a, [u8]>, GitError> {
+    if is_gitlink_mode(mode) && !is_zero_oid(oid) {
+        return Ok(std::borrow::Cow::Owned(
+            format!("Subproject commit {oid}\n").into_bytes(),
+        ));
     }
-    if entry.new_mode == "160000" && !is_zero_oid(&entry.new_oid) {
-        lines.push(DiffLine {
-            kind: LineKind::Add,
-            content: format!("Subproject commit {}", entry.new_oid),
-            old_no: None,
-            new_no: Some(1),
-        });
-    }
-    let old_count = lines
-        .iter()
-        .filter(|l| matches!(l.kind, LineKind::Remove))
-        .count() as u32;
-    let new_count = lines
-        .iter()
-        .filter(|l| matches!(l.kind, LineKind::Add))
-        .count() as u32;
-    let hunk = Hunk {
-        old_start: if old_count > 0 { 1 } else { 0 },
-        old_count,
-        new_start: if new_count > 0 { 1 } else { 0 },
-        new_count,
-        section: String::new(),
-        lines,
-    };
-    (entry_status(entry), vec![hunk])
+    blob_of(contents, oid).map(std::borrow::Cow::Borrowed)
 }
 
 /// Line-based text diff with 3 lines of context, built directly from blob
@@ -826,8 +980,11 @@ fn text_hunks(old: &str, new: &str) -> Vec<Hunk> {
 ///
 /// 1. `rev-parse --verify` both endpoints (bad base -> `BadBase`),
 /// 2. `merge-base` to reproduce `...` semantics,
-/// 3. `diff-tree -r -z -M --full-index --raw` for the file list (NUL
-///    delimited, so paths arrive verbatim regardless of `core.quotepath`),
+/// 3. `diff-tree -r -z -M --full-index --raw --ignore-submodules=none` for
+///    the file list (NUL delimited, so paths arrive verbatim regardless of
+///    `core.quotepath`; `--ignore-submodules=none` overrides
+///    `submodule.<name>.ignore` / `.gitmodules` config that would otherwise
+///    suppress gitlink change entries),
 /// 4. `cat-file --batch-check` / `--batch` for blob sizes and contents,
 /// 5. an in-process line diff (`similar`) with 3 context lines.
 ///
@@ -866,6 +1023,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             "-M",
             "--full-index",
             "--raw",
+            "--ignore-submodules=none",
             &merge_base,
             &head_oid,
         ],
@@ -875,17 +1033,22 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             String::from_utf8_lossy(&out.stderr).to_string(),
         ));
     }
-    let entries = parse_raw_z(&out.stdout);
+    let entries = parse_raw_z(&out.stdout)?;
 
     // Sizes first (--batch-check), so oversized blobs are never ingested.
+    // Gitlink sides are excluded: their oid is a commit in a submodule repo,
+    // not a blob in this one, and usually doesn't exist locally at all.
     let mut size_oids: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in &entries {
-        if is_submodule(entry) || entry.old_oid == entry.new_oid {
+        if entry.old_oid == entry.new_oid {
             continue;
         }
-        for oid in [&entry.old_oid, &entry.new_oid] {
-            if !is_zero_oid(oid) && seen.insert(oid.clone()) {
+        for (mode, oid) in [
+            (&entry.old_mode, &entry.old_oid),
+            (&entry.new_mode, &entry.new_oid),
+        ] {
+            if !is_zero_oid(oid) && !is_gitlink_mode(mode) && seen.insert(oid.clone()) {
                 size_oids.push(oid.clone());
             }
         }
@@ -898,19 +1061,19 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     let mut need_seen = std::collections::HashSet::new();
     let mut total_bytes: usize = 0;
     for entry in &entries {
-        if is_submodule(entry) {
-            plans.push(Plan::Submodule);
-            continue;
-        }
         if entry.old_oid == entry.new_oid {
-            // Pure rename (R100) or mode-only change: nothing to show.
+            // Pure rename (R100), mode-only change, or a gitlink pointing at
+            // the same commit on both sides: nothing to show.
             plans.push(Plan::NoContent);
             continue;
         }
         let mut file_bytes = 0usize;
         let mut max_blob = 0usize;
-        for oid in [&entry.old_oid, &entry.new_oid] {
-            if is_zero_oid(oid) {
+        for (mode, oid) in [
+            (&entry.old_mode, &entry.old_oid),
+            (&entry.new_mode, &entry.new_oid),
+        ] {
+            if is_zero_oid(oid) || is_gitlink_mode(mode) {
                 continue;
             }
             let Some(&size) = sizes.get(oid.as_str()) else {
@@ -939,8 +1102,11 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             continue;
         }
         total_bytes += file_bytes;
-        for oid in [&entry.old_oid, &entry.new_oid] {
-            if !is_zero_oid(oid) && need_seen.insert(oid.clone()) {
+        for (mode, oid) in [
+            (&entry.old_mode, &entry.old_oid),
+            (&entry.new_mode, &entry.new_oid),
+        ] {
+            if !is_zero_oid(oid) && !is_gitlink_mode(mode) && need_seen.insert(oid.clone()) {
                 need_oids.push(oid.clone());
             }
         }
@@ -953,18 +1119,28 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     for (entry, plan) in entries.iter().zip(&plans) {
         let (old_path, new_path) = entry_paths(entry);
         let (status, hunks) = match plan {
-            Plan::Submodule => submodule_diff(entry),
             Plan::NoContent => (entry_status(entry), Vec::new()),
             Plan::TooLarge => (FileStatus::TooLarge, Vec::new()),
             Plan::Content => {
-                let old = blob_of(&contents, &entry.old_oid);
-                let new = blob_of(&contents, &entry.new_oid);
-                if is_binary(old) || is_binary(new) {
+                let old = side_bytes(&entry.old_mode, &entry.old_oid, &contents)?;
+                let new = side_bytes(&entry.new_mode, &entry.new_oid, &contents)?;
+                if is_binary(&old) || is_binary(&new) {
                     (FileStatus::Binary, Vec::new())
                 } else {
-                    let old_text = String::from_utf8_lossy(old);
-                    let new_text = String::from_utf8_lossy(new);
-                    (entry_status(entry), text_hunks(&old_text, &new_text))
+                    match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
+                        (Ok(old_text), Ok(new_text)) => {
+                            (entry_status(entry), text_hunks(old_text, new_text))
+                        }
+                        _ => {
+                            // Different byte contents can lossy-decode to the
+                            // same string; never diff lossily.
+                            warnings.push(format!(
+                                "file content is not valid UTF-8, not rendered: {}",
+                                display_path(entry)
+                            ));
+                            (FileStatus::NonUtf8, Vec::new())
+                        }
+                    }
                 }
             }
         };
@@ -1041,6 +1217,67 @@ mod git_tests {
             .iter()
             .flat_map(|h| h.lines.iter().map(|l| l.content.as_str()))
             .collect()
+    }
+
+    /// Runs git in `dir` and returns trimmed stdout (asserting success).
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn replace_refs_cannot_hide_changes() {
+        // An agent can `git replace` the real HEAD with a fake commit whose
+        // tree equals the base tree; every git command then silently reads
+        // the fake commit and the diff comes back empty. --no-replace-objects
+        // must defeat this.
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a.txt"), "one\nEVIL\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "evil change"]);
+        let head = git_stdout(d, &["rev-parse", "HEAD"]);
+        let base_tree = git_stdout(d, &["rev-parse", "main^{tree}"]);
+        let fake = git_stdout(
+            d,
+            &["commit-tree", &base_tree, "-p", "main", "-m", "innocent"],
+        );
+        git(d, &["replace", &head, &fake]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.status, FileStatus::Modified);
+        assert!(hunk_contents(a).contains(&"EVIL"));
+    }
+
+    #[test]
+    fn grafts_cannot_move_the_merge_base() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a.txt"), "one\nEVIL\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "evil change"]);
+        let head = git_stdout(d, &["rev-parse", "HEAD"]);
+        let main_oid = git_stdout(d, &["rev-parse", "main"]);
+        // Graft main's tip to claim HEAD as its parent: HEAD becomes an ancestor
+        // of main, so merge-base(main, HEAD) = HEAD and the diff collapses to
+        // empty — unless grafts are disabled.
+        let graft_dir = d.join(".git").join("info");
+        std::fs::create_dir_all(&graft_dir).unwrap();
+        std::fs::write(graft_dir.join("grafts"), format!("{main_oid} {head}\n")).unwrap();
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert!(hunk_contents(a).contains(&"EVIL"));
     }
 
     #[test]
@@ -1254,6 +1491,48 @@ mod git_tests {
     }
 
     #[test]
+    fn submodule_ignore_all_config_cannot_hide_gitlink_change() {
+        let td = base_repo();
+        let d = td.path();
+        let sha1 = "1111111111111111111111111111111111111111";
+        let sha2 = "2222222222222222222222222222222222222222";
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha1},sub"),
+            ],
+        );
+        std::fs::write(
+            d.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n",
+        )
+        .unwrap();
+        git(d, &["add", ".gitmodules"]);
+        git(d, &["commit", "-m", "add submodule"]);
+        // Move main forward so the gitlink change is on the feature side only.
+        git(d, &["checkout", "main"]);
+        git(d, &["merge", "--ff-only", "feature"]);
+        git(d, &["checkout", "feature"]);
+        git(d, &["config", "submodule.sub.ignore", "all"]);
+        git(
+            d,
+            &["update-index", "--cacheinfo", &format!("160000,{sha2},sub")],
+        );
+        git(d, &["commit", "-m", "bump submodule"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "sub");
+        let contents = hunk_contents(f);
+        assert!(
+            contents.iter().any(|c| c.contains(sha2)),
+            "gitlink bump must be visible: {contents:?}"
+        );
+    }
+
+    #[test]
     fn submodule_pointer_change_is_visible() {
         let td = base_repo();
         let d = td.path();
@@ -1281,6 +1560,78 @@ mod git_tests {
     }
 
     #[test]
+    fn file_to_gitlink_conversion_shows_removed_content() {
+        let td = base_repo();
+        let d = td.path();
+        // a.txt exists on main with content "one\ntwo\nthree\n". Convert it to a gitlink.
+        let sha = "3333333333333333333333333333333333333333";
+        git(d, &["rm", "--cached", "a.txt"]);
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},a.txt"),
+            ],
+        );
+        git(d, &["commit", "-m", "file to gitlink"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "a.txt");
+        let contents = hunk_contents(f);
+        assert!(
+            contents.contains(&"two"),
+            "old file content must be visible: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains(sha)),
+            "new gitlink must be visible: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn gitlink_to_file_conversion_shows_added_content() {
+        let td = base_repo();
+        let d = td.path();
+        let sha = "4444444444444444444444444444444444444444";
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},sub"),
+            ],
+        );
+        git(d, &["commit", "-m", "add gitlink"]);
+        git(d, &["checkout", "main"]);
+        git(d, &["merge", "--ff-only", "feature"]);
+        git(d, &["checkout", "feature"]);
+        git(d, &["rm", "--cached", "sub"]);
+        // Checking out a gitlink entry leaves an empty directory at its path
+        // (the submodule mount point); it must go before `sub` can become a
+        // regular file.
+        let _ = std::fs::remove_dir(d.join("sub"));
+        std::fs::write(d.join("sub"), "EVIL payload\n").unwrap();
+        git(d, &["add", "sub"]);
+        git(d, &["commit", "-m", "gitlink to file"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "sub");
+        let contents = hunk_contents(f);
+        assert!(
+            contents.contains(&"EVIL payload"),
+            "added file content must be visible: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains(sha)),
+            "old gitlink must be visible: {contents:?}"
+        );
+    }
+
+    #[test]
     fn nul_bytes_are_binary() {
         let td = base_repo();
         let d = td.path();
@@ -1292,6 +1643,36 @@ mod git_tests {
         let f = find(&out.files, "blob.bin");
         assert_eq!(f.status, FileStatus::Binary);
         assert!(f.hunks.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_blobs_are_not_lossy_diffed() {
+        // 0x80 -> 0x81: neither contains NUL, both are invalid UTF-8, and
+        // both lossy-decode to "\u{FFFD}\n" — a lossy text diff would claim
+        // "no content changes" for a real byte-level change.
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("data.txt"), [0x80, b'\n']).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "feature"]);
+        std::fs::write(d.join("data.txt"), [0x81, b'\n']).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        assert_eq!(out.files.len(), 1);
+        assert_eq!(out.files[0].status, FileStatus::NonUtf8);
+        assert!(out.files[0].hunks.is_empty());
+        assert_eq!(out.warnings.len(), 1);
+        assert!(
+            out.warnings[0].contains("data.txt"),
+            "warning should name the file: {}",
+            out.warnings[0]
+        );
     }
 
     #[test]

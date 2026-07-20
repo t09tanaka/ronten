@@ -23,7 +23,14 @@ export interface Hunk {
   lines: DiffLine[]
 }
 
-export type FileStatus = 'modified' | 'added' | 'deleted' | 'renamed' | 'binary' | 'too-large'
+export type FileStatus =
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'renamed'
+  | 'binary'
+  | 'non-utf8'
+  | 'too-large'
 
 export interface FileDiff {
   old_path: string | null
