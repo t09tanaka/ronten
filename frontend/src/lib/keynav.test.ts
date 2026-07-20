@@ -21,8 +21,8 @@ describe('interpretKey', () => {
     })
   })
 
-  it('maps c to verdict comment', () => {
-    expect(interpretKey('c', 'BODY', false)).toEqual({ type: 'verdict', verdict: 'comment' })
+  it('returns null for c (the removed comment-verdict binding)', () => {
+    expect(interpretKey('c', 'BODY', false)).toBeNull()
   })
 
   it('maps i to focus-comment', () => {

@@ -14,7 +14,6 @@
   const options: { value: Verdict; label: string }[] = [
     { value: 'approve', label: 'Approve' },
     { value: 'request-changes', label: 'Request changes' },
-    { value: 'comment', label: 'Comment' },
   ]
 </script>
 
@@ -70,9 +69,4 @@
     color: var(--c-shu);
   }
 
-  .verdict-btn.active.verdict-comment {
-    background: var(--c-ai-tint);
-    border-color: var(--c-ai);
-    color: var(--c-ai);
-  }
 </style>

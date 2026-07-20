@@ -192,7 +192,6 @@ The UI is keyboard-first — a full review pass is possible without a mouse:
 | `j` / `k` | select next / previous concern |
 | `a` | verdict: approve |
 | `x` | verdict: request changes |
-| `c` | verdict: comment |
 | `i` | focus the comment box |
 | `Enter` | confirm submit |
 | `Escape` | close the submit/abort confirmation or the inline comment editor |

@@ -381,7 +381,7 @@ index 1111111..2222222 100644
             "concerns": {
                 "c1": { "verdict": "request-changes", "comments": [] },
                 "c2": { "verdict": "approve", "comments": [] },
-                "_unmapped": { "verdict": "comment", "comments": [] }
+                "_unmapped": { "verdict": "approve", "comments": [] }
             },
             "general_comments": ["looks mostly fine"]
         });

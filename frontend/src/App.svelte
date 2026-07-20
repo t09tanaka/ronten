@@ -20,7 +20,6 @@
   const VERDICT_LABELS: Record<Verdict, string> = {
     approve: 'Approve',
     'request-changes': 'Request changes',
-    comment: 'Comment',
   }
 
   function verdictLabel(v: Verdict | null | undefined): string {
@@ -116,10 +115,8 @@
         e.preventDefault()
         if (rs.selected) {
           rs.setVerdict(rs.selected.id, action.verdict)
-          // Comment and request-changes verdicts mean "I have something to
-          // write" — bring the comment box into view and focus it, like the
-          // `i` shortcut. A nudge only: submitting without a comment stays
-          // allowed.
+          // Request-changes means "I have something to write" — bring the
+          // comment box into view and focus it, like the `i` shortcut.
           if (action.verdict !== 'approve') focusGeneralComments()
         }
         break
@@ -215,7 +212,7 @@
   const submitTitle = $derived(
     rs.allReviewed
       ? 'Submit review'
-      : `Every concern needs a verdict — request changes and comment also need a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`,
+      : `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`,
   )
 </script>
 
@@ -342,7 +339,7 @@
     </div>
     <footer class="shortcut-hint">
       <kbd>j</kbd>/<kbd>k</kbd> select · <kbd>a</kbd> approve · <kbd>x</kbd> request changes ·
-      <kbd>c</kbd> comment · <kbd>Enter</kbd> submit · <kbd>i</kbd> comment box · <kbd>Esc</kbd> close
+      <kbd>Enter</kbd> submit · <kbd>i</kbd> comment box · <kbd>Esc</kbd> close
     </footer>
   </div>
 
@@ -866,9 +863,6 @@
     color: var(--c-shu);
   }
 
-  .vs-comment {
-    color: var(--c-ai);
-  }
 
   .modal-error {
     font-size: 13px;

@@ -5,11 +5,10 @@
   const MARK_LABELS: Record<Verdict, string> = {
     approve: 'Verdict: Approve',
     'request-changes': 'Verdict: Request changes',
-    comment: 'Verdict: Comment',
   }
 
-  // Only confirmed verdicts get a mark; an unconfirmed request-changes or
-  // comment verdict (no comment written yet) keeps the pending placeholder.
+  // Only confirmed verdicts get a mark; an unconfirmed request-changes
+  // verdict (no comment written yet) keeps the pending placeholder.
   function verdictOf(id: string): Verdict | null {
     if (!rs.isConfirmed(id)) return null
     return rs.draft.concerns[id]?.verdict ?? null
@@ -55,21 +54,13 @@
                     stroke-linecap="round"
                     stroke-linejoin="round"
                   />
-                {:else if verdict === 'request-changes'}
+                {:else}
                   <path
                     d="M3.5 3.5 L10.5 10.5 M10.5 3.5 L3.5 10.5"
                     fill="none"
                     stroke="currentColor"
                     stroke-width="1.8"
                     stroke-linecap="round"
-                  />
-                {:else}
-                  <path
-                    d="M2.5 3 h9 v6.5 h-5 l-2.5 2.2 v-2.2 h-1.5 z"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="1.5"
-                    stroke-linejoin="round"
                   />
                 {/if}
               </svg>
@@ -166,10 +157,6 @@
 
   .mark-request-changes {
     color: var(--c-shu);
-  }
-
-  .mark-comment {
-    color: var(--c-ai);
   }
 
   /* Pending placeholder: quiet, and never stamp-animated (it appears on
