@@ -590,6 +590,14 @@ fn is_zero_oid(oid: &str) -> bool {
     !oid.is_empty() && oid.bytes().all(|b| b == b'0')
 }
 
+fn is_octal_mode_field(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| (b'0'..=b'7').contains(&b))
+}
+
+fn is_hex_oid_field(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Parses `git diff-tree -r -z --raw` output:
 /// `:<oldmode> <newmode> <oldoid> <newoid> <status>\0<path>\0[<path2>\0]`.
 /// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
@@ -598,12 +606,16 @@ fn is_zero_oid(oid: &str) -> bool {
 fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
     let malformed =
         |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
-    let mut tokens = bytes.split(|&b| b == 0);
+    let mut tokens = bytes.split(|&b| b == 0).peekable();
     let mut entries = Vec::new();
     while let Some(token) = tokens.next() {
         if token.is_empty() {
-            // The trailing NUL leaves one empty token; anything after it
-            // would be malformed and is caught on the next iteration.
+            // An empty token is only legal as the very last one (the
+            // trailing NUL after the final record); anything after it would
+            // desynchronize the field/path token stream.
+            if tokens.peek().is_some() {
+                return Err(malformed("unexpected empty token before end of output"));
+            }
             continue;
         }
         let meta = String::from_utf8_lossy(token).to_string();
@@ -612,17 +624,36 @@ fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
                 "record does not start with ':': {meta:?}"
             )));
         };
+        // The `-z` raw format packs the rename/copy score into field 5
+        // itself (e.g. `R100`), so a well-formed record is always exactly 5
+        // space-separated fields.
         let parts: Vec<&str> = meta.split(' ').collect();
-        if parts.len() < 5 {
+        if parts.len() != 5 {
             return Err(malformed(&format!(
                 "record has {} fields (expected 5): {meta:?}",
                 parts.len()
             )));
         }
-        let status = parts[4]
-            .chars()
+        let (old_mode, new_mode, old_oid, new_oid, status_field) =
+            (parts[0], parts[1], parts[2], parts[3], parts[4]);
+        if !is_octal_mode_field(old_mode) || !is_octal_mode_field(new_mode) {
+            return Err(malformed(&format!("non-octal mode field: {meta:?}")));
+        }
+        if !is_hex_oid_field(old_oid) || !is_hex_oid_field(new_oid) {
+            return Err(malformed(&format!("non-hex oid field: {meta:?}")));
+        }
+        let mut status_chars = status_field.chars();
+        let status = status_chars
             .next()
             .ok_or_else(|| malformed("empty status field"))?;
+        if !matches!(status, 'A' | 'D' | 'M' | 'R' | 'C' | 'T' | 'U' | 'X') {
+            return Err(malformed(&format!("unknown status letter: {meta:?}")));
+        }
+        if !status_chars.as_str().bytes().all(|b| b.is_ascii_digit()) {
+            return Err(malformed(&format!(
+                "invalid rename/copy score in status field: {meta:?}"
+            )));
+        }
         let path_token = tokens
             .next()
             .filter(|t| !t.is_empty())
@@ -637,10 +668,10 @@ fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
             None
         };
         entries.push(RawEntry {
-            old_mode: parts[0].to_string(),
-            new_mode: parts[1].to_string(),
-            old_oid: parts[2].to_string(),
-            new_oid: parts[3].to_string(),
+            old_mode: old_mode.to_string(),
+            new_mode: new_mode.to_string(),
+            old_oid: old_oid.to_string(),
+            new_oid: new_oid.to_string(),
             status,
             path,
             path2,
@@ -681,6 +712,35 @@ mod raw_tests {
         // Meta with fewer than 5 fields.
         assert!(parse_raw_z(b":100644 100644 M\0a.txt\0").is_err());
     }
+
+    #[test]
+    fn parse_raw_z_rejects_bad_fields() {
+        // 6 fields
+        assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M extra\0a.txt\0").is_err());
+        // non-octal mode
+        assert!(parse_raw_z(b":10z644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0").is_err());
+        // non-hex oid
+        assert!(parse_raw_z(
+            b":100644 100644 zzzz 2222222222222222222222222222222222222222 M\0a.txt\0"
+        )
+        .is_err());
+        // unknown status letter
+        assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 Q\0a.txt\0").is_err());
+        // interior empty token
+        assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0\0b.txt\0").is_err());
+    }
+}
+
+#[cfg(test)]
+mod blob_of_tests {
+    use super::*;
+
+    #[test]
+    fn blob_of_missing_oid_is_an_error() {
+        let contents = std::collections::HashMap::new();
+        assert!(blob_of(&contents, "0000000000000000000000000000000000000000").is_ok());
+        assert!(blob_of(&contents, "1234567890123456789012345678901234567890").is_err());
+    }
 }
 
 fn is_gitlink_mode(mode: &str) -> bool {
@@ -712,7 +772,9 @@ fn entry_status(entry: &RawEntry) -> FileStatus {
 
 /// Runs `git cat-file <flag>` feeding `input` (one oid per line) on stdin
 /// and returning raw stdout. Stdin is written from a helper thread so a
-/// large response can't deadlock against a full stdin pipe.
+/// large response can't deadlock against a full stdin pipe. A write failure
+/// (e.g. git exiting early) means the response git did produce is for a
+/// truncated request, not a complete one, so it must not be trusted.
 fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec<u8>, GitError> {
     use std::io::Write;
     let mut child = git_cmd(root)
@@ -724,18 +786,21 @@ fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec
         .map_err(|e| GitError::GitFailed(e.to_string()))?;
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let input = input.to_string();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(input.as_bytes());
-    });
+    let writer =
+        std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(input.as_bytes()) });
     let output = child
         .wait_with_output()
         .map_err(|e| GitError::GitFailed(e.to_string()))?;
-    let _ = writer.join();
+    let write_result = writer
+        .join()
+        .map_err(|_| GitError::GitFailed("cat-file stdin writer thread panicked".to_string()))?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
+    write_result
+        .map_err(|e| GitError::GitFailed(format!("failed to write cat-file stdin request: {e}")))?;
     Ok(output.stdout)
 }
 
