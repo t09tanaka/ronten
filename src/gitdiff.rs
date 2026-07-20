@@ -498,8 +498,9 @@ enum Plan {
 }
 
 /// Environment variables that can redirect which repository/objects git
-/// reads, or alter diff output. The reviewed agent shares this process
-/// environment, so all of them are stripped before running git.
+/// reads, alter diff output, or inject arbitrary git config. The reviewed
+/// agent shares this process environment, so all of them are stripped
+/// before running git.
 const SCRUBBED_GIT_ENV: &[&str] = &[
     "GIT_EXTERNAL_DIFF",
     "GIT_DIFF_OPTS",
@@ -510,6 +511,17 @@ const SCRUBBED_GIT_ENV: &[&str] = &[
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_COUNT",
+    // GIT_CONFIG_PARAMETERS can itself encode arbitrary key/value pairs
+    // (including fake GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> style
+    // injection) that git decodes directly, independent of the count var.
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_GLOBAL",
+    "GIT_CONFIG_SYSTEM",
+    // GIT_CONFIG_KEY_<n>/GIT_CONFIG_VALUE_<n> are dynamically named and
+    // cannot be enumerated here, but git only reads them up to
+    // GIT_CONFIG_COUNT, so scrubbing that count var alone neutralizes them.
 ];
 
 /// Base `git` invocation: replacement refs disabled (an in-repo agent can
