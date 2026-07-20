@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - 全PRはmainベース・`gh pr create`経由（ローカルマージ禁止、`--amend`禁止）
-- `frontend/dist` はコミット対象（frontend変更時は再ビルドしてdistもコミット）
+- ~~`frontend/dist` はコミット対象~~ **訂正（実装時判明）:** `frontend/dist` は gitignore されており非追跡。コミットするのはfrontendソースのみ（distの packaging 問題は PR4 スコープ）
 - Push前に `/run-github-actions-locally` でローカルCI確認（fmt / clippy -D warnings / cargo test / frontend check+test+build）
 - テスト・lint実行は sonnet subagent に委譲する（親コンテキストで直接実行しない）
 - 出力契約（result JSON）は変更しない。`FileStatus` はsession payload（フロントエンド専用）なので追加は非破壊
@@ -238,8 +238,10 @@ export type FileStatus =
 
 ```ts
       case 'non-utf8':
-        return 'File content is not valid UTF-8 (not rendered)'
+        return 'Non-UTF-8 file changed (content not displayed)'
 ```
+
+（当初案 `'File content is not valid UTF-8 (not rendered)'` は Codex 文言レビューを受け、既存の "Binary file changed" と構造を揃えた上記に変更）
 
 - [ ] **Step 5: Run all tests + frontend check, rebuild dist**
 
@@ -385,6 +387,20 @@ git commit -m "fix: fail closed on malformed diff-tree raw records"
 - [ ] **Step 3:** ユーザーにマージを依頼し、マージ後にPR2の計画へ進む
 
 ---
+
+## 実装後追記: Codex レビューによる追加修正（同ブランチに反映済み）
+
+Task 1〜3 実装後の Codex レビューで、PR1 スコープ内（diff 隠蔽ベクター）の追加問題が見つかり、以下を同ブランチで修正した。**攻撃①②は実環境で再現を確認済み**（テストが fix 前に RED）。
+
+1. **`--ignore-submodules=none`**: git config `submodule.<name>.ignore=all` で gitlink 変更の raw entry を丸ごと消せた → `diff-tree` にフラグ明示＋回帰テスト
+2. **file↔gitlink typechange の内容隠蔽**: 片側 mode 160000 で `Plan::Submodule` になり blob 側の内容を一切表示しなかった → `Plan::Submodule`/`submodule_diff` を廃止し、各 side を「gitlink なら `Subproject commit <oid>` 行 / blob なら実内容」で表現して `text_hunks` に通す方式へ再設計＋双方向の回帰テスト
+3. **grafts**: `.git/info/grafts` / `GIT_GRAFT_FILE` で親関係を偽装し merge-base を動かして diff を空にできた（`--no-replace-objects` は grafts に効かない）→ `GIT_GRAFT_FILE=/dev/null` 固定＋回帰テスト。`GIT_SHALLOW_FILE` / `GIT_REFERENCE_BACKEND` も scrub 追加
+4. **`parse_raw_z` 厳密化**: field 数ちょうど5、mode=octal、oid=hex、status 文字集合、内部空 token 拒否
+5. **blob lookup fail-closed**: `cat-file --batch` 応答に要求 oid が無い場合に空 blob として扱う fail-open を `Result` 化。stdin writer スレッドの書き込み失敗も伝播
+6. **文言変更**: 上記の通り Codex 提案を採用
+7. `GIT_CONFIG` 系（config 注入）env の scrub 追加（最終ブランチレビュー指摘）
+
+見送り（理由付き）: PATH 偽装（README 記載の信頼境界そのもの）、非UTF-8 パス（PR2）、frontend `statusCardText` の網羅性チェック（PR2 の刷新時）、`BadBase` と実行エラーの分離（PR4）。
 
 ## 後続PRロードマップ（各PR着手時に個別プランを作成）
 
