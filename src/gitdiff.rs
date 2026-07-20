@@ -568,30 +568,38 @@ fn is_zero_oid(oid: &str) -> bool {
 /// Parses `git diff-tree -r -z --raw` output:
 /// `:<oldmode> <newmode> <oldoid> <newoid> <status>\0<path>\0[<path2>\0]`.
 /// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
-fn parse_raw_z(bytes: &[u8]) -> Vec<RawEntry> {
+/// Any structurally malformed record is a hard error: this parser feeds the
+/// review gate, so partial success is worse than failing the whole diff.
+fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
+    let malformed = |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
     let mut tokens = bytes.split(|&b| b == 0);
     let mut entries = Vec::new();
     while let Some(token) = tokens.next() {
         if token.is_empty() {
+            // The trailing NUL leaves one empty token; anything after it
+            // would be malformed and is caught on the next iteration.
             continue;
         }
         let meta = String::from_utf8_lossy(token).to_string();
         let Some(meta) = meta.strip_prefix(':') else {
-            continue;
+            return Err(malformed(&format!("record does not start with ':': {meta:?}")));
         };
         let parts: Vec<&str> = meta.split(' ').collect();
         if parts.len() < 5 {
-            continue;
+            return Err(malformed(&format!("record has {} fields (expected 5): {meta:?}", parts.len())));
         }
-        let status = parts[4].chars().next().unwrap_or('M');
-        let Some(path_token) = tokens.next() else {
-            break;
-        };
+        let status = parts[4].chars().next().ok_or_else(|| malformed("empty status field"))?;
+        let path_token = tokens
+            .next()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| malformed(&format!("record {meta:?} has no path")))?;
         let path = String::from_utf8_lossy(path_token).to_string();
         let path2 = if matches!(status, 'R' | 'C') {
-            tokens
+            let token = tokens
                 .next()
-                .map(|t| String::from_utf8_lossy(t).to_string())
+                .filter(|t| !t.is_empty())
+                .ok_or_else(|| malformed(&format!("rename/copy record {meta:?} has no second path")))?;
+            Some(String::from_utf8_lossy(token).to_string())
         } else {
             None
         };
@@ -605,7 +613,41 @@ fn parse_raw_z(bytes: &[u8]) -> Vec<RawEntry> {
             path2,
         });
     }
-    entries
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod raw_tests {
+    use super::*;
+
+    #[test]
+    fn parse_raw_z_valid_record() {
+        let raw = b":100644 100755 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0";
+        let entries = parse_raw_z(raw).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "a.txt");
+        assert_eq!(entries[0].status, 'M');
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_garbage_meta() {
+        // A token that isn't `:`-prefixed is not a diff-tree raw record;
+        // silently skipping it would desynchronize the path tokens.
+        assert!(parse_raw_z(b"garbage\0a.txt\0").is_err());
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_truncated_record() {
+        // Meta token with no following path token.
+        assert!(parse_raw_z(b":100644 100644 111 222 M\0").is_err());
+        // Rename record missing its second path.
+        assert!(parse_raw_z(
+            b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 R90\0old.txt\0"
+        )
+        .is_err());
+        // Meta with fewer than 5 fields.
+        assert!(parse_raw_z(b":100644 100644 M\0a.txt\0").is_err());
+    }
 }
 
 fn is_submodule(entry: &RawEntry) -> bool {
@@ -899,7 +941,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             String::from_utf8_lossy(&out.stderr).to_string(),
         ));
     }
-    let entries = parse_raw_z(&out.stdout);
+    let entries = parse_raw_z(&out.stdout)?;
 
     // Sizes first (--batch-check), so oversized blobs are never ingested.
     let mut size_oids: Vec<String> = Vec::new();
