@@ -485,15 +485,16 @@ struct RawEntry {
 
 /// How a raw entry will be rendered, decided before blob contents are fetched.
 enum Plan {
-    /// Gitlink (mode 160000) on either side: synthesize `Subproject commit`
-    /// lines; never `cat-file` the oid (it usually doesn't exist locally).
-    Submodule,
-    /// Identical blob oids on both sides (pure rename or mode-only change):
-    /// no hunks, no content needed.
+    /// Identical oids on both sides (pure rename, mode-only change, or a
+    /// gitlink pointing at the same commit on both sides): no hunks, no
+    /// content needed.
     NoContent,
     /// Over a size limit: `FileStatus::TooLarge`, no hunks.
     TooLarge,
-    /// Fetch both blobs and diff them.
+    /// Diff two text representations. Gitlink (mode 160000) sides never have
+    /// their oid fetched (it usually doesn't exist locally as a blob);
+    /// instead they contribute the synthetic `Subproject commit <oid>` line.
+    /// See [`side_bytes`].
     Content,
 }
 
@@ -682,8 +683,8 @@ mod raw_tests {
     }
 }
 
-fn is_submodule(entry: &RawEntry) -> bool {
-    entry.old_mode == "160000" || entry.new_mode == "160000"
+fn is_gitlink_mode(mode: &str) -> bool {
+    mode == "160000"
 }
 
 /// Path to show in user-facing warnings: the post-change path when present.
@@ -801,12 +802,22 @@ fn blob_contents(
     Ok(contents)
 }
 
-fn blob_of<'a>(contents: &'a std::collections::HashMap<String, Vec<u8>>, oid: &str) -> &'a [u8] {
+/// Looks up a fetched blob's content by oid. The all-zero oid (added/deleted
+/// side) is the one legitimate case with no fetched content and returns
+/// `&[]`; any other oid missing from `contents` is a bug in the fetch/lookup
+/// pipeline (or a tampered `cat-file` response) and must fail closed rather
+/// than silently rendering as an empty file.
+fn blob_of<'a>(
+    contents: &'a std::collections::HashMap<String, Vec<u8>>,
+    oid: &str,
+) -> Result<&'a [u8], GitError> {
     if is_zero_oid(oid) {
-        &[]
-    } else {
-        contents.get(oid).map(|v| v.as_slice()).unwrap_or(&[])
+        return Ok(&[]);
     }
+    contents
+        .get(oid)
+        .map(|v| v.as_slice())
+        .ok_or_else(|| GitError::GitFailed(format!("object {oid} missing from cat-file response")))
 }
 
 /// Same heuristic git uses: a NUL byte within the first 8000 bytes.
@@ -814,43 +825,23 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8000)].contains(&0)
 }
 
-/// Synthesizes the `Subproject commit <oid>` hunk for a gitlink entry,
-/// mirroring what `git diff` prints for submodule pointer changes.
-fn submodule_diff(entry: &RawEntry) -> (FileStatus, Vec<Hunk>) {
-    let mut lines = Vec::new();
-    if entry.old_mode == "160000" && !is_zero_oid(&entry.old_oid) {
-        lines.push(DiffLine {
-            kind: LineKind::Remove,
-            content: format!("Subproject commit {}", entry.old_oid),
-            old_no: Some(1),
-            new_no: None,
-        });
+/// Text representation of one side (old or new) of a raw entry, used as
+/// input to [`text_hunks`]. Never `cat-file`s a gitlink oid (it usually
+/// doesn't exist locally as a blob) — a gitlink side becomes the same
+/// synthetic `Subproject commit <oid>` line `git diff` prints, so
+/// converting a regular file to/from a gitlink still shows the blob content
+/// on the non-gitlink side instead of hiding it behind a submodule-only view.
+fn side_bytes<'a>(
+    mode: &str,
+    oid: &str,
+    contents: &'a std::collections::HashMap<String, Vec<u8>>,
+) -> Result<std::borrow::Cow<'a, [u8]>, GitError> {
+    if is_gitlink_mode(mode) && !is_zero_oid(oid) {
+        return Ok(std::borrow::Cow::Owned(
+            format!("Subproject commit {oid}\n").into_bytes(),
+        ));
     }
-    if entry.new_mode == "160000" && !is_zero_oid(&entry.new_oid) {
-        lines.push(DiffLine {
-            kind: LineKind::Add,
-            content: format!("Subproject commit {}", entry.new_oid),
-            old_no: None,
-            new_no: Some(1),
-        });
-    }
-    let old_count = lines
-        .iter()
-        .filter(|l| matches!(l.kind, LineKind::Remove))
-        .count() as u32;
-    let new_count = lines
-        .iter()
-        .filter(|l| matches!(l.kind, LineKind::Add))
-        .count() as u32;
-    let hunk = Hunk {
-        old_start: if old_count > 0 { 1 } else { 0 },
-        old_count,
-        new_start: if new_count > 0 { 1 } else { 0 },
-        new_count,
-        section: String::new(),
-        lines,
-    };
-    (entry_status(entry), vec![hunk])
+    blob_of(contents, oid).map(std::borrow::Cow::Borrowed)
 }
 
 /// Line-based text diff with 3 lines of context, built directly from blob
@@ -924,8 +915,11 @@ fn text_hunks(old: &str, new: &str) -> Vec<Hunk> {
 ///
 /// 1. `rev-parse --verify` both endpoints (bad base -> `BadBase`),
 /// 2. `merge-base` to reproduce `...` semantics,
-/// 3. `diff-tree -r -z -M --full-index --raw` for the file list (NUL
-///    delimited, so paths arrive verbatim regardless of `core.quotepath`),
+/// 3. `diff-tree -r -z -M --full-index --raw --ignore-submodules=none` for
+///    the file list (NUL delimited, so paths arrive verbatim regardless of
+///    `core.quotepath`; `--ignore-submodules=none` overrides
+///    `submodule.<name>.ignore` / `.gitmodules` config that would otherwise
+///    suppress gitlink change entries),
 /// 4. `cat-file --batch-check` / `--batch` for blob sizes and contents,
 /// 5. an in-process line diff (`similar`) with 3 context lines.
 ///
@@ -964,6 +958,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             "-M",
             "--full-index",
             "--raw",
+            "--ignore-submodules=none",
             &merge_base,
             &head_oid,
         ],
@@ -976,14 +971,19 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     let entries = parse_raw_z(&out.stdout)?;
 
     // Sizes first (--batch-check), so oversized blobs are never ingested.
+    // Gitlink sides are excluded: their oid is a commit in a submodule repo,
+    // not a blob in this one, and usually doesn't exist locally at all.
     let mut size_oids: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in &entries {
-        if is_submodule(entry) || entry.old_oid == entry.new_oid {
+        if entry.old_oid == entry.new_oid {
             continue;
         }
-        for oid in [&entry.old_oid, &entry.new_oid] {
-            if !is_zero_oid(oid) && seen.insert(oid.clone()) {
+        for (mode, oid) in [
+            (&entry.old_mode, &entry.old_oid),
+            (&entry.new_mode, &entry.new_oid),
+        ] {
+            if !is_zero_oid(oid) && !is_gitlink_mode(mode) && seen.insert(oid.clone()) {
                 size_oids.push(oid.clone());
             }
         }
@@ -996,19 +996,19 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     let mut need_seen = std::collections::HashSet::new();
     let mut total_bytes: usize = 0;
     for entry in &entries {
-        if is_submodule(entry) {
-            plans.push(Plan::Submodule);
-            continue;
-        }
         if entry.old_oid == entry.new_oid {
-            // Pure rename (R100) or mode-only change: nothing to show.
+            // Pure rename (R100), mode-only change, or a gitlink pointing at
+            // the same commit on both sides: nothing to show.
             plans.push(Plan::NoContent);
             continue;
         }
         let mut file_bytes = 0usize;
         let mut max_blob = 0usize;
-        for oid in [&entry.old_oid, &entry.new_oid] {
-            if is_zero_oid(oid) {
+        for (mode, oid) in [
+            (&entry.old_mode, &entry.old_oid),
+            (&entry.new_mode, &entry.new_oid),
+        ] {
+            if is_zero_oid(oid) || is_gitlink_mode(mode) {
                 continue;
             }
             let Some(&size) = sizes.get(oid.as_str()) else {
@@ -1037,8 +1037,11 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             continue;
         }
         total_bytes += file_bytes;
-        for oid in [&entry.old_oid, &entry.new_oid] {
-            if !is_zero_oid(oid) && need_seen.insert(oid.clone()) {
+        for (mode, oid) in [
+            (&entry.old_mode, &entry.old_oid),
+            (&entry.new_mode, &entry.new_oid),
+        ] {
+            if !is_zero_oid(oid) && !is_gitlink_mode(mode) && need_seen.insert(oid.clone()) {
                 need_oids.push(oid.clone());
             }
         }
@@ -1051,16 +1054,15 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     for (entry, plan) in entries.iter().zip(&plans) {
         let (old_path, new_path) = entry_paths(entry);
         let (status, hunks) = match plan {
-            Plan::Submodule => submodule_diff(entry),
             Plan::NoContent => (entry_status(entry), Vec::new()),
             Plan::TooLarge => (FileStatus::TooLarge, Vec::new()),
             Plan::Content => {
-                let old = blob_of(&contents, &entry.old_oid);
-                let new = blob_of(&contents, &entry.new_oid);
-                if is_binary(old) || is_binary(new) {
+                let old = side_bytes(&entry.old_mode, &entry.old_oid, &contents)?;
+                let new = side_bytes(&entry.new_mode, &entry.new_oid, &contents)?;
+                if is_binary(&old) || is_binary(&new) {
                     (FileStatus::Binary, Vec::new())
                 } else {
-                    match (std::str::from_utf8(old), std::str::from_utf8(new)) {
+                    match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
                         (Ok(old_text), Ok(new_text)) => {
                             (entry_status(entry), text_hunks(old_text, new_text))
                         }
@@ -1424,6 +1426,48 @@ mod git_tests {
     }
 
     #[test]
+    fn submodule_ignore_all_config_cannot_hide_gitlink_change() {
+        let td = base_repo();
+        let d = td.path();
+        let sha1 = "1111111111111111111111111111111111111111";
+        let sha2 = "2222222222222222222222222222222222222222";
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha1},sub"),
+            ],
+        );
+        std::fs::write(
+            d.join(".gitmodules"),
+            "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n",
+        )
+        .unwrap();
+        git(d, &["add", ".gitmodules"]);
+        git(d, &["commit", "-m", "add submodule"]);
+        // Move main forward so the gitlink change is on the feature side only.
+        git(d, &["checkout", "main"]);
+        git(d, &["merge", "--ff-only", "feature"]);
+        git(d, &["checkout", "feature"]);
+        git(d, &["config", "submodule.sub.ignore", "all"]);
+        git(
+            d,
+            &["update-index", "--cacheinfo", &format!("160000,{sha2},sub")],
+        );
+        git(d, &["commit", "-m", "bump submodule"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "sub");
+        let contents = hunk_contents(f);
+        assert!(
+            contents.iter().any(|c| c.contains(sha2)),
+            "gitlink bump must be visible: {contents:?}"
+        );
+    }
+
+    #[test]
     fn submodule_pointer_change_is_visible() {
         let td = base_repo();
         let d = td.path();
@@ -1448,6 +1492,78 @@ mod git_tests {
         assert!(matches!(lines[0].kind, LineKind::Add));
         assert_eq!(lines[0].content, format!("Subproject commit {sha}"));
         assert_eq!(lines[0].new_no, Some(1));
+    }
+
+    #[test]
+    fn file_to_gitlink_conversion_shows_removed_content() {
+        let td = base_repo();
+        let d = td.path();
+        // a.txt exists on main with content "one\ntwo\nthree\n". Convert it to a gitlink.
+        let sha = "3333333333333333333333333333333333333333";
+        git(d, &["rm", "--cached", "a.txt"]);
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},a.txt"),
+            ],
+        );
+        git(d, &["commit", "-m", "file to gitlink"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "a.txt");
+        let contents = hunk_contents(f);
+        assert!(
+            contents.contains(&"two"),
+            "old file content must be visible: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains(sha)),
+            "new gitlink must be visible: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn gitlink_to_file_conversion_shows_added_content() {
+        let td = base_repo();
+        let d = td.path();
+        let sha = "4444444444444444444444444444444444444444";
+        git(
+            d,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sha},sub"),
+            ],
+        );
+        git(d, &["commit", "-m", "add gitlink"]);
+        git(d, &["checkout", "main"]);
+        git(d, &["merge", "--ff-only", "feature"]);
+        git(d, &["checkout", "feature"]);
+        git(d, &["rm", "--cached", "sub"]);
+        // Checking out a gitlink entry leaves an empty directory at its path
+        // (the submodule mount point); it must go before `sub` can become a
+        // regular file.
+        let _ = std::fs::remove_dir(d.join("sub"));
+        std::fs::write(d.join("sub"), "EVIL payload\n").unwrap();
+        git(d, &["add", "sub"]);
+        git(d, &["commit", "-m", "gitlink to file"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "sub");
+        let contents = hunk_contents(f);
+        assert!(
+            contents.contains(&"EVIL payload"),
+            "added file content must be visible: {contents:?}"
+        );
+        assert!(
+            contents.iter().any(|c| c.contains(sha)),
+            "old gitlink must be visible: {contents:?}"
+        );
     }
 
     #[test]
