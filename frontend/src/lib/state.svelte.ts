@@ -16,6 +16,7 @@ import type {
 const SAVE_DEBOUNCE_MS = 500
 
 export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error'
+export type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
 export interface CommentTarget {
   path: string
@@ -31,8 +32,11 @@ class ReviewState {
   submitting = $state(false)
   submitError = $state<string | null>(null)
   pendingCommentTarget = $state<CommentTarget | null>(null)
+  saveState = $state<SaveState>('idle')
 
   #saveTimer: ReturnType<typeof setTimeout> | null = null
+  #saveInFlight = false
+  #saveQueued = false
 
   get selected(): ConcernView | null {
     return this.session?.concerns[this.selectedIdx] ?? null
@@ -133,13 +137,43 @@ class ReviewState {
     }
   }
 
+  /** True while the latest draft may not be persisted on the server. */
+  get hasUnsavedChanges(): boolean {
+    return this.#saveTimer != null || this.saveState === 'saving' || this.saveState === 'error'
+  }
+
   scheduleSave(): void {
     if (this.#locked) return
     if (this.#saveTimer != null) clearTimeout(this.#saveTimer)
     this.#saveTimer = setTimeout(() => {
       this.#saveTimer = null
-      void saveDraft(this.draft)
+      void this.#runSave()
     }, SAVE_DEBOUNCE_MS)
+  }
+
+  // Serializes draft PUTs: at most one request in flight, and a save
+  // requested while one is running re-reads the (then-current) draft after
+  // it finishes. This prevents an older payload from racing past a newer
+  // one and overwriting it on the server.
+  async #runSave(): Promise<void> {
+    if (this.#saveInFlight) {
+      this.#saveQueued = true
+      return
+    }
+    this.#saveInFlight = true
+    this.saveState = 'saving'
+    try {
+      do {
+        this.#saveQueued = false
+        await saveDraft(this.draft)
+      } while (this.#saveQueued)
+      this.saveState = 'saved'
+    } catch {
+      // The next scheduleSave (triggered by any draft change) retries.
+      this.saveState = 'error'
+    } finally {
+      this.#saveInFlight = false
+    }
   }
 
   #cancelPendingSave(): void {
@@ -160,11 +194,16 @@ class ReviewState {
         this.phase = 'submitted'
         return
       }
-      const missing =
-        result.missing && result.missing.length > 0 ? `: ${result.missing.join(', ')}` : ''
-      this.submitError = `${result.error}${missing}`
+      const parts = [result.error]
+      if (result.missing && result.missing.length > 0) parts.push(result.missing.join(', '))
+      if (result.details && result.details.length > 0) parts.push(result.details.join(', '))
+      this.submitError = parts.join(': ')
+      // The pending save was cancelled above; make sure the latest draft
+      // still gets persisted now that the submit didn't go through.
+      this.scheduleSave()
     } catch (e) {
       this.submitError = e instanceof Error ? e.message : 'Submit failed'
+      this.scheduleSave()
     } finally {
       this.submitting = false
     }
@@ -180,6 +219,8 @@ class ReviewState {
       this.phase = 'aborted'
     } catch (e) {
       this.submitError = e instanceof Error ? e.message : 'Abort failed'
+      // Same as submitReview: re-persist the draft after a failed abort.
+      this.scheduleSave()
     } finally {
       this.submitting = false
     }

@@ -5,13 +5,29 @@
 use crate::gitdiff::FileDiff;
 use crate::mapping::{HunkRef, Mapping, UNMAPPED_ID};
 use crate::model::{
-    derive_decision, Comment, ConcernResult, ConcernsInput, ResultOutput, Risk, Verdict,
+    derive_decision, Comment, ConcernResult, ConcernsInput, ResultOutput, Risk, Side, Verdict,
+    SUPPORTED_VERSION,
 };
 use crate::server::Outcome;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use tokio::sync::mpsc::Sender;
+
+/// How a session ended. Exactly one terminal state is ever set, via
+/// `SessionState::try_finish`, so submit/abort/timeout races resolve to a
+/// single winner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminal {
+    Submitted,
+    Aborted,
+    TimedOut,
+}
+
+/// Maximum number of comments per concern (and of general comments).
+const MAX_COMMENTS: usize = 500;
+/// Maximum comment body length in characters.
+const MAX_COMMENT_CHARS: usize = 10_000;
 
 /// The human's in-progress (or final, at submit time) review state.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -62,7 +78,7 @@ pub struct SessionState {
     pub token: String,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub draft: Mutex<Draft>,
-    pub finished: Mutex<bool>,
+    pub finished: Mutex<Option<Terminal>>,
     pub outcome_tx: Sender<Outcome>,
 }
 
@@ -75,6 +91,118 @@ impl SessionState {
             ids.push(UNMAPPED_ID.to_string());
         }
         ids
+    }
+
+    /// Atomically claims the session's single terminal state. Returns `true`
+    /// if `t` won (the caller owns the outcome) or `false` if another path
+    /// already finished the session.
+    pub fn try_finish(&self, t: Terminal) -> bool {
+        let mut finished = self.finished.lock().unwrap();
+        if finished.is_some() {
+            false
+        } else {
+            *finished = Some(t);
+            true
+        }
+    }
+
+    /// The hunks assigned to a concern id (`_unmapped` maps to the
+    /// unclaimed bucket). Unknown ids yield an empty slice.
+    fn hunk_refs_for(&self, id: &str) -> &[HunkRef] {
+        if id == UNMAPPED_ID {
+            &self.mapping.unmapped
+        } else {
+            self.mapping
+                .concerns
+                .iter()
+                .find(|mc| mc.id == id)
+                .map(|mc| mc.hunks.as_slice())
+                .unwrap_or(&[])
+        }
+    }
+
+    /// Every `(path, side, line)` a comment on this concern may anchor to,
+    /// derived from the diff lines of the concern's assigned hunks. Hunk-less
+    /// files (binary/pure rename/too-large) contribute no anchors.
+    fn valid_anchors_for(&self, id: &str) -> HashSet<(&str, Side, u32)> {
+        let mut anchors = HashSet::new();
+        for r in self.hunk_refs_for(id) {
+            let file = &self.files[r.file];
+            let Some(hi) = r.hunk else { continue };
+            for line in &file.hunks[hi].lines {
+                if let (Some(no), Some(path)) = (line.old_no, file.old_path.as_deref()) {
+                    anchors.insert((path, Side::Old, no));
+                }
+                if let (Some(no), Some(path)) = (line.new_no, file.new_path.as_deref()) {
+                    anchors.insert((path, Side::New, no));
+                }
+            }
+        }
+        anchors
+    }
+
+    /// Fully validates a draft against the session's contract before submit:
+    /// unknown concern ids, comment anchors outside the concern's assigned
+    /// hunks, blank or oversized bodies, and comment-count limits. Returns
+    /// human-readable violation descriptions (empty = valid). `PUT /draft`
+    /// deliberately skips this — the draft is a lenient scratchpad — so
+    /// submit must always run the full check.
+    pub fn validate_draft(&self, draft: &Draft) -> Vec<String> {
+        let mut violations = Vec::new();
+        let required: HashSet<String> = self.required_ids().into_iter().collect();
+
+        let mut ids: Vec<&String> = draft.concerns.keys().collect();
+        ids.sort();
+        for id in ids {
+            let cd = &draft.concerns[id];
+            if !required.contains(id.as_str()) {
+                violations.push(format!("unknown concern id {id:?}"));
+                continue;
+            }
+            if cd.comments.len() > MAX_COMMENTS {
+                violations.push(format!(
+                    "concern {id:?}: too many comments: {} (maximum {MAX_COMMENTS})",
+                    cd.comments.len()
+                ));
+                continue;
+            }
+            let anchors = self.valid_anchors_for(id);
+            for c in &cd.comments {
+                let at = format!("{}:{}:{}", c.path, side_name(c.side), c.line);
+                if c.body.trim().is_empty() {
+                    violations.push(format!("concern {id:?}: blank comment body at {at}"));
+                } else if c.body.chars().count() > MAX_COMMENT_CHARS {
+                    violations.push(format!(
+                        "concern {id:?}: comment body at {at} exceeds {MAX_COMMENT_CHARS} characters"
+                    ));
+                }
+                if !anchors.contains(&(c.path.as_str(), c.side, c.line)) {
+                    violations.push(format!(
+                        "concern {id:?}: comment anchor {at} does not match any diff line assigned to this concern"
+                    ));
+                }
+            }
+        }
+
+        if draft.general_comments.len() > MAX_COMMENTS {
+            violations.push(format!(
+                "too many general comments: {} (maximum {MAX_COMMENTS})",
+                draft.general_comments.len()
+            ));
+        } else {
+            for (i, g) in draft.general_comments.iter().enumerate() {
+                if g.trim().is_empty() {
+                    violations.push(format!("general comment #{}: blank body", i + 1));
+                } else if g.chars().count() > MAX_COMMENT_CHARS {
+                    violations.push(format!(
+                        "general comment #{}: exceeds {MAX_COMMENT_CHARS} characters",
+                        i + 1
+                    ));
+                }
+            }
+        }
+
+        violations
     }
 
     /// Builds the final `ResultOutput` from a submitted draft. Callers must
@@ -96,7 +224,9 @@ impl SessionState {
             .collect();
         let decision = derive_decision(concerns.iter().map(|c| c.verdict));
         ResultOutput {
-            version: self.input.version,
+            // The contract version ronten processed, not an echo of the
+            // input (which validate_concerns already pinned to this value).
+            version: SUPPORTED_VERSION,
             decision,
             concerns,
             general_comments: draft.general_comments.clone(),
@@ -104,5 +234,13 @@ impl SessionState {
             started_at: self.started_at.to_rfc3339(),
             submitted_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+}
+
+/// Lowercase wire name for a side, matching its serde serialization.
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Old => "old",
+        Side::New => "new",
     }
 }

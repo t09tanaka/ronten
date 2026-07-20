@@ -31,7 +31,9 @@ export async function saveDraft(draft: Draft): Promise<void> {
   }
 }
 
-export type SubmitResult = { ok: true } | { error: string; missing?: string[] }
+export type SubmitResult =
+  | { ok: true }
+  | { error: string; missing?: string[]; details?: string[] }
 
 export async function submit(draft: Draft): Promise<SubmitResult> {
   const res = await fetch(apiUrl('/submit'), {

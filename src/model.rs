@@ -6,24 +6,44 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// The only concerns/result contract version this build of ronten accepts
+/// (and the version it stamps on every emitted result).
+pub const SUPPORTED_VERSION: u32 = 1;
+
 /// Top-level input: a list of concerns an agent wants a human to review.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConcernsInput {
+    /// Contract version. Must be exactly 1 (the only supported version).
+    #[schemars(range(min = 1, max = 1))]
     pub version: u32,
+    /// Optional overall summary of the change (at most 2000 characters).
     #[serde(default)]
+    #[schemars(length(max = 2000))]
     pub summary: Option<String>,
+    /// The concerns to review: 1 to 200 entries with unique ids.
+    #[schemars(length(min = 1, max = 200))]
     pub concerns: Vec<Concern>,
 }
 
 /// A single concern raised against the diff.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Concern {
+    /// Unique concern id: 1-64 characters matching
+    /// `^[A-Za-z0-9][A-Za-z0-9._-]*$`. The id `_unmapped` is reserved.
+    #[schemars(length(min = 1, max = 64), pattern(r"^[A-Za-z0-9][A-Za-z0-9._-]*$"))]
     pub id: String,
+    /// Short title (at most 200 characters; must be non-blank after
+    /// trimming whitespace).
+    #[schemars(length(min = 1, max = 200))]
     pub title: String,
+    /// Longer description (at most 20000 characters).
     #[serde(default)]
+    #[schemars(length(max = 20000))]
     pub description: Option<String>,
     pub risk: Risk,
+    /// Diff locations this concern covers (at most 200 entries).
     #[serde(default)]
+    #[schemars(length(max = 200))]
     pub locations: Vec<Location>,
 }
 
@@ -42,14 +62,20 @@ pub struct Location {
     pub path: String,
     #[serde(default)]
     pub side: Option<Side>,
+    /// First line of the range, 1-based (0 is invalid). When both `start`
+    /// and `end` are present, `start` must be <= `end`.
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub start: Option<u32>,
+    /// Last line of the range, 1-based and inclusive (0 is invalid; must be
+    /// >= `start` when both are present).
     #[serde(default)]
+    #[schemars(range(min = 1))]
     pub end: Option<u32>,
 }
 
 /// Which side of a diff a location or comment refers to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Side {
     Old,
@@ -98,7 +124,12 @@ pub enum Verdict {
 pub struct Comment {
     pub path: String,
     pub side: Side,
+    /// 1-based line number on the given side (0 is invalid).
+    #[schemars(range(min = 1))]
     pub line: u32,
+    /// Comment text (at most 10000 characters; must be non-blank after
+    /// trimming whitespace).
+    #[schemars(length(min = 1, max = 10000))]
     pub body: String,
 }
 
