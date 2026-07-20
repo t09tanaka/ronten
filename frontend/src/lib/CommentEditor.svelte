@@ -34,16 +34,16 @@
     autofocus
   ></textarea>
   <div class="comment-editor-actions">
-    <button type="button" onclick={add} disabled={!body.trim()}>Add comment</button>
-    <button type="button" onclick={cancel}>Cancel</button>
+    <button type="button" class="editor-add" onclick={add} disabled={!body.trim()}>Add comment</button>
+    <button type="button" class="editor-cancel" onclick={cancel}>Cancel</button>
   </div>
 </div>
 
 <style>
   .comment-editor {
     padding: 10px;
-    background: #f6f8fa;
-    border: 1px solid #d0d7de;
+    background: var(--c-panel);
+    border: 1px solid var(--c-rule);
     border-radius: 4px;
     margin: 4px 0;
   }
@@ -54,8 +54,10 @@
     font-family: inherit;
     font-size: 13px;
     padding: 8px;
-    border: 1px solid #ccc;
+    border: 1px solid var(--c-control-border);
     border-radius: 4px;
+    background: var(--c-paper);
+    color: var(--c-ink);
     resize: vertical;
   }
 
@@ -65,24 +67,40 @@
     margin-top: 8px;
   }
 
-  .comment-editor-actions button {
+  .editor-add {
     padding: 5px 12px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background: #fff;
+    border: 1px solid var(--c-ai);
+    border-radius: 3px;
+    background: var(--c-paper);
+    color: var(--c-ai);
     font-size: 13px;
+    font-family: inherit;
     cursor: pointer;
   }
 
-  .comment-editor-actions button:first-child {
-    background: #0969da;
-    border-color: #0969da;
-    color: #fff;
+  .editor-add:hover:not(:disabled) {
+    background: var(--c-ai-tint);
   }
 
-  .comment-editor-actions button:first-child:disabled {
-    background: #a8c8e8;
-    border-color: #a8c8e8;
+  .editor-add:disabled {
+    border-color: var(--c-rule);
+    color: var(--c-ink-3);
     cursor: not-allowed;
+  }
+
+  .editor-cancel {
+    padding: 5px 12px;
+    border: 1px solid var(--c-rule);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--c-ink-2);
+    font-size: 13px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+
+  .editor-cancel:hover {
+    background: var(--c-hover-wash);
+    color: var(--c-ink);
   }
 </style>

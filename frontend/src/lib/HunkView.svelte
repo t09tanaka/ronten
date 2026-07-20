@@ -2,6 +2,7 @@
   import { rs } from './state.svelte'
   import CommentEditor from './CommentEditor.svelte'
   import { newTarget, oldTarget, type CommentLineInfo } from './anchors'
+  import { highlightLine, langForPath } from './highlight'
   import type { Comment, ConcernView, FileDiff, Hunk, HunkRef } from './types'
 
   const COLLAPSE_THRESHOLD = 200
@@ -16,6 +17,7 @@
 
   let { file, hunk, hunkRef, concernId, oncommentline }: Props = $props()
 
+  const lang = $derived(langForPath(file.new_path ?? file.old_path))
   const comments = $derived(rs.draft.concerns[concernId]?.comments ?? [])
 
   function commentsFor(target: CommentLineInfo | null): Comment[] {
@@ -118,7 +120,10 @@
                   >
                 {/if}
               </td>
-              <td class="content">{line.content}</td>
+              <!-- highlightLine always returns HTML-escaped markup (hljs
+                   escapes its input; the fallback path escapes explicitly),
+                   so agent-supplied diff content cannot inject HTML here. -->
+              <td class="content">{@html highlightLine(line.content, lang)}</td>
             </tr>
             {#each [...commentsFor(oldT), ...commentsFor(newT)] as comment (comment)}
               <tr class="comment-row">
@@ -165,7 +170,7 @@
 
 <style>
   .hunk {
-    border: 1px solid #e2e2e2;
+    border: 1px solid var(--c-rule);
     border-top: none;
   }
 
@@ -174,26 +179,26 @@
     align-items: center;
     gap: 10px;
     padding: 4px 10px;
-    background: #fafafa;
-    color: #8b949e;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    background: var(--c-panel);
+    color: var(--c-ink-2);
+    font-family: var(--font-mono);
     font-size: 12px;
-    border-bottom: 1px solid #eee;
+    border-bottom: 1px solid var(--c-rule);
     flex-wrap: wrap;
   }
 
   .hunk-range {
-    color: #6e7781;
+    color: var(--c-ink-2);
   }
 
   .hunk-section {
-    color: #999;
+    color: var(--c-ink-2);
   }
 
   .shared-badge {
     margin-left: auto;
     font-size: 11px;
-    color: #9a6700;
+    color: var(--c-odo);
     display: flex;
     align-items: center;
     gap: 3px;
@@ -202,7 +207,7 @@
   .owner-link {
     background: none;
     border: none;
-    color: #0969da;
+    color: var(--c-ai);
     cursor: pointer;
     padding: 0;
     font-size: 11px;
@@ -215,12 +220,12 @@
     width: 100%;
     text-align: left;
     padding: 8px 10px;
-    background: #f6f8fa;
+    background: var(--c-panel);
     border: none;
-    border-top: 1px solid #eee;
-    color: #57606a;
+    border-top: 1px solid var(--c-rule);
+    color: var(--c-ink-2);
     cursor: pointer;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
   }
 
@@ -237,7 +242,7 @@
     --gutter-w: 3.5em;
     width: 100%;
     border-collapse: collapse;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 12.5px;
   }
 
@@ -253,9 +258,9 @@
     white-space: nowrap;
     padding: 0;
     text-align: right;
-    color: #8b949e;
+    color: var(--c-ink-2);
     user-select: none;
-    background: #fafbfc;
+    background: var(--c-gutter);
   }
 
   /* The whole gutter cell is one native button (keyboard-focusable,
@@ -277,11 +282,11 @@
   }
 
   .gutter-btn:hover {
-    background: #eaeef2;
+    background: #edebe1;
   }
 
   .gutter-btn:focus-visible {
-    outline: 2px solid #0969da;
+    outline: 2px solid var(--c-ai);
     outline-offset: -2px;
   }
 
@@ -293,7 +298,7 @@
     left: var(--gutter-w);
     /* Separator drawn as an inset shadow instead of a border: with
        border-collapse, collapsed borders don't travel with sticky cells. */
-    box-shadow: inset -1px 0 0 #e2e2e2;
+    box-shadow: inset -1px 0 0 var(--c-rule);
   }
 
   .content {
@@ -302,21 +307,21 @@
   }
 
   .line-add {
-    background: #e6ffec;
+    background: var(--c-matsuba-tint);
   }
 
   .line-remove {
-    background: #ffebe9;
+    background: var(--c-shu-tint);
   }
 
   /* Sticky cells need opaque backgrounds matching their row tint so the
      scrolled code doesn't bleed through underneath them. */
   .line-add .gutter {
-    background: #ccffd8;
+    background: var(--c-matsuba-tint-2);
   }
 
   .line-remove .gutter {
-    background: #ffd7d5;
+    background: var(--c-shu-tint-2);
   }
 
   .comment-row td {
@@ -343,12 +348,12 @@
     gap: 10px;
     padding: 8px 12px;
     margin: 2px 8px;
-    background: #fff8c5;
-    border: 1px solid #d4c76a;
+    background: var(--c-ai-tint);
+    border: 1px solid var(--c-ai-border);
     border-radius: 4px;
-    font-family: ui-sans-serif, system-ui, sans-serif;
+    font-family: var(--font-body);
     font-size: 13px;
-    color: #333;
+    color: var(--c-ink);
     white-space: pre-wrap;
   }
 
@@ -360,7 +365,7 @@
     flex-shrink: 0;
     border: none;
     background: none;
-    color: #666;
+    color: var(--c-ink-2);
     cursor: pointer;
     font-size: 14px;
     line-height: 1;
@@ -368,7 +373,7 @@
   }
 
   .comment-delete:hover {
-    color: #cf222e;
+    color: var(--c-shu);
   }
 
   .comment-editor-row td {

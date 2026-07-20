@@ -117,7 +117,6 @@ pub struct ConcernResult {
 pub enum Verdict {
     Approve,
     RequestChanges,
-    Comment,
 }
 
 /// A comment left on a specific line of the diff.
@@ -137,8 +136,8 @@ pub struct Comment {
 /// Derive the overall decision from a set of per-concern verdicts.
 ///
 /// Any `RequestChanges` verdict wins and makes the overall decision
-/// `RequestChanges`. `Comment` is non-blocking. An empty iterator (or one
-/// containing only `Approve`/`Comment`) yields `Approve`.
+/// `RequestChanges`. An empty iterator (or one containing only `Approve`)
+/// yields `Approve`.
 pub fn derive_decision(verdicts: impl IntoIterator<Item = Verdict>) -> Decision {
     if verdicts
         .into_iter()
@@ -185,7 +184,7 @@ mod tests {
     fn decision_derivation() {
         use Verdict::*;
         assert!(matches!(
-            derive_decision([Approve, Comment]),
+            derive_decision([Approve, Approve]),
             Decision::Approve
         ));
         assert!(matches!(

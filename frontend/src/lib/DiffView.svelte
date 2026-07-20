@@ -99,11 +99,11 @@
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
-    background: #f6f8fa;
-    border: 1px solid #e2e2e2;
+    background: var(--c-panel);
+    border: 1px solid var(--c-rule);
     border-bottom: none;
-    border-radius: 6px 6px 0 0;
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    border-radius: 4px 4px 0 0;
+    font-family: var(--font-mono);
     font-size: 13px;
   }
 
@@ -114,23 +114,23 @@
   .file-status {
     font-size: 11px;
     text-transform: uppercase;
-    color: #57606a;
-    background: #eef0f2;
+    color: var(--c-ink-2);
+    background: var(--c-neutral-tint);
     padding: 1px 6px;
     border-radius: 3px;
   }
 
   .status-card {
     padding: 10px;
-    border: 1px solid #e2e2e2;
+    border: 1px solid var(--c-rule);
     border-top: none;
     font-size: 13px;
-    color: #666;
+    color: var(--c-ink-2);
     font-style: italic;
   }
 
   .empty-diff {
-    color: #666;
+    color: var(--c-ink-2);
     font-size: 14px;
   }
 </style>

@@ -4,7 +4,7 @@
 
 export type Side = 'old' | 'new'
 export type Risk = 'high' | 'medium' | 'low'
-export type Verdict = 'approve' | 'request-changes' | 'comment'
+export type Verdict = 'approve' | 'request-changes'
 export type LineKind = 'context' | 'add' | 'remove'
 
 export interface DiffLine {

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { rs } from './state.svelte'
+  import { focusGeneralComments } from './scroll'
   import type { Verdict } from './types'
 
   interface Props {
@@ -13,7 +14,6 @@
   const options: { value: Verdict; label: string }[] = [
     { value: 'approve', label: 'Approve' },
     { value: 'request-changes', label: 'Request changes' },
-    { value: 'comment', label: 'Comment' },
   ]
 </script>
 
@@ -24,7 +24,11 @@
       class="verdict-btn verdict-{opt.value}"
       class:active={verdict === opt.value}
       aria-pressed={verdict === opt.value}
-      onclick={() => rs.setVerdict(concernId, opt.value)}
+      onclick={() => {
+        rs.setVerdict(concernId, opt.value)
+        // Nudge toward writing the reason for non-approve verdicts.
+        if (opt.value !== 'approve') focusGeneralComments()
+      }}
     >
       {opt.label}
     </button>
@@ -39,34 +43,30 @@
   }
 
   .verdict-btn {
-    padding: 6px 12px;
-    border: 1px solid #ccc;
-    border-radius: 4px;
-    background: #fff;
+    padding: 6px 14px;
+    border: 1px solid var(--c-rule);
+    border-radius: 3px;
+    background: var(--c-paper);
     font-size: 13px;
-    color: #333;
+    font-family: inherit;
+    color: var(--c-ink);
     cursor: pointer;
   }
 
   .verdict-btn:hover {
-    background: #f0f1f3;
+    background: var(--c-panel);
   }
 
   .verdict-btn.active.verdict-approve {
-    background: #d6f5dd;
-    border-color: #1a7f37;
-    color: #1a7f37;
+    background: var(--c-matsuba-tint);
+    border-color: var(--c-matsuba);
+    color: var(--c-matsuba);
   }
 
   .verdict-btn.active.verdict-request-changes {
-    background: #ffe0dd;
-    border-color: #cf222e;
-    color: #cf222e;
+    background: var(--c-shu-tint);
+    border-color: var(--c-shu);
+    color: var(--c-shu);
   }
 
-  .verdict-btn.active.verdict-comment {
-    background: #dbeafe;
-    border-color: #0969da;
-    color: #0969da;
-  }
 </style>

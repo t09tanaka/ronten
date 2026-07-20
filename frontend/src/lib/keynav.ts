@@ -42,8 +42,6 @@ export function interpretKey(input: KeyInput): KeyAction {
       return { type: 'verdict', verdict: 'approve' }
     case 'x':
       return { type: 'verdict', verdict: 'request-changes' }
-    case 'c':
-      return { type: 'verdict', verdict: 'comment' }
     case 'i':
       return { type: 'focus-comment' }
     case 'Enter':

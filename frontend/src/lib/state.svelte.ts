@@ -1,6 +1,7 @@
 // Single shared review store (Svelte 5 runes).
 
 import { abortSession, fetchSession, saveDraft, submit } from './api'
+import { isVerdictConfirmed } from './confirmation'
 import type {
   Comment,
   ConcernDraft,
@@ -41,9 +42,17 @@ class ReviewState {
     return this.session?.concerns[this.selectedIdx] ?? null
   }
 
+  /** A concern counts as reviewed only once its verdict is confirmed —
+   * approve immediately, request-changes/comment once a comment exists
+   * (a line comment on the concern or a general comment). */
+  isConfirmed(id: string): boolean {
+    const cd = this.draft.concerns[id]
+    return isVerdictConfirmed(cd?.verdict, cd?.comments.length ?? 0, this.draft.general_comments.length)
+  }
+
   get reviewedCount(): number {
     if (!this.session) return 0
-    return this.session.concerns.filter((c) => this.draft.concerns[c.id]?.verdict != null).length
+    return this.session.concerns.filter((c) => this.isConfirmed(c.id)).length
   }
 
   get allReviewed(): boolean {

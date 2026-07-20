@@ -39,4 +39,19 @@ mod tests {
     fn index_html_is_embedded() {
         assert!(Asset::get("index.html").is_some());
     }
+
+    // The bundled Shippori Mincho subsets are OFL-licensed; the license text
+    // must ship with the font in every distribution, including the single
+    // self-contained binary.
+    #[test]
+    fn font_license_is_embedded() {
+        assert!(Asset::get("shippori-mincho-OFL.txt").is_some());
+    }
+
+    // highlight.js is BSD-3-Clause; its copyright notice must ship with the
+    // binary that bundles it.
+    #[test]
+    fn highlight_js_license_is_embedded() {
+        assert!(Asset::get("highlight-js-BSD-3-Clause.txt").is_some());
+    }
 }
