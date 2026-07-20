@@ -423,8 +423,7 @@ pub enum GitError {
 
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
 pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
-    let output = std::process::Command::new("git")
-        .env("LC_ALL", "C")
+    let output = base_git()
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|_| GitError::NotARepo)?;
@@ -438,9 +437,7 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
 /// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
 /// on any failure returns `"review"`.
 pub fn current_branch(root: &std::path::Path) -> String {
-    let output = std::process::Command::new("git")
-        .env("LC_ALL", "C")
-        .current_dir(root)
+    let output = git_cmd(root)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .output();
     match output {
@@ -498,17 +495,42 @@ enum Plan {
     Content,
 }
 
-/// Base `git` invocation for this module: `LC_ALL=C` for stable message
-/// parsing, and the diff-affecting environment variables removed. All
-/// commands used here are plumbing that ignores diff drivers anyway, but
-/// removing them is cheap defense in depth.
-fn git_cmd(root: &std::path::Path) -> std::process::Command {
+/// Environment variables that can redirect which repository/objects git
+/// reads, or alter diff output. The reviewed agent shares this process
+/// environment, so all of them are stripped before running git.
+const SCRUBBED_GIT_ENV: &[&str] = &[
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// Base `git` invocation: replacement refs disabled (an in-repo agent can
+/// `git replace` HEAD with an innocent-looking commit), repo-redirection
+/// env stripped, and `LC_ALL=C` for stable message parsing.
+fn base_git() -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
-    cmd.env("LC_ALL", "C")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_DIFF_OPTS")
-        .arg("-C")
-        .arg(root);
+    cmd.arg("--no-replace-objects")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("LC_ALL", "C");
+    for var in SCRUBBED_GIT_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
+/// Base `git` invocation for this module, scoped to `root` via `-C`. See
+/// [`base_git`] for the hardening this applies (replacement refs disabled,
+/// repo-redirection env scrubbed). All commands used here are plumbing that
+/// ignores diff drivers anyway, but removing them is cheap defense in depth.
+fn git_cmd(root: &std::path::Path) -> std::process::Command {
+    let mut cmd = base_git();
+    cmd.arg("-C").arg(root);
     cmd
 }
 
@@ -1041,6 +1063,43 @@ mod git_tests {
             .iter()
             .flat_map(|h| h.lines.iter().map(|l| l.content.as_str()))
             .collect()
+    }
+
+    /// Runs git in `dir` and returns trimmed stdout (asserting success).
+    fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn replace_refs_cannot_hide_changes() {
+        // An agent can `git replace` the real HEAD with a fake commit whose
+        // tree equals the base tree; every git command then silently reads
+        // the fake commit and the diff comes back empty. --no-replace-objects
+        // must defeat this.
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a.txt"), "one\nEVIL\nthree\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "evil change"]);
+        let head = git_stdout(d, &["rev-parse", "HEAD"]);
+        let base_tree = git_stdout(d, &["rev-parse", "main^{tree}"]);
+        let fake = git_stdout(d, &["commit-tree", &base_tree, "-p", "main", "-m", "innocent"]);
+        git(d, &["replace", &head, &fake]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.status, FileStatus::Modified);
+        assert!(hunk_contents(a).contains(&"EVIL"));
     }
 
     #[test]
