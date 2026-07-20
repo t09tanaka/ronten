@@ -27,7 +27,8 @@
       aria-pressed={verdict === opt.value}
       onclick={() => {
         rs.setVerdict(concernId, opt.value)
-        if (opt.value === 'comment') focusGeneralComments()
+        // Nudge toward writing the reason for non-approve verdicts.
+        if (opt.value !== 'approve') focusGeneralComments()
       }}
     >
       {opt.label}

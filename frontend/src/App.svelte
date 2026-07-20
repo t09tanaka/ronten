@@ -101,9 +101,11 @@
         e.preventDefault()
         if (rs.selected) {
           rs.setVerdict(rs.selected.id, action.verdict)
-          // A comment verdict means "I have something to write" — bring the
-          // comment box into view and focus it, like the `i` shortcut.
-          if (action.verdict === 'comment') focusGeneralComments()
+          // Comment and request-changes verdicts mean "I have something to
+          // write" — bring the comment box into view and focus it, like the
+          // `i` shortcut. A nudge only: submitting without a comment stays
+          // allowed.
+          if (action.verdict !== 'approve') focusGeneralComments()
         }
         break
       case 'focus-comment':
