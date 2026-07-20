@@ -31,6 +31,8 @@
     switch (status) {
       case 'binary':
         return 'Binary file changed'
+      case 'non-utf8':
+        return 'File content is not valid UTF-8 (not rendered)'
       case 'too-large':
         return 'File too large to display'
       case 'renamed':

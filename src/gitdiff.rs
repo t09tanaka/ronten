@@ -8,6 +8,8 @@ pub enum FileStatus {
     Deleted,
     Renamed,
     Binary,
+    #[serde(rename = "non-utf8")]
+    NonUtf8,
     #[serde(rename = "too-large")]
     TooLarge,
 }
@@ -984,9 +986,20 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
                 if is_binary(old) || is_binary(new) {
                     (FileStatus::Binary, Vec::new())
                 } else {
-                    let old_text = String::from_utf8_lossy(old);
-                    let new_text = String::from_utf8_lossy(new);
-                    (entry_status(entry), text_hunks(&old_text, &new_text))
+                    match (std::str::from_utf8(old), std::str::from_utf8(new)) {
+                        (Ok(old_text), Ok(new_text)) => {
+                            (entry_status(entry), text_hunks(old_text, new_text))
+                        }
+                        _ => {
+                            // Different byte contents can lossy-decode to the
+                            // same string; never diff lossily.
+                            warnings.push(format!(
+                                "file content is not valid UTF-8, not rendered: {}",
+                                display_path(entry)
+                            ));
+                            (FileStatus::NonUtf8, Vec::new())
+                        }
+                    }
                 }
             }
         };
@@ -1351,6 +1364,36 @@ mod git_tests {
         let f = find(&out.files, "blob.bin");
         assert_eq!(f.status, FileStatus::Binary);
         assert!(f.hunks.is_empty());
+    }
+
+    #[test]
+    fn non_utf8_blobs_are_not_lossy_diffed() {
+        // 0x80 -> 0x81: neither contains NUL, both are invalid UTF-8, and
+        // both lossy-decode to "\u{FFFD}\n" — a lossy text diff would claim
+        // "no content changes" for a real byte-level change.
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("data.txt"), [0x80, b'\n']).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "feature"]);
+        std::fs::write(d.join("data.txt"), [0x81, b'\n']).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        assert_eq!(out.files.len(), 1);
+        assert_eq!(out.files[0].status, FileStatus::NonUtf8);
+        assert!(out.files[0].hunks.is_empty());
+        assert_eq!(out.warnings.len(), 1);
+        assert!(
+            out.warnings[0].contains("data.txt"),
+            "warning should name the file: {}",
+            out.warnings[0]
+        );
     }
 
     #[test]
