@@ -200,7 +200,7 @@
   const submitTitle = $derived(
     rs.allReviewed
       ? 'Submit review'
-      : `Every concern needs a verdict (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`,
+      : `Every concern needs a verdict — request changes and comment also need a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`,
   )
 </script>
 

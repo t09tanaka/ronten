@@ -8,7 +8,10 @@
     comment: 'Verdict: Comment',
   }
 
+  // Only confirmed verdicts get a mark; an unconfirmed request-changes or
+  // comment verdict (no comment written yet) keeps the pending placeholder.
   function verdictOf(id: string): Verdict | null {
+    if (!rs.isConfirmed(id)) return null
     return rs.draft.concerns[id]?.verdict ?? null
   }
 </script>
