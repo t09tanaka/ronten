@@ -615,7 +615,7 @@ index 1111111..2222222 100644
                     {"path": "src/app.ts", "side": "new", "line": 2, "body": "added line new side"}
                 ]},
                 "c2": { "verdict": "approve", "comments": [] },
-                "_unmapped": { "verdict": "comment", "comments": [
+                "_unmapped": { "verdict": "request-changes", "comments": [
                     {"path": "src/app.ts", "side": "new", "line": 12, "body": "unmapped hunk line"}
                 ]}
             },
