@@ -40,15 +40,32 @@ pub struct ReviewArgs {
     pub timeout: Option<Duration>,
 }
 
+/// Hard cap on the size of the concerns JSON input, to bound memory use
+/// regardless of source (file or stdin).
+pub const MAX_CONCERNS_BYTES: usize = 8 * 1024 * 1024;
+
 /// Read concerns JSON from a file path or, when `spec` is `-`, from stdin.
+///
+/// Rejects input exceeding [`MAX_CONCERNS_BYTES`]. The stdin path bounds the
+/// read itself (via `Read::take`) so an unbounded stream can't be read into
+/// memory in full before the size is checked.
 fn read_concerns_source(spec: &str) -> std::io::Result<String> {
-    if spec == "-" {
+    let raw = if spec == "-" {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        Ok(buf)
+        std::io::stdin()
+            .take(MAX_CONCERNS_BYTES as u64 + 1)
+            .read_to_string(&mut buf)?;
+        buf
     } else {
-        std::fs::read_to_string(spec)
+        std::fs::read_to_string(spec)?
+    };
+    if raw.len() > MAX_CONCERNS_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("concerns input exceeds {MAX_CONCERNS_BYTES} bytes"),
+        ));
     }
+    Ok(raw)
 }
 
 /// Entry point for the `review` subcommand. Returns the process exit code.

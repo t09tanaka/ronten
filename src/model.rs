@@ -1,7 +1,9 @@
 //! Data model for the concerns input contract and result output contract.
 //!
-//! Unknown fields on input types are ignored (no `deny_unknown_fields`) to keep
-//! the contract forward-compatible with newer agent-side producers.
+//! Unknown fields on input types are rejected (`deny_unknown_fields`), since
+//! the contract's version is pinned to 1: a typo like `statr` must not
+//! silently be dropped and widen a location to whole-file. Any intentional
+//! extension happens in a future version 2, not by loosening this one.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -12,6 +14,7 @@ pub const SUPPORTED_VERSION: u32 = 1;
 
 /// Top-level input: a list of concerns an agent wants a human to review.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConcernsInput {
     /// Contract version. Must be exactly 1 (the only supported version).
     #[schemars(range(min = 1, max = 1))]
@@ -27,6 +30,7 @@ pub struct ConcernsInput {
 
 /// A single concern raised against the diff.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Concern {
     /// Unique concern id: 1-64 characters matching
     /// `^[A-Za-z0-9][A-Za-z0-9._-]*$`. The id `_unmapped` is reserved.
@@ -58,6 +62,7 @@ pub enum Risk {
 
 /// A location within the diff that a concern points at.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Location {
     pub path: String,
     #[serde(default)]
@@ -154,11 +159,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_spec_example_and_ignores_unknown_fields() {
+    fn parses_spec_example() {
         let json = r#"{
-          "version": 1, "summary": "s", "extra_field": true,
+          "version": 1, "summary": "s",
           "concerns": [{ "id": "auth-core", "title": "t", "risk": "high",
-            "unknown": 1,
             "locations": [ {"path": "a.ts"}, {"path": "b.ts", "side": "new", "start": 10, "end": 42} ] }]
         }"#;
         let input: ConcernsInput = serde_json::from_str(json).unwrap();
@@ -166,6 +170,26 @@ mod tests {
         assert!(matches!(input.concerns[0].risk, Risk::High));
         assert_eq!(input.concerns[0].locations[0].start, None);
         assert_eq!(input.concerns[0].locations[1].end, Some(42));
+    }
+
+    #[test]
+    fn rejects_unknown_fields_on_v1_input() {
+        // version 1 しか受け付けない契約で unknown field を黙って無視すると、
+        // 例えば "statr" のような typo が「ファイル全体claim」へ静かに拡大する。
+        let top = r#"{"version":1, "bogus":1, "concerns":[{"id":"a","title":"t","risk":"low"}]}"#;
+        assert!(serde_json::from_str::<ConcernsInput>(top).is_err());
+
+        let concern =
+            r#"{"version":1, "concerns":[{"id":"a","title":"t","risk":"low","extra":1}]}"#;
+        assert!(serde_json::from_str::<ConcernsInput>(concern).is_err());
+
+        let location = r#"{"version":1, "concerns":[{"id":"a","title":"t","risk":"low",
+            "locations":[{"path":"a.ts","statr":120}]}]}"#;
+        assert!(serde_json::from_str::<ConcernsInput>(location).is_err());
+
+        let valid = r#"{"version":1, "concerns":[{"id":"a","title":"t","risk":"low",
+            "locations":[{"path":"a.ts","start":120}]}]}"#;
+        assert!(serde_json::from_str::<ConcernsInput>(valid).is_ok());
     }
 
     #[test]
