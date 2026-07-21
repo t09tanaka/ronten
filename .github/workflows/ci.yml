@@ -8,6 +8,7 @@ on:
 jobs:
   rust:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -26,13 +27,35 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build frontend dist
+        run: cargo build
+      - name: Drop node_modules (keeps dependency licenses out of the crate)
+        run: rm -rf frontend/node_modules
       - name: Package
-        # cargo auto-includes LICENSE/README files found anywhere in the
-        # package directory; drop node_modules (created by the Test step's
-        # frontend build) so dependency license files stay out of the crate.
+        # frontend/dist is a gitignored build artifact deliberately shipped in
+        # the crate (see Cargo.toml include), so the VCS dirty-check cannot
+        # pass; --allow-dirty is required and the content check below is the
+        # real gate.
+        run: cargo package --locked --allow-dirty
+      - name: Verify crate contents
         run: |
-          rm -rf frontend/node_modules
-          cargo package --locked
+          cargo package --list --allow-dirty > /tmp/package-files.txt
+          grep -q '^frontend/dist/index\.html$' /tmp/package-files.txt
+          grep -q '^frontend/dist/assets/.*\.js$' /tmp/package-files.txt
+          grep -q '^frontend/dist/assets/.*\.css$' /tmp/package-files.txt
+          if grep -q 'node_modules' /tmp/package-files.txt; then
+            echo 'node_modules leaked into the crate' >&2; exit 1
+          fi
 
   frontend:
     runs-on: ubuntu-latest
