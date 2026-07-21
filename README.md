@@ -197,7 +197,18 @@ never a context line. An omitted `side` claims on *both* numbering schemes at on
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
+  "review": {
+    "session_id": "9f2c…",
+    "ronten_version": "0.1.0",
+    "base_ref": "main",
+    "base_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+    "head_oid": "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
+    "merge_base_oid": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+    "diff_sha256": "…64 hex chars…",
+    "concerns_sha256": "…64 hex chars…",
+    "assurance": "advisory"
+  },
   "decision": "request-changes",
   "concerns": [
     {
@@ -225,6 +236,22 @@ decision — derived from the per-concern verdicts: any `request-changes` verdic
 overall decision `request-changes`. Agents can feed `concerns[].comments` directly into a fix
 loop. On abort or timeout, no result JSON is produced at all; the exit code (2 or 3) is the
 only signal.
+
+The `review` block pins the result to exactly what was reviewed. `base_oid`, `head_oid`, and
+`merge_base_oid` are the commits resolved when the session started (`null` only for
+`ronten demo`, which has no repository); `diff_sha256` and `concerns_sha256` are SHA-256
+digests of the canonical serialization of the rendered diff and the full concerns input. A
+consumer acting on a result must compare `review.head_oid` against the commit it is about to
+act on — a result for one commit never applies to another. ronten enforces the same rule at
+its end: submit re-resolves `HEAD`, and if it no longer matches the reviewed commit (an extra
+commit landed, a branch switch happened), the submit is refused with `409 review stale` and
+the UI asks the reviewer to start a new session.
+
+`assurance` is always `"advisory"`: the process that launches `ronten` can read the session
+URL from stderr, so ronten cannot prove the submit came from a human rather than from the
+launching agent itself. Treat the result as a well-structured record of a review session, not
+as a cryptographic approval gate, and do not wire it directly into security-enforcing CI
+rules.
 
 ## Keyboard shortcuts
 

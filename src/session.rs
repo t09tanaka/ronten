@@ -5,10 +5,11 @@
 use crate::gitdiff::FileDiff;
 use crate::mapping::{HunkRef, Mapping, UnmappedLine, UNMAPPED_ID};
 use crate::model::{
-    derive_decision, Comment, ConcernResult, ConcernsInput, ResultOutput, Risk, Side, Verdict,
-    SUPPORTED_VERSION,
+    derive_decision, Assurance, Comment, ConcernResult, ConcernsInput, ResultOutput, ReviewInfo,
+    Risk, Side, Verdict, OUTPUT_VERSION,
 };
 use crate::server::Outcome;
+use crate::snapshot::ReviewSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -81,6 +82,15 @@ pub struct SessionState {
     pub mapping: Mapping,
     pub input: ConcernsInput,
     pub token: String,
+    /// Non-secret random id identifying this session in the result JSON
+    /// (deliberately distinct from `token`, which grants session access).
+    pub session_id: String,
+    /// What this session is reviewing, captured once at start.
+    pub snapshot: ReviewSnapshot,
+    /// Repo root for the submit-time `HEAD` freshness re-check. `None` for
+    /// sessions with no git repository behind them (demo), which skips the
+    /// check.
+    pub repo_root: Option<std::path::PathBuf>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub draft: Mutex<Draft>,
     pub finished: Mutex<Option<Terminal>>,
@@ -278,9 +288,18 @@ impl SessionState {
             .collect();
         let decision = derive_decision(concerns.iter().map(|c| c.verdict));
         ResultOutput {
-            // The contract version ronten processed, not an echo of the
-            // input (which validate_concerns already pinned to this value).
-            version: SUPPORTED_VERSION,
+            version: OUTPUT_VERSION,
+            review: ReviewInfo {
+                session_id: self.session_id.clone(),
+                ronten_version: env!("CARGO_PKG_VERSION").to_string(),
+                base_ref: self.snapshot.base_ref.clone(),
+                base_oid: self.snapshot.base_oid.clone(),
+                head_oid: self.snapshot.head_oid.clone(),
+                merge_base_oid: self.snapshot.merge_base_oid.clone(),
+                diff_sha256: self.snapshot.diff_sha256.clone(),
+                concerns_sha256: self.snapshot.concerns_sha256.clone(),
+                assurance: Assurance::Advisory,
+            },
             decision,
             concerns,
             general_comments: draft.general_comments.clone(),

@@ -9,6 +9,7 @@ mod review;
 mod schema_cmd;
 mod server;
 mod session;
+mod snapshot;
 
 pub mod exitcode {
     pub const APPROVED: u8 = 0;
