@@ -185,11 +185,6 @@ impl SessionState {
         }
     }
 
-    /// Whether the session has reached a terminal state.
-    pub fn is_finished(&self) -> bool {
-        matches!(&*lock_ignore_poison(&self.phase), Phase::Finished(_))
-    }
-
     /// Wire name of the terminal state, if any.
     pub fn finished_kind(&self) -> Option<&'static str> {
         match &*lock_ignore_poison(&self.phase) {
