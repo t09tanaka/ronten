@@ -34,11 +34,20 @@ export async function fetchSession(): Promise<Session> {
   return (await res.json()) as Session
 }
 
-export async function saveDraft(draft: Draft, revision: number): Promise<SaveDraftResult> {
+/** `mutationId` names this specific save attempt (client-generated, e.g.
+ * `crypto.randomUUID()`). Resending the SAME id — the lost-response-retry
+ * case — is idempotent server-side: it replays the already-applied result
+ * instead of re-applying or conflicting on a revision the retry never
+ * learned advanced. A genuinely new save must use a fresh id. */
+export async function saveDraft(
+  draft: Draft,
+  revision: number,
+  mutationId: string,
+): Promise<SaveDraftResult> {
   const res = await apiFetch('/draft', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ revision, draft }),
+    body: JSON.stringify({ revision, draft, mutation_id: mutationId }),
   })
   if (res.ok) {
     const body = (await res.json()) as { revision: number }
@@ -70,12 +79,19 @@ export type SubmitResult =
     }
 
 /** Submit carries the same revision handshake as a save: a stale tab must
- * not be able to submit past another tab's newer draft. */
-export async function submit(draft: Draft, revision: number): Promise<SubmitResult> {
+ * not be able to submit past another tab's newer draft. `mutationId` gives
+ * the same lost-response-retry idempotency as `saveDraft`: resending the
+ * same id after a lost response replays the submitted outcome (200)
+ * instead of a spurious "session finished" conflict. */
+export async function submit(
+  draft: Draft,
+  revision: number,
+  mutationId: string,
+): Promise<SubmitResult> {
   const res = await apiFetch('/submit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ revision, draft }),
+    body: JSON.stringify({ revision, draft, mutation_id: mutationId }),
   })
   // Non-2xx responses (422/409) carry a JSON error body that callers need,
   // so they're parsed rather than thrown; only network failures throw.

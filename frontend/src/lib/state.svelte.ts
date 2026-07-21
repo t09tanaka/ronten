@@ -10,6 +10,7 @@ import type {
   Draft,
   FinishedKind,
   HunkRef,
+  SaveDraftResult,
   Session,
   Side,
   Verdict,
@@ -274,8 +275,20 @@ export class ReviewState {
     // different name.
     if (this.draftConflict) return
     this.saveState = 'saving'
+    // Fresh id for this save attempt. If the request throws (a lost
+    // response — client timeout/network failure), it's retried once with
+    // the SAME id and content immediately (no edit can land in between,
+    // there's no `await` yielding to anything else): the server then
+    // recognizes the retry as the same mutation instead of double-applying
+    // it or 409ing on a revision the retry never learned advanced.
+    const mutationId = crypto.randomUUID()
     try {
-      const result = await saveDraft(this.draft, this.#revision)
+      let result: SaveDraftResult
+      try {
+        result = await saveDraft(this.draft, this.#revision, mutationId)
+      } catch {
+        result = await saveDraft(this.draft, this.#revision, mutationId)
+      }
       if (!result.ok) {
         if (result.error === 'session finished') {
           // The session ended elsewhere; join the matching terminal state
@@ -330,7 +343,8 @@ export class ReviewState {
       // The flushed save may have surfaced a conflict, or ended the session
       // from elsewhere; either way there's nothing left for us to submit.
       if (this.draftConflict || this.phase !== 'review') return
-      const result = await this.#enqueueMutation(() => submit(this.draft, this.#revision))
+      const mutationId = crypto.randomUUID()
+      const result = await this.#enqueueMutation(() => submit(this.draft, this.#revision, mutationId))
       if ('ok' in result) {
         this.phase = 'submitted'
         return

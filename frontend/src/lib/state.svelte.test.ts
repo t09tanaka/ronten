@@ -54,13 +54,13 @@ describe('draft revision tracking', () => {
     saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 4 })
     rs.addGeneralComment('first')
     await vi.runAllTimersAsync()
-    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 3)
+    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 3, expect.any(String))
     expect(rs.saveState).toBe('saved')
 
     saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 5 })
     rs.addGeneralComment('second')
     await vi.runAllTimersAsync()
-    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 4)
+    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 4, expect.any(String))
   })
 })
 
@@ -162,7 +162,7 @@ describe('mutation serialization', () => {
     rs.addGeneralComment('draft A')
     await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
     expect(saveDraftMock).toHaveBeenCalledTimes(1)
-    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 3)
+    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 3, expect.any(String))
 
     // Draft B: a further edit while that save is still in flight.
     rs.addGeneralComment('draft B')
@@ -170,9 +170,11 @@ describe('mutation serialization', () => {
     // Submit fires while the autosave from draft A is still pending.
     let capturedRevision: number | undefined
     let capturedComments: string[] | undefined
-    submitMock.mockImplementationOnce((draft, revision) => {
+    let capturedMutationId: string | undefined
+    submitMock.mockImplementationOnce((draft, revision, mutationId) => {
       capturedRevision = revision
       capturedComments = [...draft.general_comments]
+      capturedMutationId = mutationId
       return Promise.resolve({ ok: true })
     })
     const submitPromise = rs.submitReview()
@@ -190,6 +192,7 @@ describe('mutation serialization', () => {
     expect(submitMock).toHaveBeenCalledTimes(1)
     expect(capturedRevision).toBe(4)
     expect(capturedComments).toEqual(['draft A', 'draft B'])
+    expect(capturedMutationId).toEqual(expect.any(String))
     expect(rs.phase).toBe('submitted')
   })
 
@@ -220,5 +223,48 @@ describe('mutation serialization', () => {
 
     expect(abortSessionMock).toHaveBeenCalledTimes(1)
     expect(rs.phase).toBe('aborted')
+  })
+})
+
+describe('mutation id idempotency', () => {
+  it('retries a lost save response once, reusing the same mutation id', async () => {
+    const rs = await loadedState()
+
+    // The first attempt is a lost response (network/timeout): saveDraft
+    // throws. Nothing about the draft changes between the two calls (no
+    // `await` in #runSave yields to anything that could edit it), so the
+    // retry must resend the exact same draft/revision under the SAME
+    // mutation id — that's what lets the server tell it apart from a
+    // genuinely new save.
+    saveDraftMock.mockRejectedValueOnce(new Error('network error'))
+    saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 4 })
+
+    rs.addGeneralComment('once')
+    await vi.runAllTimersAsync()
+
+    expect(saveDraftMock).toHaveBeenCalledTimes(2)
+    const [firstCall, secondCall] = saveDraftMock.mock.calls
+    expect(firstCall[2]).toEqual(expect.any(String))
+    expect(secondCall[2]).toBe(firstCall[2])
+    expect(secondCall[0]).toEqual(firstCall[0])
+    expect(secondCall[1]).toBe(firstCall[1])
+    expect(rs.saveState).toBe('saved')
+    expect(rs.draftConflict).toBe(false)
+  })
+
+  it('mints a fresh mutation id for the next, unrelated save', async () => {
+    const rs = await loadedState()
+
+    saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 4 })
+    rs.addGeneralComment('first')
+    await vi.runAllTimersAsync()
+    const firstId = saveDraftMock.mock.calls[0][2]
+
+    saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 5 })
+    rs.addGeneralComment('second')
+    await vi.runAllTimersAsync()
+    const secondId = saveDraftMock.mock.calls[1][2]
+
+    expect(secondId).not.toBe(firstId)
   })
 })

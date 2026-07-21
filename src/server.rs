@@ -201,7 +201,7 @@ async fn get_session(
         let phase = crate::session::lock_ignore_poison(&state.phase);
         match &*phase {
             crate::session::Phase::Reviewing(slot) => (slot.draft.clone(), slot.revision, None),
-            crate::session::Phase::Finished(outcome) => (
+            crate::session::Phase::Finished(outcome, _) => (
                 Draft::default(),
                 0,
                 Some(crate::session::outcome_kind(outcome)),
@@ -227,14 +227,44 @@ async fn get_session(
     Json(payload).into_response()
 }
 
-/// Wire shape of `PUT /draft`: the draft plus the revision the client
-/// believes is current. A mismatch means another tab (or an older copy of
-/// this one) saved in between; accepting the write would silently discard
-/// that save, so it is refused with 409 instead.
+/// Wire shape of `PUT /draft` and `POST /submit`: the draft, the revision
+/// the client believes is current, and a client-generated id naming this
+/// specific mutation. A revision mismatch means another tab (or an older
+/// copy of this one) saved in between; accepting the write would silently
+/// discard that save, so it is refused with 409 instead. `mutation_id` is
+/// what makes a lost-response retry of the SAME mutation safe: replaying it
+/// answers with the already-applied result instead of re-applying or
+/// 409ing on a revision the retry never learned advanced.
 #[derive(serde::Deserialize)]
 struct DraftPut {
     revision: u64,
     draft: Draft,
+    mutation_id: String,
+}
+
+/// Generous ceiling for a client-supplied mutation id (a UUID is 36 chars);
+/// this only exists to keep a malformed/hostile id from being stored
+/// indefinitely, not to constrain any real client's id format.
+const MAX_MUTATION_ID_CHARS: usize = 100;
+
+/// Rejects an empty or oversized `mutation_id` with the same JSON error
+/// shape every other refusal uses. `None` means the id is fine.
+fn validate_mutation_id(id: &str) -> Option<Response> {
+    if id.is_empty() || id.chars().count() > MAX_MUTATION_ID_CHARS {
+        return Some(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({
+                    "error": "invalid mutation id",
+                    "details": [format!(
+                        "mutation_id must be 1-{MAX_MUTATION_ID_CHARS} characters"
+                    )],
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
 }
 
 async fn put_draft(
@@ -245,6 +275,9 @@ async fn put_draft(
     if token != state.token {
         return not_found();
     }
+    if let Some(invalid) = validate_mutation_id(&body.mutation_id) {
+        return invalid;
+    }
     // Draft and terminal state live behind the same lock, so "finished?"
     // and "write the draft" are one atomic step: a submit/abort landing
     // concurrently either happens before this lock (we see Finished and
@@ -252,7 +285,7 @@ async fn put_draft(
     // session's draft is frozen — a late autosave must not rewrite it.
     let mut phase = crate::session::lock_ignore_poison(&state.phase);
     match &mut *phase {
-        crate::session::Phase::Finished(outcome) => {
+        crate::session::Phase::Finished(outcome, _) => {
             let kind = crate::session::outcome_kind(outcome);
             (
                 StatusCode::CONFLICT,
@@ -265,6 +298,17 @@ async fn put_draft(
                 .into_response()
         }
         crate::session::Phase::Reviewing(slot) => {
+            // Replay: a repeat of the same mutation id is treated as
+            // already applied, whatever the incoming `revision` says (it
+            // may be stale — the client that never saw the first response
+            // has no way to know the revision it produced). This is the
+            // lost-response-retry case; it does not re-apply the draft or
+            // bump the revision again.
+            if let Some((last_id, last_revision)) = &slot.last_save {
+                if *last_id == body.mutation_id {
+                    return Json(json!({"revision": *last_revision})).into_response();
+                }
+            }
             if body.revision != slot.revision {
                 return (
                     StatusCode::CONFLICT,
@@ -278,6 +322,7 @@ async fn put_draft(
             }
             slot.draft = body.draft;
             slot.revision += 1;
+            slot.last_save = Some((body.mutation_id.clone(), slot.revision));
             Json(json!({"revision": slot.revision})).into_response()
         }
     }
@@ -344,6 +389,9 @@ async fn post_submit(
     if token != state.token {
         return not_found();
     }
+    if let Some(invalid) = validate_mutation_id(&body.mutation_id) {
+        return invalid;
+    }
     let draft = body.draft;
 
     // Freshness first: if the reviewed commit is gone, no draft state makes
@@ -381,8 +429,14 @@ async fn post_submit(
     // must not be a side door around it. Claimed only after full
     // validation, so a rejected submit never consumes the session.
     let result = state.build_result(&draft);
-    match state.try_finish_at_revision(Outcome::Submitted(Box::new(result)), body.revision) {
-        crate::session::FinishAttempt::Won => Json(json!({"ok": true})).into_response(),
+    match state.try_finish_at_revision(
+        Outcome::Submitted(Box::new(result)),
+        body.revision,
+        &body.mutation_id,
+    ) {
+        crate::session::FinishAttempt::Won | crate::session::FinishAttempt::AlreadySubmittedSame => {
+            Json(json!({"ok": true})).into_response()
+        }
         crate::session::FinishAttempt::AlreadyFinished(kind) => (
             StatusCode::CONFLICT,
             Json(json!({
@@ -737,6 +791,7 @@ index 1111111..2222222 100644
 
         let draft_body = json!({
             "revision": 0,
+            "mutation_id": "m1",
             "draft": {
                 "concerns": { "c1": { "verdict": "approve", "comments": [] } },
                 "general_comments": []
@@ -766,9 +821,10 @@ index 1111111..2222222 100644
         let state = build_state();
         let app = build_router(state.clone());
 
-        let save = |verdict: &str, revision: u64| {
+        let save = |verdict: &str, revision: u64, mutation_id: &str| {
             json!({
                 "revision": revision,
+                "mutation_id": mutation_id,
                 "draft": {
                     "concerns": { "c1": { "verdict": verdict, "comments": [] } },
                     "general_comments": []
@@ -777,15 +833,19 @@ index 1111111..2222222 100644
         };
         let (status, _) = call(
             app.clone(),
-            put_json(&format!("/api/{TOKEN}/draft"), save("approve", 0)),
+            put_json(&format!("/api/{TOKEN}/draft"), save("approve", 0, "tab-a")),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        // A second writer still holding revision 0 (the other tab).
+        // A second writer still holding revision 0 (the other tab) — a
+        // genuinely different mutation id, not a retry of the first save.
         let (status, body) = call(
             app.clone(),
-            put_json(&format!("/api/{TOKEN}/draft"), save("request-changes", 0)),
+            put_json(
+                &format!("/api/{TOKEN}/draft"),
+                save("request-changes", 0, "tab-b"),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
@@ -807,7 +867,11 @@ index 1111111..2222222 100644
         let app = build_router(state.clone());
 
         // Another tab saved once: revision is now 1.
-        let save = json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
+        let save = json!({
+            "revision": 0,
+            "mutation_id": "other-tab-save",
+            "draft": { "concerns": {}, "general_comments": [] }
+        });
         let (status, _) = call(app.clone(), put_json(&format!("/api/{TOKEN}/draft"), save)).await;
         assert_eq!(status, StatusCode::OK);
 
@@ -830,7 +894,11 @@ index 1111111..2222222 100644
             app,
             post_json(
                 &format!("/api/{TOKEN}/submit"),
-                json!({"revision": 1, "draft": complete_draft()}),
+                json!({
+                    "revision": 1,
+                    "mutation_id": "up-to-date-tab-submit",
+                    "draft": complete_draft()
+                }),
             ),
         )
         .await;
@@ -857,8 +925,11 @@ index 1111111..2222222 100644
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let draft_body =
-            json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
+        let draft_body = json!({
+            "revision": 0,
+            "mutation_id": "late-autosave",
+            "draft": { "concerns": {}, "general_comments": [] }
+        });
         let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), draft_body)).await;
         assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
         assert_eq!(body["error"], "session finished");
@@ -875,8 +946,11 @@ index 1111111..2222222 100644
         let (status, _) = call(app.clone(), post_empty(&format!("/api/{TOKEN}/abort"))).await;
         assert_eq!(status, StatusCode::OK);
 
-        let draft_body =
-            json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
+        let draft_body = json!({
+            "revision": 0,
+            "mutation_id": "late-autosave",
+            "draft": { "concerns": {}, "general_comments": [] }
+        });
         let (status, body) = call(
             app.clone(),
             put_json(&format!("/api/{TOKEN}/draft"), draft_body),
@@ -900,6 +974,7 @@ index 1111111..2222222 100644
         let huge = "x".repeat(MAX_BODY_BYTES + 1024);
         let draft_body = json!({
             "revision": 0,
+            "mutation_id": "oversized",
             "draft": { "concerns": {}, "general_comments": [huge] }
         });
         let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), draft_body)).await;
@@ -914,6 +989,7 @@ index 1111111..2222222 100644
 
         let draft_body = json!({
             "revision": 0,
+            "mutation_id": "ack-opaque",
             "draft": {
                 "concerns": {},
                 "general_comments": [],
@@ -930,6 +1006,110 @@ index 1111111..2222222 100644
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["draft"]["acknowledged_opaque"], json!([1]));
+    }
+
+    /// A save whose response was lost (client timed out, but the server
+    /// already applied it) must not corrupt state on retry: resending the
+    /// exact same `mutation_id` replays the recorded post-apply revision
+    /// instead of re-applying — even though the retry still carries the OLD
+    /// `revision` (the client never learned the new one), and even though
+    /// the retry's draft content differs (a real client would resend the
+    /// identical draft; this exercises that the replay path really does
+    /// ignore the incoming draft rather than merely happening to match).
+    #[tokio::test]
+    async fn save_retry_with_same_mutation_id_is_idempotent() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let first = json!({
+            "revision": 0,
+            "mutation_id": "save-1",
+            "draft": {
+                "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+                "general_comments": []
+            }
+        });
+        let (status, body) =
+            call(app.clone(), put_json(&format!("/api/{TOKEN}/draft"), first)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["revision"], 1);
+
+        let retry = json!({
+            "revision": 0,
+            "mutation_id": "save-1",
+            "draft": {
+                "concerns": { "c1": { "verdict": "request-changes", "comments": [] } },
+                "general_comments": []
+            }
+        });
+        let (status, body) =
+            call(app.clone(), put_json(&format!("/api/{TOKEN}/draft"), retry)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(
+            body["revision"], 1,
+            "replay must answer with the recorded post-apply revision"
+        );
+
+        // The retry's differing draft must not have been applied — the
+        // original save still stands, and the revision did not bump again.
+        let (_, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(body["draft"]["concerns"]["c1"]["verdict"], "approve");
+        assert_eq!(body["draft_revision"], 1);
+    }
+
+    /// A different mutation id presenting a stale revision is a genuinely
+    /// new (not retried) mutation, so it must still 409 exactly like
+    /// `stale_draft_revision_conflicts_without_overwrite` — idempotency
+    /// must not become a side door around the conflict check.
+    #[tokio::test]
+    async fn save_different_id_stale_revision_still_409() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let first = json!({
+            "revision": 0,
+            "mutation_id": "save-1",
+            "draft": { "concerns": {}, "general_comments": [] }
+        });
+        let (status, _) = call(app.clone(), put_json(&format!("/api/{TOKEN}/draft"), first)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let second = json!({
+            "revision": 0,
+            "mutation_id": "save-2",
+            "draft": { "concerns": {}, "general_comments": ["different"] }
+        });
+        let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), second)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(body["error"], "draft conflict");
+        assert_eq!(body["current_revision"], 1);
+    }
+
+    /// An empty or oversized `mutation_id` is refused with a 422 instead of
+    /// panicking or being silently accepted.
+    #[tokio::test]
+    async fn save_invalid_mutation_id_422() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let empty = json!({
+            "revision": 0,
+            "mutation_id": "",
+            "draft": { "concerns": {}, "general_comments": [] }
+        });
+        let (status, body) =
+            call(app.clone(), put_json(&format!("/api/{TOKEN}/draft"), empty)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "invalid mutation id");
+
+        let oversized = json!({
+            "revision": 0,
+            "mutation_id": "x".repeat(101),
+            "draft": { "concerns": {}, "general_comments": [] }
+        });
+        let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), oversized)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "invalid mutation id");
     }
 
     #[tokio::test]
@@ -1060,12 +1240,91 @@ index 1111111..2222222 100644
         assert_eq!(status, StatusCode::OK);
         state.finished_outcome().unwrap();
 
+        // A genuinely different submit attempt (different mutation id),
+        // not a retry of the one that just won — must still 409.
         let (status, body) = call(
             app,
-            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft_body)),
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                json!({"revision": 0, "mutation_id": "second-attempt", "draft": draft_body}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "session finished");
+        assert_eq!(body["finished"], "submitted");
+    }
+
+    /// A repeat submit with the SAME `mutation_id` as the one that already
+    /// won is a lost-response retry, not a new attempt: it must answer 200
+    /// (not the usual "session finished" 409), and must not otherwise
+    /// disturb the already-published outcome.
+    #[tokio::test]
+    async fn submit_retry_with_same_mutation_id_returns_submitted() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let draft_body = complete_draft();
+        let body_with_id =
+            |id: &str| json!({"revision": 0, "mutation_id": id, "draft": draft_body.clone()});
+
+        let (status, _) = call(
+            app.clone(),
+            post_json(&format!("/api/{TOKEN}/submit"), body_with_id("submit-1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let first_outcome = state.finished_outcome().unwrap();
+
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), body_with_id("submit-1")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["ok"], true);
+        assert!(matches!(
+            state.finished_outcome().unwrap(),
+            Outcome::Submitted(_)
+        ));
+        // The outcome recorded by the winning submit is untouched by the
+        // replay — same session id, same submitted_at timestamp.
+        match (first_outcome, state.finished_outcome().unwrap()) {
+            (Outcome::Submitted(a), Outcome::Submitted(b)) => {
+                assert_eq!(a.submitted_at, b.submitted_at);
+            }
+            other => panic!("expected two Submitted outcomes: {other:?}"),
+        }
+    }
+
+    /// A DIFFERENT mutation id submitted after the session already finished
+    /// must still 409 exactly as before — idempotent replay must not become
+    /// a side door that lets any submit through once one has won.
+    #[tokio::test]
+    async fn submit_different_id_after_finish_409() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let draft_body = complete_draft();
+        let (status, _) = call(
+            app.clone(),
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                json!({"revision": 0, "mutation_id": "submit-1", "draft": draft_body.clone()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            app,
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                json!({"revision": 0, "mutation_id": "submit-2", "draft": draft_body}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
         assert_eq!(body["error"], "session finished");
         assert_eq!(body["finished"], "submitted");
     }
@@ -1450,9 +1709,12 @@ index 1111111..2222222 100644
     }
 
     /// Wraps a draft in the submit wire shape at revision 0 (tests that
-    /// never save keep revision 0).
+    /// never save keep revision 0), with a fixed mutation id — fine for
+    /// every test here since each only submits once (a test that submits
+    /// twice with a specific idempotency intent supplies its own body
+    /// instead, e.g. `second_submit_409`).
     fn submit_body(draft: serde_json::Value) -> serde_json::Value {
-        json!({"revision": 0, "draft": draft})
+        json!({"revision": 0, "mutation_id": "test-submit", "draft": draft})
     }
 
     /// Complete draft with every required verdict approved.

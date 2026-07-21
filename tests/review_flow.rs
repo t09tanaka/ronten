@@ -138,6 +138,7 @@ fn api_base(url: &str) -> String {
 fn full_draft(verdict: &str) -> serde_json::Value {
     serde_json::json!({
         "revision": 0,
+        "mutation_id": "it-full-draft",
         "draft": {
             "concerns": {
                 "edit": {"verdict": verdict, "comments": []},
@@ -287,6 +288,7 @@ fn request_changes_exits_1() {
 
     let draft = serde_json::json!({
         "revision": 0,
+        "mutation_id": "it-request-changes",
         "draft": {
             "concerns": {
                 "edit": {"verdict": "request-changes", "comments": [

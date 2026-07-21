@@ -33,7 +33,12 @@ pub(crate) fn lock_ignore_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[derive(Debug)]
 pub enum Phase {
     Reviewing(DraftSlot),
-    Finished(Outcome),
+    /// The second field is the `mutation_id` of the submit that drove this
+    /// session to `Finished` — `None` for an abort/timeout, since those
+    /// aren't idempotency-tracked. A repeat submit presenting this same id
+    /// is a lost-response retry, not a new attempt; see
+    /// [`try_finish_at_revision`](SessionState::try_finish_at_revision).
+    Finished(Outcome, Option<String>),
 }
 
 /// Maximum number of comments per concern (and of general comments).
@@ -49,6 +54,12 @@ pub const MAX_COMMENT_CHARS: usize = 10_000;
 pub struct DraftSlot {
     pub draft: Draft,
     pub revision: u64,
+    /// The `(mutation_id, revision)` of the last accepted `PUT /draft` — the
+    /// revision it produced, not the one it was submitted with. A repeat
+    /// save presenting this same `mutation_id` is a lost-response retry: it
+    /// replays this recorded revision instead of re-applying (or 409ing on
+    /// a now-stale `revision` field it may carry).
+    pub last_save: Option<(String, u64)>,
 }
 
 /// Validation limits the server enforces, sent to the UI in the session
@@ -162,13 +173,14 @@ impl SessionState {
     /// the publish happen under one lock.
     pub fn try_finish(&self, outcome: Outcome) -> bool {
         let mut phase = lock_ignore_poison(&self.phase);
-        if matches!(*phase, Phase::Finished(_)) {
+        if matches!(*phase, Phase::Finished(_, _)) {
             return false;
         }
         // Dropping the DraftSlot here freezes the draft: with slot and
         // terminal state behind the same lock, no save can interleave
-        // between a finished check and a write.
-        *phase = Phase::Finished(outcome);
+        // between a finished check and a write. `None`: this path (abort/
+        // timeout) has no client-supplied mutation to track for replay.
+        *phase = Phase::Finished(outcome, None);
         drop(phase);
         // `send_replace` succeeds regardless of receiver liveness; and even
         // if the waiter misses this wake-up entirely, it reads the outcome
@@ -181,7 +193,7 @@ impl SessionState {
     pub fn finished_outcome(&self) -> Option<Outcome> {
         match &*lock_ignore_poison(&self.phase) {
             Phase::Reviewing(_) => None,
-            Phase::Finished(outcome) => Some(outcome.clone()),
+            Phase::Finished(outcome, _) => Some(outcome.clone()),
         }
     }
 
@@ -190,15 +202,34 @@ impl SessionState {
     /// neither another finish nor a concurrent save can interleave. This is
     /// what keeps a stale tab's submit from silently discarding a newer
     /// draft another tab saved.
-    pub fn try_finish_at_revision(&self, outcome: Outcome, revision: u64) -> FinishAttempt {
+    ///
+    /// `mutation_id` is the id of the submit attempting to finish the
+    /// session. If the session is already `Finished(Submitted, _)` with this
+    /// exact same id recorded, this is a lost-response retry of the submit
+    /// that already won — it returns [`FinishAttempt::AlreadySubmittedSame`]
+    /// instead of the usual "session finished" conflict, and does not touch
+    /// `phase` again (the already-published outcome stands unchanged).
+    pub fn try_finish_at_revision(
+        &self,
+        outcome: Outcome,
+        revision: u64,
+        mutation_id: &str,
+    ) -> FinishAttempt {
         let mut phase = lock_ignore_poison(&self.phase);
         match &*phase {
-            Phase::Finished(o) => FinishAttempt::AlreadyFinished(outcome_kind(o)),
+            Phase::Finished(o, submitted_id) => {
+                if matches!(o, Outcome::Submitted(_))
+                    && submitted_id.as_deref() == Some(mutation_id)
+                {
+                    return FinishAttempt::AlreadySubmittedSame;
+                }
+                FinishAttempt::AlreadyFinished(outcome_kind(o))
+            }
             Phase::Reviewing(slot) => {
                 if slot.revision != revision {
                     return FinishAttempt::RevisionConflict(slot.revision);
                 }
-                *phase = Phase::Finished(outcome);
+                *phase = Phase::Finished(outcome, Some(mutation_id.to_string()));
                 drop(phase);
                 self.outcome_tx.send_replace(());
                 FinishAttempt::Won
@@ -210,7 +241,7 @@ impl SessionState {
     pub fn finished_kind(&self) -> Option<&'static str> {
         match &*lock_ignore_poison(&self.phase) {
             Phase::Reviewing(_) => None,
-            Phase::Finished(outcome) => Some(outcome_kind(outcome)),
+            Phase::Finished(outcome, _) => Some(outcome_kind(outcome)),
         }
     }
 
@@ -414,6 +445,11 @@ pub enum FinishAttempt {
     Won,
     /// Another path already finished the session (wire name of how).
     AlreadyFinished(&'static str),
+    /// The session is already `Finished(Submitted, _)` with the exact same
+    /// `mutation_id` recorded — a lost-response retry of the winning
+    /// submit, not a new attempt. The caller should answer 200, same as
+    /// `Won`.
+    AlreadySubmittedSame,
     /// The caller's draft revision is stale; the current revision is given.
     RevisionConflict(u64),
 }
