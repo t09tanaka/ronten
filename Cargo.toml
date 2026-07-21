@@ -43,7 +43,7 @@ sha2 = "0.10"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"
-ureq = { version = "2", features = ["json"] }
+ureq = { version = "3", features = ["json"] }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 http = "1"

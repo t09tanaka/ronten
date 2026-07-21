@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+mod common;
+
 /// Concerns JSON matching the fixture repo: `edit` covers a.txt, `add` covers
 /// b.txt. Written to `<repo>/concerns.json` (untracked, so absent from the diff).
 const CONCERNS: &str = r#"{"version":1,"concerns":[
@@ -151,10 +153,11 @@ fn approve_all_exits_0() {
     let td = fixture_repo();
     let (child, url) = spawn_review(td.path(), &[]);
 
-    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
-        .send_json(full_draft("approve"))
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -191,10 +194,11 @@ fn result_pins_reviewed_commits_and_inputs() {
     // oid resolved at start, not re-resolve the moved ref.
     git(td.path(), &["branch", "-f", "main", "feature"]);
 
-    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
-        .send_json(full_draft("approve"))
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -221,14 +225,7 @@ fn result_pins_reviewed_commits_and_inputs() {
 /// Posts `draft` to `/submit` and returns `(status, body)` without treating
 /// non-2xx as a transport error.
 fn submit_raw(url: &str, draft: serde_json::Value) -> (u16, serde_json::Value) {
-    match ureq::post(&format!("{}/submit", api_base(url))).send_json(draft) {
-        Ok(resp) => {
-            let status = resp.status();
-            (status, resp.into_json().unwrap())
-        }
-        Err(ureq::Error::Status(status, resp)) => (status, resp.into_json().unwrap()),
-        Err(e) => panic!("submit transport error: {e}"),
-    }
+    common::post_json(&format!("{}/submit", api_base(url)), &draft)
 }
 
 /// Advancing HEAD after the session started must make submit fail with 409
@@ -252,9 +249,7 @@ fn head_advance_makes_submit_stale_409() {
     );
 
     // The stale session emits no result: abort it and expect the abort code.
-    ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
+    common::post_empty(&format!("{}/abort", api_base(&url)));
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(
@@ -302,10 +297,8 @@ fn request_changes_exits_1() {
             "general_comments": []
         }
     });
-    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
-        .send_json(draft)
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_json(&format!("{}/submit", api_base(&url)), &draft);
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(1));
@@ -323,10 +316,8 @@ fn abort_exits_2() {
     let td = fixture_repo();
     let (child, url) = spawn_review(td.path(), &[]);
 
-    let resp = ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_empty(&format!("{}/abort", api_base(&url)));
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
@@ -378,10 +369,11 @@ fn out_flag_writes_file() {
     let td = fixture_repo();
     let (child, url) = spawn_review(td.path(), &["--out", "result.json"]);
 
-    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
-        .send_json(full_draft("approve"))
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -416,10 +408,11 @@ fn out_write_failure_exits_15_with_stdout_intact() {
     let td = fixture_repo();
     let (child, url) = spawn_review(td.path(), &["--out", "no-such-dir/result.json"]);
 
-    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
-        .send_json(full_draft("approve"))
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(15));
@@ -510,9 +503,7 @@ fn dirty_tracked_file_with_warn_policy_prints_warning_and_starts() {
         "warning must name the dirty file: {prebanner}"
     );
 
-    ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
+    common::post_empty(&format!("{}/abort", api_base(&url)));
     let _ = child.wait_with_output().unwrap();
 }
 
@@ -592,9 +583,7 @@ fn clean_worktree_prints_no_uncommitted_changes_warning() {
         "unexpected dirty-worktree warning on a clean worktree: {prebanner}"
     );
 
-    ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
+    common::post_empty(&format!("{}/abort", api_base(&url)));
     let _ = child.wait_with_output().unwrap();
 }
 
@@ -620,15 +609,11 @@ fn concerns_from_stdin() {
         .unwrap();
 
     let url = read_review_url(&mut child);
-    let resp = ureq::get(&format!("{}/session", api_base(&url)))
-        .call()
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::get_json(&format!("{}/session", api_base(&url)));
+    assert_eq!(status, 200);
 
     // Clean up: abort and wait for exit.
-    ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
+    common::post_empty(&format!("{}/abort", api_base(&url)));
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
@@ -638,18 +623,15 @@ fn session_serves_html() {
     let td = fixture_repo();
     let (child, url) = spawn_review(td.path(), &[]);
 
-    let resp = ureq::get(&url).call().unwrap();
-    assert_eq!(resp.status(), 200);
-    assert!(resp.content_type().starts_with("text/html"));
-    let body = resp.into_string().unwrap();
+    let (status, content_type, body) = common::get_text(&url);
+    assert_eq!(status, 200);
+    assert!(content_type.starts_with("text/html"));
     assert!(
         body.contains(r#"<div id="app">"#),
         "index body missing app root div: {body}"
     );
 
-    ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
+    common::post_empty(&format!("{}/abort", api_base(&url)));
     let _ = child.wait_with_output().unwrap();
 }
 
