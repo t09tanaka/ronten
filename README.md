@@ -92,8 +92,10 @@ submodules whose worktree is dirty inside.
 
 By default (`--dirty-policy error`) any of these refuses to start the review with exit
 code 17 and a per-file listing on stderr. `--dirty-policy warn` prints the same listing and
-proceeds; `--dirty-policy ignore` skips the check. The concerns file and the `--out`
-destination are exempt — ronten itself expects them in the worktree. Under the default
+proceeds; `--dirty-policy ignore` skips the check. Only the concerns file is exempt (when
+it shows up untracked at exactly its own path — ronten itself expects it in the worktree);
+tracked changes and dirty submodules are never exempt, and the `--out` destination is not
+exempt either, since it is only reserved on disk after this gate runs. Under the default
 `error` policy a failing `git status` also refuses to start (exit 14): an unverifiable
 worktree must not silently pass the gate.
 
@@ -180,9 +182,11 @@ anything already there); on submission the result is written to a same-directory
 file, flushed, then renamed over that placeholder, so the file is always either absent,
 an empty reservation, or complete — never partial. On any non-submitted outcome (abort,
 timeout, ctrl-c, or an error) the placeholder is removed again, so a subsequent run sees a
-clean slate. If the final write itself fails (e.g. the parent directory disappeared mid-run),
-the process exits with the dedicated code 15; the result JSON has still been printed to
-stdout by that point, so the review outcome itself is not lost, only the file copy.
+clean slate. `--out` is written before stdout, so its failure is confirmed (or fails loudly
+with code 15) before the process risks losing the result to a stdout error. If the final
+write itself fails (e.g. the parent directory disappeared mid-run), the process still exits
+with the dedicated code 15; stdout is attempted regardless of that outcome, so the review
+outcome itself is not lost, only the file copy.
 
 ## Examples
 

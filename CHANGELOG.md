@@ -38,6 +38,16 @@ project is pre-1.0 and minor versions may contain breaking changes.
   deny/audit gates, packaged-crate install smoke test, and a tag-triggered
   draft-release workflow producing binaries, SHA256SUMS, an SPDX SBOM, and
   build-provenance attestations.
+- `--out` no-clobber preflight: the target must not already exist, and is
+  refused (exit 15) if it is a tracked file, falls inside the git
+  directory, is the same file as `--concerns`, is a directory, or is a
+  symlink. After the dirty gate, the path is reserved atomically
+  (`O_CREAT|O_EXCL`, mode 0600) as an empty placeholder, best-effort
+  removed again on abort, timeout, or error.
+- Control characters (C0 including TAB/LF, C1, DEL, U+2028/U+2029) in
+  worktree paths and git error text are escaped to visible `⟨U+XXXX⟩`
+  tokens on stderr; the review UI reveals the same ranges in paths and
+  titles (and all but TAB in diff line content).
 
 ### Changed
 - Terminal state, outcome, and the editable draft are one atomic value: no
@@ -46,6 +56,13 @@ project is pre-1.0 and minor versions may contain breaking changes.
   deadline; a second Ctrl-C force-exits.
 - Result JSON `version` is now `2`; `warnings` are structured objects. The
   concerns *input* contract remains v1.
+- The dirty-worktree gate's exemption is now category- and path-scoped:
+  only the untracked concerns input file, matched by its exact
+  repo-relative path (no symlink resolution), is exempt; tracked changes
+  and dirty submodules are never exempt, and the `--out` target is no
+  longer exempt either.
+- On submit, the result is written to `--out` before stdout; a broken
+  stdout pipe no longer aborts the process or skips the `--out` write.
 
 ## [0.1.0] - 2026-07
 
