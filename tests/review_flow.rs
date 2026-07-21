@@ -398,15 +398,146 @@ fn out_flag_writes_file() {
     );
 }
 
+/// The `--out` file must be written even when stdout is closed. This test
+/// closes the parent's read end of the child's stdout pipe right after
+/// spawning, so the child's later write to stdout hits a closed pipe
+/// (`EPIPE`, surfaced by the Rust runtime as `io::ErrorKind::BrokenPipe`
+/// rather than a `SIGPIPE` kill). `--out` is written first and does not
+/// depend on stdout succeeding, so the result must still land on disk, the
+/// process must still exit with the decision code, and it must not panic.
+///
+/// This test manages the child's stderr itself (rather than via
+/// `spawn_review`'s shared helper) because it needs the *complete* stderr
+/// output — including anything written after the banner — to assert the
+/// absence of a panic message; the shared helper's background drain thread
+/// discards that tail.
+#[cfg(unix)]
 #[test]
-fn out_write_failure_exits_15_with_stdout_intact() {
-    // The parent directory of `--out` doesn't exist, so the atomic
-    // write must fail — but the review outcome already happened, so
-    // stdout must still carry the correct result JSON, only the exit
-    // code changes (to the dedicated OUT_FAILED code), regardless of the
-    // approve/request-changes decision.
+fn out_written_even_if_stdout_closed() {
+    use std::io::BufRead;
+    use std::io::Read as _;
+
     let td = fixture_repo();
-    let (child, url) = spawn_review(td.path(), &["--out", "no-such-dir/result.json"]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+            "--out",
+            "result.json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Drop our end of the stdout pipe now, before the child ever writes to
+    // it: once this end is closed, the child's write hits a broken pipe.
+    drop(child.stdout.take());
+
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    let mut stderr_so_far = String::new();
+    let url = loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "process exited before printing URL"
+        );
+        stderr_so_far.push_str(&line);
+        if let Some(rest) = line.trim().strip_prefix("Review session: ") {
+            break rest.to_string();
+        }
+    };
+
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
+
+    // Read the rest of stderr to EOF: this both captures any later output
+    // (e.g. a would-be panic message) and blocks until the child exits,
+    // since EOF on this pipe only happens when the child closes it.
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    stderr_so_far.push_str(&rest);
+
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "stderr: {stderr_so_far}");
+
+    let file = std::fs::read_to_string(td.path().join("result.json")).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&file).unwrap();
+    assert_eq!(result["decision"], "approve");
+
+    assert!(
+        !stderr_so_far.to_lowercase().contains("panic"),
+        "stdout being closed must not panic: {stderr_so_far}"
+    );
+}
+
+#[test]
+fn out_reservation_failure_exits_15_before_start() {
+    // The parent directory of `--out` doesn't exist. Since `--out` is now
+    // reserved (atomically, via `create_new`) before the server ever starts,
+    // this failure surfaces at that reservation step rather than at the
+    // final write: the process exits with OUT_FAILED before printing the
+    // session URL or accepting a submission at all, so stdout stays empty
+    // (there is no review outcome to carry) — unlike the late-write-failure
+    // path (see `out_late_write_failure_exits_15_with_stdout_intact` below),
+    // where the outcome was already decided and only the final write failed.
+    let td = fixture_repo();
+    let code = expect_exit(
+        td.path(),
+        &[
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+            "--out",
+            "no-such-dir/result.json",
+        ],
+    );
+    assert_eq!(code, 15);
+    assert!(
+        !td.path().join("no-such-dir").exists(),
+        "the missing parent directory must not have been created as a side effect"
+    );
+}
+
+/// Companion to `out_reservation_failure_exits_15_before_start`, covering the
+/// other (reachable) way to hit `OUT_FAILED`: a write failure *after* the
+/// session has already started and a decision has been reached. The
+/// reservation placeholder is created successfully (so the session starts
+/// normally and accepts a submission), but by the time `write_out_atomic`
+/// renames its temp file over the reserved path at submit time, that path has
+/// been replaced with a directory — the rename fails, `--out` is not written,
+/// and the process exits `OUT_FAILED` (15). Unlike the pre-start reservation
+/// failure, the review outcome already exists by then, so stdout must still
+/// carry the full result JSON: `--out` failing must never cost the caller the
+/// only other copy of the decision.
+#[test]
+fn out_late_write_failure_exits_15_with_stdout_intact() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--out", "result.json"]);
+    assert!(
+        td.path().join("result.json").exists(),
+        "the placeholder must be reserved before the session is reachable over HTTP"
+    );
+
+    // Swap the reserved placeholder for a directory: `write_out_atomic`'s
+    // final `rename(tmp, path)` fails when `path` is a (non-empty-target)
+    // directory, deterministically reproducing the post-submit write
+    // failure without relying on any timing race.
+    std::fs::remove_file(td.path().join("result.json")).unwrap();
+    std::fs::create_dir(td.path().join("result.json")).unwrap();
 
     let (status, _) = common::post_json(
         &format!("{}/submit", api_base(&url)),
@@ -416,11 +547,177 @@ fn out_write_failure_exits_15_with_stdout_intact() {
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(15));
-    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must still carry the result JSON: {e}: {stdout:?}"));
     assert_eq!(result["decision"], "approve");
+}
+
+/// Spawns `ronten review` (with `--base main --concerns concerns.json
+/// --no-open` plus `extra`) expecting an immediate exit — no session, no
+/// stdout — and returns `(exit code, stderr)`. Companion to `expect_exit`
+/// for the `--out` preflight-rejection tests below, which also need to
+/// assert on the rejection message.
+fn expect_exit_with_stderr(dir: &Path, extra: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(dir)
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// A pre-existing file at the `--out` target must be refused (exit 15)
+/// before the server ever starts: overwriting it would silently discard
+/// whatever is there, most plausibly a result from a previous run.
+#[test]
+fn out_refuses_existing_target() {
+    let td = fixture_repo();
+    std::fs::write(
+        td.path().join("result.json"),
+        "leftover from a previous run\n",
+    )
+    .unwrap();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "result.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
     assert!(
-        !td.path().join("no-such-dir").exists(),
-        "the missing parent directory must not have been created as a side effect"
+        stderr.contains("already exists"),
+        "stderr missing existing-target message: {stderr}"
+    );
+    assert!(
+        stderr.contains("move or delete"),
+        "stderr must tell the user to move/delete the stale result: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("result.json")).unwrap(),
+        "leftover from a previous run\n",
+        "the pre-existing file must not have been touched"
+    );
+}
+
+/// A `--out` target that is tracked by git must be refused: overwriting it
+/// would blow away part of the reviewed repository, not just a scratch file.
+#[test]
+fn out_refuses_tracked_file() {
+    let td = fixture_repo();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "a.txt"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("tracked"),
+        "stderr missing tracked-file message: {stderr}"
+    );
+}
+
+/// A `--out` target inside `.git` must be refused: writing there could
+/// corrupt the repository's own bookkeeping.
+#[test]
+fn out_refuses_git_dir() {
+    let td = fixture_repo();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", ".git/result.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("git directory"),
+        "stderr missing git-dir message: {stderr}"
+    );
+    assert!(
+        !td.path().join(".git/result.json").exists(),
+        "nothing should have been written inside .git"
+    );
+}
+
+/// `--out` pointed at the same file as `--concerns` must be refused: ronten
+/// would be reading and clobbering the same path in one run.
+#[test]
+fn out_refuses_concerns_path() {
+    let td = fixture_repo();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "concerns.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("same file") && stderr.contains("--concerns"),
+        "stderr missing same-as-concerns message: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("concerns.json")).unwrap(),
+        CONCERNS,
+        "the concerns file must not have been touched"
+    );
+}
+
+/// A `--out` target that is already a symlink must be refused, even a
+/// dangling one — following it to write would escape the intended location.
+#[cfg(unix)]
+#[test]
+fn out_refuses_symlink() {
+    let td = fixture_repo();
+    std::os::unix::fs::symlink("nowhere", td.path().join("result.json")).unwrap();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "result.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        std::fs::symlink_metadata(td.path().join("result.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must be left alone, not replaced or removed"
+    );
+}
+
+/// Aborting a session started with `--out` must remove the placeholder
+/// reserved for it — otherwise a later run would see it as a stale existing
+/// target and refuse to start (see `out_refuses_existing_target`).
+#[test]
+fn out_placeholder_removed_on_abort() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--out", "result.json"]);
+    assert!(
+        td.path().join("result.json").exists(),
+        "the placeholder must be reserved before the session is reachable over HTTP"
+    );
+
+    let (status, _) = common::post_empty(&format!("{}/abort", api_base(&url)));
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        !td.path().join("result.json").exists(),
+        "the placeholder must be removed once the session aborts without a submission"
+    );
+}
+
+/// A stale `result.json` left over from a previous run must block the
+/// review from starting at all (exit 15, before the server binds), not just
+/// fail once a decision is finally reached.
+#[test]
+fn out_stale_result_blocks_start() {
+    let td = fixture_repo();
+    std::fs::write(
+        td.path().join("result.json"),
+        r#"{"version":2,"decision":"approve"}"#,
+    )
+    .unwrap();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "result.json"]);
+    assert_eq!(code, 15);
+    assert!(
+        stderr.contains("result.json"),
+        "stderr must name the stale target: {stderr}"
     );
 }
 
@@ -485,6 +782,220 @@ fn untracked_file_blocks_start_by_default() {
         !stderr.contains("concerns.json"),
         "the concerns file itself is exempt from the dirty gate: {stderr}"
     );
+}
+
+/// Unix filenames may contain bytes a terminal or log line would otherwise
+/// interpret specially — here an ESC (start of an ANSI/OSC escape sequence)
+/// and a raw newline (which could forge an extra, fake log line). The dirty
+/// listing must escape both to the visible `⟨U+XXXX⟩` token instead of
+/// echoing them verbatim to stderr.
+#[cfg(unix)]
+#[test]
+fn dirty_listing_escapes_control_chars() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let td = fixture_repo();
+    let name = OsStr::from_bytes(b"evil\x1binjected\nname.txt");
+    std::fs::write(td.path().join(name), "danger\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("⟨U+001B⟩"),
+        "stderr must escape the raw ESC byte as a visible token: {stderr}"
+    );
+    assert!(
+        stderr.contains("⟨U+000A⟩"),
+        "stderr must escape the embedded newline as a visible token: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "stderr must not contain a raw, unescaped ESC byte: {stderr:?}"
+    );
+}
+
+/// The concerns file being ronten's own input does not exempt it from the
+/// dirty gate once it is tracked: a tracked, uncommitted modification to
+/// concerns.json must still block start, exactly like any other tracked
+/// change. Only an *untracked* concerns file matching the `--concerns` path
+/// exactly is exempt (see `untracked_file_blocks_start_by_default`).
+#[test]
+fn tracked_concerns_change_blocks_start() {
+    let td = fixture_repo();
+    git(td.path(), &["add", "concerns.json"]);
+    git(td.path(), &["commit", "-m", "track concerns"]);
+    // Uncommitted modification to the now-tracked concerns.json.
+    std::fs::write(td.path().join("concerns.json"), format!("{CONCERNS}\n")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("uncommitted change (tracked): concerns.json"),
+        "stderr must name the dirty tracked concerns file: {stderr}"
+    );
+}
+
+/// Regression for the canonicalize-based exemption this task replaces: the
+/// old `drop_exempt` canonicalized *every* status entry's path and dropped
+/// it if that resolved to the same file as the (canonicalized) concerns
+/// path. A symlink aliasing a genuinely dirty tracked file to the concerns
+/// argument would therefore have canonicalized to the same real path and
+/// been silently dropped from `tracked_changes` too — hiding a real
+/// uncommitted change.
+///
+/// Construction: `tracked.json` is a tracked file (valid concerns JSON) with
+/// an uncommitted modification. `alias.json` is an untracked symlink to
+/// `tracked.json`, passed as `--concerns alias.json`. Canonicalizing
+/// `alias.json` resolves to the same real file as `tracked.json`, but the
+/// new lexical repo-relative comparison only ever exempts an entry in
+/// `untracked` whose path string is exactly "alias.json" (there is none —
+/// `alias.json` resolves, canonicalized, to "tracked.json", which is what
+/// gets compared, and "tracked.json" never appears in `untracked`). So the
+/// dirty tracked change to `tracked.json` must still block start.
+#[cfg(unix)]
+#[test]
+fn symlink_alias_does_not_exempt_tracked_change() {
+    let td = fixture_repo();
+    // The fixture's default untracked concerns.json is irrelevant to this
+    // test (concerns come from alias.json here) and would itself block
+    // start as an untracked file, muddying the assertion below — remove it.
+    std::fs::remove_file(td.path().join("concerns.json")).unwrap();
+    std::fs::write(td.path().join("tracked.json"), CONCERNS).unwrap();
+    git(td.path(), &["add", "tracked.json"]);
+    git(td.path(), &["commit", "-m", "track concerns target"]);
+    // Uncommitted modification to the tracked file.
+    std::fs::write(td.path().join("tracked.json"), format!("{CONCERNS}\n")).unwrap();
+    std::os::unix::fs::symlink(td.path().join("tracked.json"), td.path().join("alias.json"))
+        .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "alias.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(17),
+        "the symlink-aliased tracked change must still block start"
+    );
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("uncommitted change (tracked): tracked.json"),
+        "stderr must name the dirty tracked file, not silently drop it via the symlink alias: {stderr}"
+    );
+}
+
+/// Regression for a second canonicalize hole: resolving the concerns path's
+/// *own* final component (not just aliasing another status entry, as in
+/// `symlink_alias_does_not_exempt_tracked_change` above) let a gitignored
+/// symlink at the concerns path stand in for whatever it points at.
+///
+/// Construction: `.gitignore` (committed) ignores `concerns.json`.
+/// `forgotten.rs` is an untracked file containing valid concerns JSON.
+/// `concerns.json` is a symlink to `forgotten.rs` — itself gitignored, so
+/// `git status` reports neither an untracked nor a tracked entry for
+/// `concerns.json` at all, only `? forgotten.rs`. Passed as `--concerns
+/// concerns.json`, the old (fully-canonicalizing) resolution would follow
+/// the symlink and return "forgotten.rs" as the exempt repo-relative path —
+/// removing the one real untracked entry `git status` reported, even though
+/// `forgotten.rs` is an unrelated file the symlink merely happens to point
+/// at. The fixed resolution never canonicalizes the leaf, so it returns
+/// "concerns.json" (which never appears in `untracked`, since it's
+/// gitignored) — `forgotten.rs` must still block start.
+#[cfg(unix)]
+#[test]
+fn ignored_symlink_concerns_does_not_exempt_other_untracked() {
+    let td = fixture_repo();
+    // The fixture's default untracked concerns.json is irrelevant here
+    // (concerns.json is redefined below as a gitignored symlink) — remove it
+    // first so it doesn't shadow the construction.
+    std::fs::remove_file(td.path().join("concerns.json")).unwrap();
+    std::fs::write(td.path().join(".gitignore"), "concerns.json\n").unwrap();
+    git(td.path(), &["add", ".gitignore"]);
+    git(td.path(), &["commit", "-m", "ignore concerns.json"]);
+    std::fs::write(td.path().join("forgotten.rs"), CONCERNS).unwrap();
+    std::os::unix::fs::symlink(
+        td.path().join("forgotten.rs"),
+        td.path().join("concerns.json"),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(17),
+        "the untracked file the gitignored symlink points at must still block start"
+    );
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("untracked file: forgotten.rs"),
+        "stderr must name forgotten.rs as untracked, not silently exempt it via the gitignored symlink leaf: {stderr}"
+    );
+}
+
+/// A concerns file that is tracked but has no uncommitted modifications must
+/// not be reported as dirty (no false positive from the new comparison).
+#[test]
+fn tracked_unmodified_concerns_on_clean_worktree_still_starts() {
+    let td = fixture_repo();
+    git(td.path(), &["add", "concerns.json"]);
+    git(td.path(), &["commit", "-m", "track concerns"]);
+
+    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    assert!(
+        !prebanner.contains("worktree is not clean"),
+        "unexpected dirty-worktree warning for a clean, tracked concerns file: {prebanner}"
+    );
+
+    common::post_empty(&format!("{}/abort", api_base(&url)));
+    let _ = child.wait_with_output().unwrap();
 }
 
 #[test]
@@ -789,4 +1300,100 @@ fn reserved_id_exits_10() {
         ],
     );
     assert_eq!(code, 10);
+}
+
+/// The concerns file is untrusted input, and `validate_concerns` interpolates
+/// a location's `path` straight into its error message. A `path` carrying a
+/// raw ESC byte (plus a newline, for good measure) must not reach stderr
+/// unescaped — that would let the concerns file forge extra terminal/log
+/// lines or ANSI-inject the rest of the output. This is the cleanest trigger
+/// for that print site: `start: 0` is rejected by `validate_concerns` (line
+/// numbers are 1-based) before any diff mapping happens, so the message is
+/// guaranteed to include the offending `path` verbatim.
+#[test]
+fn concerns_error_output_escapes_control_chars() {
+    let td = fixture_repo();
+    let evil = "{\"version\":1,\"concerns\":[\
+      {\"id\":\"edit\",\"title\":\"Edit\",\"risk\":\"low\",\"locations\":\
+      [{\"path\":\"a.txt\\u001bevil\\ninjected\",\"start\":0}]}]}";
+    std::fs::write(td.path().join("evil.json"), evil).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "evil.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    assert_eq!(out.status.code(), Some(10));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("⟨U+001B⟩"),
+        "stderr must escape the raw ESC byte from the concerns path as a visible token: {stderr}"
+    );
+    assert!(
+        stderr.contains("⟨U+000A⟩"),
+        "stderr must escape the embedded newline from the concerns path as a visible token: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "stderr must not contain a raw, unescaped ESC byte: {stderr:?}"
+    );
+    // The path's own embedded "\n" must not survive as a real newline: every
+    // line that mentions the concerns error is the one line printed by
+    // `eprintln!`, not split into extra forged lines by the raw byte.
+    let matching_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("invalid concerns"))
+        .collect();
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "the embedded newline must not have forged an extra log line: {stderr:?}"
+    );
+}
+
+/// Companion to `concerns_error_output_escapes_control_chars` covering the
+/// other raw-bytes-reach-stderr path: `deny_unknown_fields` embeds the
+/// offending field name verbatim in serde's error `Display`, and that error
+/// is printed at the JSON-parse site (`invalid concerns JSON: ...`), a
+/// different print site than `validate_concerns`'s. A control character in an
+/// unknown field name must be escaped there too.
+#[test]
+fn concerns_json_unknown_field_error_escapes_control_chars() {
+    let td = fixture_repo();
+    let evil = "{\"version\":1,\"concerns\":[\
+      {\"id\":\"edit\",\"title\":\"Edit\",\"risk\":\"low\",\"locations\":[],\
+      \"evil\\u001bfield\":true}]}";
+    std::fs::write(td.path().join("evil_field.json"), evil).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "evil_field.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    assert_eq!(out.status.code(), Some(10));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("⟨U+001B⟩"),
+        "stderr must escape the raw ESC byte from the unknown field name as a visible token: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "stderr must not contain a raw, unescaped ESC byte: {stderr:?}"
+    );
 }

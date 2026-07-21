@@ -2,13 +2,16 @@
 //! session state, bind a localhost server, and drive it to an outcome.
 
 use crate::exitcode;
-use crate::gitdiff::{compute_diff, current_branch, repo_root, worktree_status, GitError};
+use crate::gitdiff::{
+    compute_diff, current_branch, git_dirs, is_tracked, repo_root, worktree_status, GitError,
+};
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
 use crate::session::{DraftSlot, Phase, SessionState};
+use crate::termsafe::sanitize;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -91,51 +94,241 @@ pub(crate) fn read_concerns_source(spec: &str) -> std::io::Result<String> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
-/// Absolute, symlink-resolved forms of the paths ronten itself expects to
-/// see in the worktree — the concerns file (unless read from stdin) and the
-/// `--out` destination — so the dirty gate doesn't flag ronten's own inputs.
-fn exempt_paths(concerns: &str, out: Option<&std::path::Path>) -> Vec<PathBuf> {
-    let mut exempt = Vec::new();
-    if concerns != "-" {
-        if let Ok(p) = std::fs::canonicalize(concerns) {
-            exempt.push(p);
-        }
-    }
-    if let Some(out) = out {
-        // `--out` usually doesn't exist yet, so canonicalize its parent and
-        // re-append the file name (covers a leftover result from a previous
-        // run sitting untracked in the worktree).
-        if let (Some(parent), Some(name)) = (
-            out.parent().filter(|p| !p.as_os_str().is_empty()),
-            out.file_name(),
-        ) {
-            if let Ok(parent) = std::fs::canonicalize(parent) {
-                exempt.push(parent.join(name));
-            }
-        } else if let (Ok(cwd), Some(name)) = (std::env::current_dir(), out.file_name()) {
-            if let Ok(cwd) = std::fs::canonicalize(cwd) {
-                exempt.push(cwd.join(name));
-            }
-        }
-    }
-    exempt
+/// The absolute path `out` would resolve to once it exists, computed without
+/// requiring `out` itself to exist: canonicalizes `out`'s parent directory
+/// (falling back to the current directory when `out` is a bare file name)
+/// and re-appends the file name. Returns `None` if the file name is missing
+/// (e.g. `out` is `.` or `/`) or the parent can't be canonicalized (most
+/// commonly: the parent directory doesn't exist).
+fn out_prospective_abs(out: &Path) -> Option<PathBuf> {
+    let name = out.file_name()?;
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_canon = match parent {
+        Some(parent) => std::fs::canonicalize(parent).ok()?,
+        None => std::fs::canonicalize(std::env::current_dir().ok()?).ok()?,
+    };
+    Some(parent_canon.join(name))
 }
 
-/// Drops status entries whose absolute path is in `exempt`. Entries that
-/// cannot be resolved (e.g. a deleted tracked file) are kept: an
-/// unresolvable path is a reason to show the entry, not to hide it.
+/// The concerns input's path relative to the repo root, in the lexical,
+/// `/`-separated form `git status` emits — the only form that can be
+/// compared against status output without reopening the symlink-alias hole
+/// described on [`drop_exempt`].
+///
+/// Deliberately never canonicalizes the concerns path's *final* component —
+/// only its parent directory is resolved (same pattern as
+/// [`out_prospective_abs`]), and the literal `file_name()` is re-appended.
+/// Canonicalizing the leaf too would resolve a concerns path that is itself
+/// a symlink to whatever it points at, so a gitignored `concerns.json ->
+/// forgotten.rs` symlink would make this function return `forgotten.rs` as
+/// the exempt path — hiding an unrelated untracked file that `git status`
+/// only ever reports under the symlink's own name, never the target's.
+/// Resolving only the parent still allows comparison against the
+/// canonicalized repo root while leaving the leaf name exactly as `git
+/// status` would report it.
+///
+/// Returns `None` — meaning "no exemption is possible" — when concerns come
+/// from stdin (`concerns == "-"`, nothing on disk to compare), when the
+/// concerns path has no file name, when the parent can't be canonicalized,
+/// or when the resulting path falls outside the canonicalized repo root.
+/// All of these are fail-closed: no exemption is applied and the dirty gate
+/// is free to report the path dirty like any other.
+fn concerns_repo_relative(concerns: &str, root: &Path) -> Option<String> {
+    if concerns == "-" {
+        return None;
+    }
+    let concerns_path = Path::new(concerns);
+    let name = concerns_path.file_name()?;
+    let parent = concerns_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_canon = match parent {
+        Some(parent) => std::fs::canonicalize(parent).ok()?,
+        None => std::fs::canonicalize(std::env::current_dir().ok()?).ok()?,
+    };
+    let concerns_abs = parent_canon.join(name);
+    let root_abs = std::fs::canonicalize(root).ok()?;
+    let rel = concerns_abs.strip_prefix(&root_abs).ok()?;
+    let rel = rel.to_str()?;
+    Some(rel.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+/// Checks-only preflight for `--out`, run before the dirty gate so a
+/// rejection never depends on (or reports) worktree cleanliness. Does not
+/// touch the filesystem beyond metadata reads — the actual reservation
+/// happens later, after the dirty gate, via [`OutReservation::reserve`].
+///
+/// Rejects, in order:
+/// 1. `out` resolves to the same file as `concerns` (skipped when concerns
+///    comes from stdin, i.e. `concerns == "-"`).
+/// 2. `out` resolves inside the repository's git directory (or, for a
+///    worktree checkout, the shared common git directory).
+/// 3. `out` resolves to a path that is tracked in the index (checked only
+///    when `out` lexically falls under the repo root; a target outside the
+///    repo can't be tracked by it, so the check is simply skipped there).
+/// 4. `out` already exists — as a regular file, a directory, or a symlink.
+///
+/// A git-dir or tracked-file check that can't be answered (e.g. `git`
+/// itself failed) is treated as a rejection: the safe default is not to
+/// reserve a path whose safety can't be confirmed. A target whose
+/// prospective absolute path can't be computed at all (most commonly: its
+/// parent directory doesn't exist) is *not* rejected here — that surfaces
+/// later, as an ordinary I/O error, when [`OutReservation::reserve`] tries to
+/// create it.
+fn preflight_out_checks(out: &Path, concerns_spec: &str, root: &Path) -> Result<(), String> {
+    let out_abs = out_prospective_abs(out);
+
+    // 1. Same file as --concerns.
+    if concerns_spec != "-" {
+        if let (Some(out_abs), Ok(concerns_abs)) =
+            (out_abs.as_ref(), std::fs::canonicalize(concerns_spec))
+        {
+            if *out_abs == concerns_abs {
+                return Err(format!(
+                    "--out target {} is the same file as --concerns {concerns_spec}",
+                    out.display()
+                ));
+            }
+        }
+    }
+
+    if let Some(out_abs) = out_abs.as_ref() {
+        // 2. Inside git's own directory.
+        match git_dirs(root) {
+            Ok(dirs) => {
+                if dirs.iter().any(|d| out_abs.starts_with(d)) {
+                    return Err(format!(
+                        "--out target {} is inside the repository's git directory; choose a path outside .git",
+                        out.display()
+                    ));
+                }
+            }
+            Err(GitError::GitFailed(msg)) => {
+                return Err(format!(
+                    "could not determine the repository's git directory: {}",
+                    sanitize(msg.trim())
+                ));
+            }
+            Err(_) => {}
+        }
+
+        // 3. Tracked in the index (only meaningful if out lexically falls
+        // under the repo root).
+        if let Ok(root_abs) = std::fs::canonicalize(root) {
+            if let Ok(rel) = out_abs.strip_prefix(&root_abs) {
+                if let Some(rel) = rel.to_str() {
+                    let rel = rel.replace(std::path::MAIN_SEPARATOR, "/");
+                    match is_tracked(root, &rel) {
+                        Ok(true) => {
+                            return Err(format!(
+                                "--out target {} is a tracked file in this repository; choose an untracked path",
+                                out.display()
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(GitError::GitFailed(msg)) => {
+                            return Err(format!(
+                                "could not check whether --out is tracked: {}",
+                                sanitize(msg.trim())
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Already exists (file, directory, or symlink — checked without
+    // following the symlink, so a dangling symlink is still rejected).
+    match std::fs::symlink_metadata(out) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(format!("--out target {} is a directory", out.display()));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "--out target {} already exists; move or delete the previous result before re-running",
+                out.display()
+            ));
+        }
+        Err(_) => {}
+    }
+
+    Ok(())
+}
+
+/// An atomic no-clobber reservation on a `--out` target: an empty placeholder
+/// file created with `O_CREAT|O_EXCL` (`create_new`), which is what actually
+/// guarantees no-clobber — the preflight checks above narrow *why* a target
+/// is unsafe, but only `create_new` closes the TOCTOU between "checked" and
+/// "written".
+///
+/// Cleanup is RAII: unless [`disarm`](Self::disarm) is called (only on a
+/// successful final write), dropping the reservation best-effort removes the
+/// placeholder. Because `serve_session` owns the reservation for its entire
+/// body, this covers every non-submit termination — abort, timeout, a
+/// SIGINT, or an early-return error path — without each of those call sites
+/// needing to know about `--out` at all.
+pub(crate) struct OutReservation {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl OutReservation {
+    /// Creates the empty placeholder at `path`. The caller is expected to
+    /// have already run [`preflight_out_checks`]; this only re-attempts the
+    /// existence check atomically (via `create_new`) and surfaces any other
+    /// I/O failure (e.g. a missing parent directory) as-is.
+    fn reserve(path: PathBuf) -> std::io::Result<Self> {
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        open_options.open(&path)?;
+        Ok(Self { path, armed: true })
+    }
+
+    /// Marks the reservation as fulfilled: the placeholder has just been
+    /// replaced (via `rename`) with the real output, so `Drop` must not
+    /// delete it. Takes `self` by value so the disarmed drop happens right
+    /// here rather than depending on a caller remembering to check a flag.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Drops the concerns input from `status.untracked` when it appears there
+/// under an exact repo-relative path match — the only permissible dirty-gate
+/// exemption. `tracked_changes` and `submodules_dirty` are never touched:
+/// ronten only ever expects the concerns file to exist *untracked*, so a
+/// tracked or dirty-submodule entry at that same path is a real uncommitted
+/// change to review, not ronten's own input.
+///
+/// Comparison is plain string equality against `git status`'s own
+/// repo-relative path (`concerns_rel`, from [`concerns_repo_relative`]) —
+/// deliberately not a per-entry canonicalize. The previous implementation
+/// canonicalized every status entry's path and compared it against the
+/// canonicalized concerns path: a symlink aliasing a genuinely dirty tracked
+/// file to the concerns argument would canonicalize to the same real file
+/// and get silently dropped from `tracked_changes`, hiding a real
+/// uncommitted change. Lexical string comparison against `untracked` only
+/// closes that hole.
 fn drop_exempt(
     mut status: crate::gitdiff::WorktreeStatus,
-    root: &std::path::Path,
-    exempt: &[PathBuf],
+    concerns_rel: Option<&str>,
 ) -> crate::gitdiff::WorktreeStatus {
-    let keep = |path: &String| match std::fs::canonicalize(root.join(path)) {
-        Ok(abs) => !exempt.iter().any(|e| e == &abs),
-        Err(_) => true,
-    };
-    status.tracked_changes.retain(keep);
-    status.untracked.retain(keep);
-    status.submodules_dirty.retain(keep);
+    if let Some(concerns_rel) = concerns_rel {
+        status.untracked.retain(|p| p != concerns_rel);
+    }
     status
 }
 
@@ -145,7 +338,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let root = match repo_root() {
         Ok(root) => root,
         Err(GitError::GitFailed(msg)) => {
-            eprintln!("git failed: {}", msg.trim());
+            eprintln!("git failed: {}", sanitize(msg.trim()));
             return exitcode::GIT_FAILED;
         }
         Err(_) => {
@@ -165,12 +358,17 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let input: ConcernsInput = match serde_json::from_str(&raw) {
         Ok(input) => input,
         Err(e) => {
-            eprintln!("invalid concerns JSON: {e}");
+            eprintln!("invalid concerns JSON: {}", sanitize(&e.to_string()));
             return exitcode::INPUT;
         }
     };
     if let Err(e) = validate_concerns(&input) {
-        eprintln!("invalid concerns: {e}");
+        // `e` may already carry a sanitized `loc.path` token (see
+        // `validate_concerns`), but the message is passed through `sanitize`
+        // again regardless — it is cheap (a no-op scan) and makes this print
+        // site safe on its own even if some future error string forgets to
+        // sanitize a field itself.
+        eprintln!("invalid concerns: {}", sanitize(&e));
         return exitcode::INPUT;
     }
 
@@ -178,11 +376,11 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let diff_output = match compute_diff(&root, &args.base) {
         Ok(output) => output,
         Err(GitError::BadBase(msg)) => {
-            eprintln!("bad base ref {:?}: {}", args.base, msg.trim());
+            eprintln!("bad base ref {:?}: {}", args.base, sanitize(msg.trim()));
             return exitcode::BAD_BASE;
         }
         Err(GitError::GitFailed(msg)) => {
-            eprintln!("git failed: {}", msg.trim());
+            eprintln!("git failed: {}", sanitize(msg.trim()));
             return exitcode::GIT_FAILED;
         }
         Err(GitError::NotARepo) => {
@@ -208,20 +406,35 @@ pub async fn run(args: ReviewArgs) -> u8 {
         concerns_sha256: crate::snapshot::concerns_digest(&input),
     };
 
+    // 3.5. `--out` preflight: checks only, no filesystem writes. Runs before
+    // the dirty gate so a rejection is never entangled with (or shadowed by)
+    // a dirty-worktree report. The actual reservation happens further below,
+    // after the dirty gate, so the placeholder it creates never shows up as
+    // an untracked file in that gate.
+    if let Some(out) = &args.out {
+        if let Err(e) = preflight_out_checks(out, &args.concerns, &root) {
+            eprintln!("{e}");
+            return exitcode::OUT_FAILED;
+        }
+    }
+
     // The diff above only ever covers `<base>...HEAD` (committed state); if
     // the agent forgot to commit some of its work — most dangerously a
     // brand-new file it never `git add`ed — those changes are reviewed
     // nowhere while the review looks complete. The dirty gate therefore
     // runs before *any* early return, including the empty-diff one below
     // (exactly the case where an agent committed nothing at all). The
-    // concerns file and the `--out` destination are exempt: ronten itself
-    // asks for them to exist untracked in the worktree.
+    // concerns file is exempt only when it shows up untracked at exactly its
+    // own repo-relative path — see [`drop_exempt`]. The `--out` destination
+    // is not exempt at all: Task 1.1's preflight-then-reserve ordering means
+    // `--out` never exists (tracked or untracked) at dirty-gate time, so no
+    // exemption for it is needed.
     let dirty = match args.dirty_policy {
         DirtyPolicy::Ignore => None,
         DirtyPolicy::Error | DirtyPolicy::Warn => match worktree_status(&root) {
             Ok(status) => {
-                let exempt = exempt_paths(&args.concerns, args.out.as_deref());
-                let status = drop_exempt(status, &root, &exempt);
+                let concerns_rel = concerns_repo_relative(&args.concerns, &root);
+                let status = drop_exempt(status, concerns_rel.as_deref());
                 (!status.is_clean()).then_some(status)
             }
             Err(GitError::BadBase(msg))
@@ -233,13 +446,13 @@ pub async fn run(args: ReviewArgs) -> u8 {
                 if args.dirty_policy == DirtyPolicy::Error {
                     eprintln!(
                         "git status failed, cannot verify the worktree is clean: {}",
-                        msg.trim()
+                        sanitize(msg.trim())
                     );
                     return exitcode::GIT_FAILED;
                 }
                 eprintln!(
                     "warning: git status failed ({}); could not verify the worktree is clean",
-                    msg.trim()
+                    sanitize(msg.trim())
                 );
                 None
             }
@@ -248,13 +461,13 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
     let print_dirty = |status: &crate::gitdiff::WorktreeStatus| {
         for path in &status.tracked_changes {
-            eprintln!("  uncommitted change (tracked): {path}");
+            eprintln!("  uncommitted change (tracked): {}", sanitize(path));
         }
         for path in &status.untracked {
-            eprintln!("  untracked file: {path}");
+            eprintln!("  untracked file: {}", sanitize(path));
         }
         for path in &status.submodules_dirty {
-            eprintln!("  dirty submodule: {path}");
+            eprintln!("  dirty submodule: {}", sanitize(path));
         }
     };
     if let Some(status) = &dirty {
@@ -287,6 +500,23 @@ pub async fn run(args: ReviewArgs) -> u8 {
     if let Some(status) = &dirty {
         dirty_warning(status);
     }
+
+    // 3.6. Reserve `--out` now that the review is definitely starting: an
+    // empty placeholder created with `create_new` (O_EXCL), the atomic
+    // no-clobber guarantee the checks above only prepared for. Deliberately
+    // after the dirty gate above (so the placeholder itself is never flagged
+    // as an untracked file) and after the empty-diff check below would have
+    // returned (so a review that never starts doesn't leave one behind).
+    let out_reservation = match &args.out {
+        Some(path) => match OutReservation::reserve(path.clone()) {
+            Ok(reservation) => Some(reservation),
+            Err(e) => {
+                eprintln!("failed to reserve --out target {}: {e}", path.display());
+                return exitcode::OUT_FAILED;
+            }
+        },
+        None => None,
+    };
 
     // 4. Build the session state.
     let mut mapping = resolve_mapping(&files, &input);
@@ -340,7 +570,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
         url,
         args.no_open,
         args.timeout,
-        args.out,
+        out_reservation,
     )
     .await
 }
@@ -374,7 +604,7 @@ pub async fn serve_session(
     url: String,
     no_open: bool,
     timeout: Option<Duration>,
-    out: Option<PathBuf>,
+    out: Option<OutReservation>,
 ) -> u8 {
     // Install the SIGINT handler BEFORE the banner: once the session URL is
     // visible, a ctrl-c must produce the clean abort exit (2). Without eager
@@ -496,21 +726,61 @@ pub async fn serve_session(
     match outcome {
         Outcome::Submitted(result) => {
             let json = serde_json::to_string_pretty(&result).expect("result serializes to JSON");
-            println!("{json}");
             let decision_code = match result.decision {
                 Decision::Approve => exitcode::APPROVED,
                 Decision::RequestChanges => exitcode::REQUEST_CHANGES,
             };
-            if let Some(path) = out {
-                if let Err(e) = write_out_atomic(&path, &json) {
-                    eprintln!("failed to write {}: {e}", path.display());
-                    return exitcode::OUT_FAILED;
+            // `--out` is written before stdout: it is the durable,
+            // machine-readable record, so it must be confirmed (or fail
+            // loudly with OUT_FAILED) before the process risks losing the
+            // result to a stdout error. stdout is still attempted
+            // afterwards regardless of how this turns out, so a caller
+            // piping stdout gets the JSON whenever the pipe is alive.
+            let mut exit_code = decision_code;
+            if let Some(reservation) = out {
+                // The rename below replaces the reserved placeholder with
+                // the real output; only on success does the reservation get
+                // disarmed. On failure it stays armed, so it best-effort
+                // removes the placeholder on drop rather than leaving an
+                // empty file behind.
+                match write_out_atomic(&reservation.path, &json) {
+                    Ok(()) => reservation.disarm(),
+                    Err(e) => {
+                        eprintln!("failed to write {}: {e}", reservation.path.display());
+                        exit_code = exitcode::OUT_FAILED;
+                    }
                 }
             }
-            decision_code
+            write_result_to_stdout(&json);
+            exit_code
         }
+        // Aborted and Timeout fall straight through to the implicit drop of
+        // `out` at the end of this function: an armed `OutReservation`
+        // best-effort removes its placeholder there, so these arms don't
+        // need to touch `out` themselves.
         Outcome::Aborted => exitcode::ABORTED,
         Outcome::Timeout => exitcode::TIMEOUT,
+    }
+}
+
+/// Writes the result JSON to stdout followed by a trailing newline, mirroring
+/// `println!`'s framing without its panic-on-error behavior. A broken pipe
+/// (the reader went away, e.g. `| head`) is expected and silently ignored:
+/// the result is already durable in `--out` when that flag was given, and
+/// there is no reader left to notice a stderr note either way. Any other
+/// stdout error is unusual enough to surface on stderr. Either way this never
+/// changes the process exit code — it is set by the decision (or by an
+/// `--out` failure) before this runs.
+fn write_result_to_stdout(json: &str) {
+    let mut stdout = std::io::stdout();
+    let result = stdout
+        .write_all(json.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush());
+    if let Err(e) = result {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("failed to write result to stdout: {e}");
+        }
     }
 }
 

@@ -4,7 +4,7 @@
   import { newTarget, oldTarget, type CommentLineInfo } from './anchors'
   import { NO_NEWLINE_MARKER, showCrlfBadge, showNoNewlineMarker } from './eol'
   import { highlightLine, langForPath } from './highlight'
-  import { revealInvisibles } from './invisibles'
+  import { revealControlChars, revealInvisibles } from './invisibles'
   import type { Comment, ConcernView, DiffLine, FileDiff, Hunk, HunkRef } from './types'
 
   const COLLAPSE_THRESHOLD = 200
@@ -78,14 +78,14 @@
       >@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@</span
     >
     {#if hunk.section}
-      <span class="hunk-section">{revealInvisibles(hunk.section)}</span>
+      <span class="hunk-section">{revealControlChars(hunk.section)}</span>
     {/if}
     {#if otherOwners.length > 0}
       <span class="shared-badge">
         shared with
         {#each otherOwners as owner, i (owner.id)}
           <button type="button" class="owner-link" onclick={() => jumpTo(owner.id)}
-            >{revealInvisibles(owner.title)}</button
+            >{revealControlChars(owner.title)}</button
           >{i < otherOwners.length - 1 ? ',' : ''}
         {/each}
       </span>
@@ -225,7 +225,7 @@
     /* Trojan Source defense: isolate the agent-supplied section text from
        the surrounding UI so bidi control characters in it can't reorder
        neighboring elements (their codepoints are also revealed as
-       ⟨U+XXXX⟩ tokens by revealInvisibles). */
+       ⟨U+XXXX⟩ tokens by revealControlChars). */
     unicode-bidi: isolate;
   }
 

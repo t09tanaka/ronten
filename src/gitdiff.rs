@@ -997,6 +997,54 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output
     timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))
 }
 
+/// Canonicalized, absolute paths of the repository's git directory and (for a
+/// worktree checkout) the shared common git directory, via `git rev-parse
+/// --git-dir --git-common-dir`. Callers use this to keep `--out` from landing
+/// inside git's own bookkeeping (e.g. `.git/result.json`).
+///
+/// `git rev-parse` prints these relative to the directory `-C` pointed at
+/// unless `GIT_DIR` forces an absolute path; `base_git` scrubs `GIT_DIR` from
+/// the environment, so relative output is joined onto `root` before
+/// canonicalizing. A path that fails to canonicalize (unexpected, since the
+/// git dir must exist for `root` to be a repo at all) is dropped rather than
+/// causing the whole call to fail — callers only use this list for a
+/// containment check, and a dropped entry only means that one entry can't
+/// reject anything (the other entry, if canonicalizable, still can).
+pub(crate) fn git_dirs(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, GitError> {
+    let output = run_git(root, &["rev-parse", "--git-dir", "--git-common-dir"])?;
+    if !output.status.success() {
+        return Err(GitError::GitFailed(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut dirs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let path = std::path::PathBuf::from(line);
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        };
+        if let Ok(canon) = std::fs::canonicalize(&abs) {
+            dirs.push(canon);
+        }
+    }
+    Ok(dirs)
+}
+
+/// Whether `rel_path` (a repo-root-relative, `/`-separated git pathspec) is
+/// tracked in the index, via `git ls-files --error-unmatch`: success (exit 0)
+/// means tracked.
+pub(crate) fn is_tracked(root: &std::path::Path, rel_path: &str) -> Result<bool, GitError> {
+    let output = run_git(root, &["ls-files", "--error-unmatch", "--", rel_path])?;
+    Ok(output.status.success())
+}
+
 /// Resolves `<rev>^{commit}` to a full oid.
 ///
 /// Distinguishes *why* it failed: if git itself couldn't be run at all (spawn

@@ -69,7 +69,7 @@ ronten review --base <ref> --concerns <file|-> [options]
 |---|---|---|
 | `--base <ref>` | required | Comparison base; diffs `<ref>...HEAD` (merge-base semantics) |
 | `--concerns <path>` | required | Concerns JSON path; `-` for stdin |
-| `--out <path>` | none | Also write result JSON to a file (in addition to stdout) |
+| `--out <path>` | none | Also write result JSON to a file (in addition to stdout); the target must not already exist |
 | `--port <n>` | `0` (OS-assigned) | Bind port, for fixed allocation (e.g. portool) |
 | `--no-open` | false | Do not auto-open the browser; print URL only |
 | `--title <s>` | branch name | Session display name |
@@ -92,8 +92,10 @@ submodules whose worktree is dirty inside.
 
 By default (`--dirty-policy error`) any of these refuses to start the review with exit
 code 17 and a per-file listing on stderr. `--dirty-policy warn` prints the same listing and
-proceeds; `--dirty-policy ignore` skips the check. The concerns file and the `--out`
-destination are exempt — ronten itself expects them in the worktree. Under the default
+proceeds; `--dirty-policy ignore` skips the check. Only the concerns file is exempt (when
+it shows up untracked at exactly its own path — ronten itself expects it in the worktree);
+tracked changes and dirty submodules are never exempt, and the `--out` destination is not
+exempt either, since it is only reserved on disk after this gate runs. Under the default
 `error` policy a failing `git status` also refuses to start (exit 14): an unverifiable
 worktree must not silently pass the gate.
 
@@ -119,7 +121,7 @@ visible instead of rendering as two identical-looking lines.
 | 12 | not a git repository |
 | 13 | empty diff (nothing to review) |
 | 14 | git invocation failed |
-| 15 | `--out` write failed (the review outcome still printed to stdout; only the file write failed) |
+| 15 | `--out` rejected or failed: the target already exists, is tracked by git, is inside `.git`, is the same file as `--concerns`, is a directory/symlink, or the final write itself failed |
 | 16 | the server task terminated unexpectedly (e.g. a panic) before an outcome was reached |
 | 17 | worktree not clean under `--dirty-policy error` (the default); commit/stash first or pass `--dirty-policy warn` |
 | 18 | the diff exceeds a hard resource budget (e.g. more than 2000 changed files); review it in smaller pieces |
@@ -146,33 +148,52 @@ echo "$result" | jq -r '.decision'
 ```
 
 **Background + polling** — for agent shells with hard command timeouts (e.g. Claude Code's
-bash tool), where the review may take longer than the shell will wait. `--out` is only
-written on a successful submission (exit 0/1); on abort (exit 2) or timeout (exit 3) no
-file ever appears, so the loop must also watch the process itself rather than only the
-file:
+bash tool), where the review may take longer than the shell will wait. **The `--out` path
+must not exist yet**: `ronten review` refuses to start (exit 15) if the target already
+exists (a stale result left over from a previous run), is tracked by git, sits inside
+`.git`, is the same file as `--concerns`, or is a directory/symlink — move or delete a
+leftover `result.json` before re-running. Because the target is reserved as an empty
+placeholder as soon as the session starts (well before a decision is made — see below),
+`[ -f result.json ]` becomes true almost immediately and is *not* a completion signal;
+poll the process instead and only trust the file once it has exited:
 
 ```sh
 ronten review --base main --concerns concerns.json --out result.json --no-open &
 RONTEN_PID=$!
 
-while [ ! -f result.json ] && kill -0 "$RONTEN_PID" 2>/dev/null; do
+while kill -0 "$RONTEN_PID" 2>/dev/null; do
   sleep 5
 done
 wait "$RONTEN_PID"
 EXIT_CODE=$?
-# result.json exists only when EXIT_CODE is 0 or 1; on abort/timeout there is
-# no result file and the exit code is the only signal.
+# result.json holds the real result only when EXIT_CODE is 0 or 1. On
+# abort/timeout (2/3) it is absent again. Exit 15 splits in two: if --out
+# was refused before the session ever started (e.g. the target already
+# existed from a previous run), that pre-existing file is left present and
+# UNTOUCHED — it never held this run's result and must not be assumed
+# empty/absent or auto-deleted. If the reservation succeeded but the final
+# write itself failed after a decision was reached, the placeholder is
+# removed, so the file is genuinely absent again. Either way, the exit code
+# is the only reliable signal of the outcome; treat any pre-existing
+# result.json on a 15 as needing manual triage, not cleanup.
 ```
 
 Either way, `ronten review` remains a single foreground-equivalent process for the duration
-of the review — nothing is left running once a result exists.
+of the review — nothing is left running once the process exits.
 
-`--out` is written atomically: the result is written to a same-directory temp file, flushed,
-then renamed into place. A poller watching for `result.json` to appear can never observe a
-partially-written file — it either isn't there yet or is complete. If the write itself fails
-(e.g. the parent directory doesn't exist), the process exits with the dedicated code 15
-rather than the approve/request-changes code; the result JSON has still been printed to
-stdout by that point, so the review outcome itself is not lost, only the file copy.
+`--out` is reserved and written atomically, closing the two races an agent-facing poller
+would otherwise be exposed to: a stale file silently getting overwritten, and a poller
+observing a partially-written file. As soon as the session starts, ronten atomically
+creates an empty placeholder at the target path (`O_CREAT|O_EXCL`, refusing to clobber
+anything already there); on submission the result is written to a same-directory temp
+file, flushed, then renamed over that placeholder, so the file is always either absent,
+an empty reservation, or complete — never partial. On any non-submitted outcome (abort,
+timeout, ctrl-c, or an error) the placeholder is removed again, so a subsequent run sees a
+clean slate. `--out` is written before stdout, so its failure is confirmed (or fails loudly
+with code 15) before the process risks losing the result to a stdout error. If the final
+write itself fails (e.g. the parent directory disappeared mid-run), the process still exits
+with the dedicated code 15; stdout is attempted regardless of that outcome, so the review
+outcome itself is not lost, only the file copy.
 
 ## Examples
 

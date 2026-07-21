@@ -5,7 +5,8 @@
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
   import { interpretKey } from './lib/keynav'
-  import { revealInvisibles } from './lib/invisibles'
+  import { revealControlChars } from './lib/invisibles'
+  import { renderMarkdown } from './lib/markdown'
   import { focusGeneralComments } from './lib/scroll'
   import type { Verdict } from './lib/types'
 
@@ -172,79 +173,6 @@
     e.preventDefault()
   }
 
-  // Tiny hand-rolled markdown converter for concern descriptions: paragraphs,
-  // `- ` bullet lists, `code` spans, and fenced ``` code blocks. No external
-  // markdown dependency. HTML is escaped first since descriptions come from
-  // agent-supplied JSON.
-  function escapeHtml(s: string): string {
-    return s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;')
-  }
-
-  function renderInline(s: string): string {
-    return s.replace(/`([^`]+)`/g, '<code>$1</code>')
-  }
-
-  function renderMarkdown(src: string): string {
-    const lines = escapeHtml(src).split('\n')
-    const out: string[] = []
-    let paragraph: string[] = []
-    let list: string[] = []
-
-    function flushParagraph(): void {
-      if (paragraph.length > 0) {
-        out.push(`<p>${renderInline(paragraph.join(' '))}</p>`)
-        paragraph = []
-      }
-    }
-    function flushList(): void {
-      if (list.length > 0) {
-        out.push(`<ul>${list.map((item) => `<li>${renderInline(item)}</li>`).join('')}</ul>`)
-        list = []
-      }
-    }
-
-    let i = 0
-    while (i < lines.length) {
-      const line = lines[i]
-      if (line.startsWith('```')) {
-        flushParagraph()
-        flushList()
-        const codeLines: string[] = []
-        i++
-        while (i < lines.length && !lines[i].startsWith('```')) {
-          codeLines.push(lines[i])
-          i++
-        }
-        out.push(`<pre><code>${codeLines.join('\n')}</code></pre>`)
-        i++ // skip closing fence
-        continue
-      }
-      if (line.startsWith('- ')) {
-        flushParagraph()
-        list.push(line.slice(2))
-        i++
-        continue
-      }
-      if (line.trim() === '') {
-        flushParagraph()
-        flushList()
-        i++
-        continue
-      }
-      flushList()
-      paragraph.push(line.trim())
-      i++
-    }
-    flushParagraph()
-    flushList()
-    return out.join('')
-  }
-
   const maxCommentChars = $derived(rs.limits?.max_comment_chars)
 
   const submitTitle = $derived(
@@ -272,9 +200,9 @@
       <div class="topbar-title">
         <span class="seal" aria-hidden="true">論</span>
         <div class="topbar-text">
-          <h1>{revealInvisibles(rs.session.title)}</h1>
+          <h1>{revealControlChars(rs.session.title)}</h1>
           {#if rs.session.summary}
-            <p class="summary">{revealInvisibles(rs.session.summary)}</p>
+            <p class="summary">{revealControlChars(rs.session.summary)}</p>
           {/if}
         </div>
       </div>
@@ -306,9 +234,9 @@
         <ul class="warnings-banner-list">
           {#each rs.session.warnings as warning, i (i)}
             <li>
-              {#if warning.path}<span class="warning-path">{revealInvisibles(warning.path)}:</span
+              {#if warning.path}<span class="warning-path">{revealControlChars(warning.path)}:</span
                 >{/if}
-              {revealInvisibles(warning.message)}
+              {revealControlChars(warning.message)}
             </li>
           {/each}
         </ul>
@@ -341,7 +269,7 @@
           {@const selected = rs.selected}
           {@const selectedComments = rs.draft.concerns[selected.id]?.comments ?? []}
           <div class="concern-header">
-            <h2>{revealInvisibles(selected.title)}</h2>
+            <h2>{revealControlChars(selected.title)}</h2>
             {#if selected.risk}
               <span class="risk-badge risk-{selected.risk}">{selected.risk}</span>
             {/if}
@@ -354,7 +282,7 @@
             <ul class="concern-comment-list">
               {#each selectedComments as comment, i (i)}
                 <li>
-                  <span class="comment-loc">{revealInvisibles(comment.path)}:{comment.line}</span>
+                  <span class="comment-loc">{revealControlChars(comment.path)}:{comment.line}</span>
                   {comment.body}
                 </li>
               {/each}
@@ -362,7 +290,7 @@
           {/if}
           {#if selected.description}
             <div class="concern-description">
-              {@html renderMarkdown(revealInvisibles(selected.description))}
+              {@html renderMarkdown(selected.description)}
             </div>
           {/if}
           <DiffView />
@@ -420,7 +348,7 @@
     <ul class="verdict-summary">
       {#each rs.session.concerns as c (c.id)}
         <li>
-          <span class="vs-title">{revealInvisibles(c.title)}</span>
+          <span class="vs-title">{revealControlChars(c.title)}</span>
           <span class="vs-verdict vs-{rs.draft.concerns[c.id]?.verdict ?? 'none'}"
             >{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span
           >
@@ -516,7 +444,7 @@
     letter-spacing: 0.01em;
     /* Trojan Source defense: isolate agent-supplied text so bidi control
        characters in it can't reorder neighboring elements (their codepoints
-       are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
+       are also revealed as ⟨U+XXXX⟩ tokens by revealControlChars). */
     unicode-bidi: isolate;
   }
 

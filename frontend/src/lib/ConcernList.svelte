@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { revealInvisibles } from './invisibles'
+  import { revealControlChars } from './invisibles'
   import { rs } from './state.svelte'
   import type { Verdict } from './types'
 
@@ -27,7 +27,7 @@
         class:unmapped={concern.unmapped}
         onclick={() => rs.select(i)}
       >
-        <span class="concern-title">{revealInvisibles(concern.title)}</span>
+        <span class="concern-title">{revealControlChars(concern.title)}</span>
         <span class="concern-meta">
           {#if concern.risk}
             <span class="risk-badge risk-{concern.risk}">{concern.risk}</span>
@@ -141,7 +141,7 @@
     /* Trojan Source defense: pin display order to logical order so bidi
        control characters in the agent-supplied title can't reorder how it
        renders (their codepoints are also revealed as ⟨U+XXXX⟩ tokens by
-       revealInvisibles). */
+       revealControlChars). */
     unicode-bidi: isolate;
   }
 

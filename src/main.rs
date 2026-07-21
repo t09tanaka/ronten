@@ -10,6 +10,7 @@ mod schema_cmd;
 mod server;
 mod session;
 mod snapshot;
+mod termsafe;
 
 pub mod exitcode {
     pub const APPROVED: u8 = 0;
@@ -22,8 +23,12 @@ pub mod exitcode {
     pub const NOT_A_REPO: u8 = 12;
     pub const EMPTY_DIFF: u8 = 13;
     pub const GIT_FAILED: u8 = 14;
-    /// A submit outcome was reached but writing `--out` failed. Takes
-    /// precedence over the approve/request-changes decision code.
+    /// `--out` could not be used, either rejected up front (the target
+    /// already exists, is tracked by git, sits inside `.git`, is the same
+    /// file as `--concerns`, or is a directory/symlink — checked, and the
+    /// review never starts) or because the final write failed after a
+    /// submit outcome was reached (in which case this takes precedence over
+    /// the approve/request-changes decision code).
     pub const OUT_FAILED: u8 = 15;
     /// The server task ended unexpectedly before any review outcome was
     /// resolved (e.g. the accept loop errored out).
