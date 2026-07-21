@@ -2,7 +2,7 @@
 //! session state, bind a localhost server, and drive it to an outcome.
 
 use crate::exitcode;
-use crate::gitdiff::{compute_diff, current_branch, repo_root, GitError};
+use crate::gitdiff::{compute_diff, current_branch, has_tracked_changes, repo_root, GitError};
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
@@ -125,6 +125,19 @@ pub async fn run(args: ReviewArgs) -> u8 {
     if files.is_empty() {
         eprintln!("nothing to review: no diff between {} and HEAD", args.base);
         return exitcode::EMPTY_DIFF;
+    }
+
+    // The diff above only ever covers `<base>...HEAD` (committed state); if
+    // the agent forgot to commit some of its work, those changes are
+    // reviewed nowhere. Warn about it here (after the diff is computed, so
+    // there is something to compare against; before serving, so it's visible
+    // before the reviewer ever opens the URL). Display-only, so a git
+    // failure here is not itself a reason to abort the review.
+    if has_tracked_changes(&root) {
+        eprintln!(
+            "warning: tracked files have uncommitted changes; this review covers committed state only ({}...HEAD)",
+            args.base
+        );
     }
 
     // 4. Build the session state.

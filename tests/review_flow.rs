@@ -101,6 +101,57 @@ fn spawn_review(dir: &Path, extra: &[&str]) -> (Child, String) {
     (child, url)
 }
 
+/// Like [`read_review_url`], but also returns every stderr line seen before
+/// the `Review session: ` banner, joined back together. The dirty-worktree
+/// warning (if any) prints before the banner, so this is how tests observe
+/// it without disturbing `read_review_url`'s own banner-detection loop.
+fn read_review_url_with_prebanner(child: &mut Child) -> (String, String) {
+    use std::io::BufRead;
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    let mut prebanner = String::new();
+    let url = loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "process exited before printing URL"
+        );
+        if let Some(rest) = line.trim().strip_prefix("Review session: ") {
+            break rest.to_string();
+        }
+        prebanner.push_str(&line);
+    };
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+    (url, prebanner)
+}
+
+/// Same as [`spawn_review`], but returns the pre-banner stderr text too.
+fn spawn_review_with_prebanner(dir: &Path, extra: &[&str]) -> (Child, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(dir)
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .args(extra)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (url, prebanner) = read_review_url_with_prebanner(&mut child);
+    (child, url, prebanner)
+}
+
 /// `http://127.0.0.1:PORT/r/TOKEN` → `http://127.0.0.1:PORT/api/TOKEN`.
 fn api_base(url: &str) -> String {
     let (origin, token) = url.rsplit_once("/r/").unwrap();
@@ -248,6 +299,43 @@ fn out_write_failure_exits_15_with_stdout_intact() {
         !td.path().join("no-such-dir").exists(),
         "the missing parent directory must not have been created as a side effect"
     );
+}
+
+#[test]
+fn dirty_tracked_file_prints_uncommitted_changes_warning() {
+    // `concerns.json` in the fixture is already untracked (excluded via
+    // -uno); modify a *tracked* file without committing so the warning must
+    // fire.
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+
+    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    assert!(
+        prebanner.contains(
+            "warning: tracked files have uncommitted changes; this review covers committed state only (main...HEAD)"
+        ),
+        "stderr missing dirty-worktree warning: {prebanner}"
+    );
+
+    ureq::post(&format!("{}/abort", api_base(&url)))
+        .call()
+        .unwrap();
+    let _ = child.wait_with_output().unwrap();
+}
+
+#[test]
+fn clean_worktree_prints_no_uncommitted_changes_warning() {
+    let td = fixture_repo();
+    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    assert!(
+        !prebanner.contains("tracked files have uncommitted changes"),
+        "unexpected dirty-worktree warning on a clean worktree: {prebanner}"
+    );
+
+    ureq::post(&format!("{}/abort", api_base(&url)))
+        .call()
+        .unwrap();
+    let _ = child.wait_with_output().unwrap();
 }
 
 #[test]

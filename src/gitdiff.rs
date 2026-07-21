@@ -496,6 +496,23 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     Ok(std::path::PathBuf::from(path))
 }
 
+/// True if any tracked file has uncommitted changes (staged or unstaged),
+/// via `git status --porcelain -uno` (`-uno` excludes untracked files: they
+/// were never committed, so they can't silently escape the `<base>...HEAD`
+/// diff the way an uncommitted edit to a tracked file can). This drives a
+/// display-only startup warning, so any git invocation failure here fails
+/// open (returns `false`, review proceeds) rather than blocking the review
+/// over a check that isn't load-bearing for correctness.
+pub fn has_tracked_changes(root: &std::path::Path) -> bool {
+    match git_cmd(root)
+        .args(["status", "--porcelain", "-uno"])
+        .output()
+    {
+        Ok(output) if output.status.success() => !output.stdout.is_empty(),
+        _ => false,
+    }
+}
+
 /// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
 /// on any failure returns `"review"`.
 pub fn current_branch(root: &std::path::Path) -> String {
