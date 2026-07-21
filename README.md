@@ -329,6 +329,29 @@ truncated:
   (exit 10, via `deny_unknown_fields`) rather than ignoring them; such fields would be added
   in a future version 2 of the contract, never by loosening v1.
 
+## Releases and supply chain
+
+CI pins every GitHub Action to a full commit SHA, pins the Rust toolchain
+(`rust-toolchain.toml`) and Node patch version, and gates on `cargo deny`
+(advisories / license allowlist / source provenance, see `deny.toml`) and
+`cargo audit`. The `package` job installs the actual packaged `.crate` and
+runs the binary, so "`cargo install ronten` works without Node.js" is enforced,
+not assumed.
+
+Tagging `vX.Y.Z` (which must equal the `Cargo.toml` version) builds Linux and
+macOS binaries and attaches them to a **draft** GitHub release together with a
+`SHA256SUMS` file, an SPDX SBOM, and a build-provenance attestation. Before
+publishing the draft, verify an artifact end to end:
+
+```sh
+sha256sum --check SHA256SUMS
+gh attestation verify ronten-<version>-<target>.tar.gz --repo t09tanaka/ronten
+```
+
+Publishing to crates.io remains a deliberate manual `cargo publish`. See
+[SECURITY.md](SECURITY.md) for the vulnerability-reporting process and threat
+model, and [CHANGELOG.md](CHANGELOG.md) for release history.
+
 ## Development
 
 ### Repo layout

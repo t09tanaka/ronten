@@ -1,0 +1,113 @@
+name: Release
+
+# Runs on version tags (v0.2.0 etc.). Produces: platform binaries, a
+# SHA256SUMS file, an SPDX SBOM, and GitHub build-provenance attestations,
+# attached to a DRAFT release for a human to review and publish. Publishing
+# to crates.io stays a deliberate manual step.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Tag must equal Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(cargo metadata --format-version 1 --no-deps | \
+            python3 -c "import json,sys; print(json.load(sys.stdin)['packages'][0]['version'])")
+          if [ "$tag" != "$version" ]; then
+            echo "tag v$tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+
+  build:
+    needs: verify-version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "20.20.2"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
+        with:
+          toolchain: "1.92.0"
+      - name: Build
+        run: cargo build --release --locked
+      - name: Smoke-test the binary
+        run: |
+          ./target/release/ronten --version
+          ./target/release/ronten schema --output > /dev/null
+      - name: Archive
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="ronten-${version}-${{ matrix.target }}"
+          mkdir "$name"
+          cp target/release/ronten README.md LICENSE "$name/"
+          tar -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: ronten-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ronten-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+      - name: SBOM (SPDX, from the source tree)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: spdx-json
+          output-file: dist/ronten-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Build provenance attestation
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: dist/ronten-*.tar.gz
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Draft release for $GITHUB_REF_NAME. Verify SHA256SUMS and the provenance attestation (gh attestation verify) before publishing." \
+            dist/ronten-*.tar.gz dist/SHA256SUMS dist/ronten-*.spdx.json
