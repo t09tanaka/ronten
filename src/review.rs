@@ -109,25 +109,28 @@ fn out_prospective_abs(out: &Path) -> Option<PathBuf> {
     Some(parent_canon.join(name))
 }
 
-/// Absolute, symlink-resolved forms of the paths ronten itself expects to
-/// see in the worktree — the concerns file (unless read from stdin) and the
-/// `--out` destination — so the dirty gate doesn't flag ronten's own inputs.
-fn exempt_paths(concerns: &str, out: Option<&std::path::Path>) -> Vec<PathBuf> {
-    let mut exempt = Vec::new();
-    if concerns != "-" {
-        if let Ok(p) = std::fs::canonicalize(concerns) {
-            exempt.push(p);
-        }
+/// The concerns input's path relative to the repo root, in the lexical,
+/// `/`-separated form `git status` emits — the only form that can be
+/// compared against status output without reopening the symlink-alias hole
+/// described on [`drop_exempt`].
+///
+/// Resolution: canonicalize the concerns path (it must exist to be read at
+/// all) and the repo root, then lexically `strip_prefix` the latter from the
+/// former. Returns `None` — meaning "no exemption is possible" — when
+/// concerns come from stdin (`concerns == "-"`, nothing on disk to compare),
+/// when canonicalization fails, or when the canonicalized concerns path
+/// falls outside the canonicalized repo root. All of these are fail-closed:
+/// no exemption is applied and the dirty gate is free to report the path
+/// dirty like any other.
+fn concerns_repo_relative(concerns: &str, root: &Path) -> Option<String> {
+    if concerns == "-" {
+        return None;
     }
-    if let Some(out) = out {
-        // `--out` usually doesn't exist yet (the whole point of the preflight
-        // no-clobber check below), so this covers a leftover result from a
-        // previous run sitting untracked in the worktree.
-        if let Some(abs) = out_prospective_abs(out) {
-            exempt.push(abs);
-        }
-    }
-    exempt
+    let concerns_abs = std::fs::canonicalize(concerns).ok()?;
+    let root_abs = std::fs::canonicalize(root).ok()?;
+    let rel = concerns_abs.strip_prefix(&root_abs).ok()?;
+    let rel = rel.to_str()?;
+    Some(rel.replace(std::path::MAIN_SEPARATOR, "/"))
 }
 
 /// Checks-only preflight for `--out`, run before the dirty gate so a
@@ -285,21 +288,29 @@ impl Drop for OutReservation {
     }
 }
 
-/// Drops status entries whose absolute path is in `exempt`. Entries that
-/// cannot be resolved (e.g. a deleted tracked file) are kept: an
-/// unresolvable path is a reason to show the entry, not to hide it.
+/// Drops the concerns input from `status.untracked` when it appears there
+/// under an exact repo-relative path match — the only permissible dirty-gate
+/// exemption. `tracked_changes` and `submodules_dirty` are never touched:
+/// ronten only ever expects the concerns file to exist *untracked*, so a
+/// tracked or dirty-submodule entry at that same path is a real uncommitted
+/// change to review, not ronten's own input.
+///
+/// Comparison is plain string equality against `git status`'s own
+/// repo-relative path (`concerns_rel`, from [`concerns_repo_relative`]) —
+/// deliberately not a per-entry canonicalize. The previous implementation
+/// canonicalized every status entry's path and compared it against the
+/// canonicalized concerns path: a symlink aliasing a genuinely dirty tracked
+/// file to the concerns argument would canonicalize to the same real file
+/// and get silently dropped from `tracked_changes`, hiding a real
+/// uncommitted change. Lexical string comparison against `untracked` only
+/// closes that hole.
 fn drop_exempt(
     mut status: crate::gitdiff::WorktreeStatus,
-    root: &std::path::Path,
-    exempt: &[PathBuf],
+    concerns_rel: Option<&str>,
 ) -> crate::gitdiff::WorktreeStatus {
-    let keep = |path: &String| match std::fs::canonicalize(root.join(path)) {
-        Ok(abs) => !exempt.iter().any(|e| e == &abs),
-        Err(_) => true,
-    };
-    status.tracked_changes.retain(keep);
-    status.untracked.retain(keep);
-    status.submodules_dirty.retain(keep);
+    if let Some(concerns_rel) = concerns_rel {
+        status.untracked.retain(|p| p != concerns_rel);
+    }
     status
 }
 
@@ -390,14 +401,17 @@ pub async fn run(args: ReviewArgs) -> u8 {
     // nowhere while the review looks complete. The dirty gate therefore
     // runs before *any* early return, including the empty-diff one below
     // (exactly the case where an agent committed nothing at all). The
-    // concerns file and the `--out` destination are exempt: ronten itself
-    // asks for them to exist untracked in the worktree.
+    // concerns file is exempt only when it shows up untracked at exactly its
+    // own repo-relative path — see [`drop_exempt`]. The `--out` destination
+    // is not exempt at all: Task 1.1's preflight-then-reserve ordering means
+    // `--out` never exists (tracked or untracked) at dirty-gate time, so no
+    // exemption for it is needed.
+    let concerns_rel = concerns_repo_relative(&args.concerns, &root);
     let dirty = match args.dirty_policy {
         DirtyPolicy::Ignore => None,
         DirtyPolicy::Error | DirtyPolicy::Warn => match worktree_status(&root) {
             Ok(status) => {
-                let exempt = exempt_paths(&args.concerns, args.out.as_deref());
-                let status = drop_exempt(status, &root, &exempt);
+                let status = drop_exempt(status, concerns_rel.as_deref());
                 (!status.is_clean()).then_some(status)
             }
             Err(GitError::BadBase(msg))

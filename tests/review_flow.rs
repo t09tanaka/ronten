@@ -660,6 +660,116 @@ fn untracked_file_blocks_start_by_default() {
     );
 }
 
+/// The concerns file being ronten's own input does not exempt it from the
+/// dirty gate once it is tracked: a tracked, uncommitted modification to
+/// concerns.json must still block start, exactly like any other tracked
+/// change. Only an *untracked* concerns file matching the `--concerns` path
+/// exactly is exempt (see `untracked_file_blocks_start_by_default`).
+#[test]
+fn tracked_concerns_change_blocks_start() {
+    let td = fixture_repo();
+    git(td.path(), &["add", "concerns.json"]);
+    git(td.path(), &["commit", "-m", "track concerns"]);
+    // Uncommitted modification to the now-tracked concerns.json.
+    std::fs::write(td.path().join("concerns.json"), format!("{CONCERNS}\n")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("uncommitted change (tracked): concerns.json"),
+        "stderr must name the dirty tracked concerns file: {stderr}"
+    );
+}
+
+/// Regression for the canonicalize-based exemption this task replaces: the
+/// old `drop_exempt` canonicalized *every* status entry's path and dropped
+/// it if that resolved to the same file as the (canonicalized) concerns
+/// path. A symlink aliasing a genuinely dirty tracked file to the concerns
+/// argument would therefore have canonicalized to the same real path and
+/// been silently dropped from `tracked_changes` too — hiding a real
+/// uncommitted change.
+///
+/// Construction: `tracked.json` is a tracked file (valid concerns JSON) with
+/// an uncommitted modification. `alias.json` is an untracked symlink to
+/// `tracked.json`, passed as `--concerns alias.json`. Canonicalizing
+/// `alias.json` resolves to the same real file as `tracked.json`, but the
+/// new lexical repo-relative comparison only ever exempts an entry in
+/// `untracked` whose path string is exactly "alias.json" (there is none —
+/// `alias.json` resolves, canonicalized, to "tracked.json", which is what
+/// gets compared, and "tracked.json" never appears in `untracked`). So the
+/// dirty tracked change to `tracked.json` must still block start.
+#[cfg(unix)]
+#[test]
+fn symlink_alias_does_not_exempt_tracked_change() {
+    let td = fixture_repo();
+    // The fixture's default untracked concerns.json is irrelevant to this
+    // test (concerns come from alias.json here) and would itself block
+    // start as an untracked file, muddying the assertion below — remove it.
+    std::fs::remove_file(td.path().join("concerns.json")).unwrap();
+    std::fs::write(td.path().join("tracked.json"), CONCERNS).unwrap();
+    git(td.path(), &["add", "tracked.json"]);
+    git(td.path(), &["commit", "-m", "track concerns target"]);
+    // Uncommitted modification to the tracked file.
+    std::fs::write(td.path().join("tracked.json"), format!("{CONCERNS}\n")).unwrap();
+    std::os::unix::fs::symlink(td.path().join("tracked.json"), td.path().join("alias.json"))
+        .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "alias.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(17),
+        "the symlink-aliased tracked change must still block start"
+    );
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("uncommitted change (tracked): tracked.json"),
+        "stderr must name the dirty tracked file, not silently drop it via the symlink alias: {stderr}"
+    );
+}
+
+/// A concerns file that is tracked but has no uncommitted modifications must
+/// not be reported as dirty (no false positive from the new comparison).
+#[test]
+fn tracked_unmodified_concerns_on_clean_worktree_still_starts() {
+    let td = fixture_repo();
+    git(td.path(), &["add", "concerns.json"]);
+    git(td.path(), &["commit", "-m", "track concerns"]);
+
+    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    assert!(
+        !prebanner.contains("worktree is not clean"),
+        "unexpected dirty-worktree warning for a clean, tracked concerns file: {prebanner}"
+    );
+
+    common::post_empty(&format!("{}/abort", api_base(&url)));
+    let _ = child.wait_with_output().unwrap();
+}
+
 #[test]
 fn dirty_tracked_file_with_warn_policy_prints_warning_and_starts() {
     let td = fixture_repo();
