@@ -154,8 +154,18 @@ class ReviewState {
       const session = await fetchSession()
       this.session = session
       // Older drafts predate acknowledged_opaque — default it so allOpaqueAcked
-      // and toggleAck can assume the array always exists.
-      this.draft = { ...session.draft, acknowledged_opaque: session.draft.acknowledged_opaque ?? [] }
+      // and toggleAck can assume the array always exists. The lenient PUT
+      // /draft endpoint can also have persisted unknown/non-opaque/duplicate
+      // indices (e.g. from a stale client); normalize to the set of actually
+      // opaque file indices so the UI can't get stuck unrecoverable on bad
+      // saved state.
+      const opaqueIdx = new Set(
+        session.files.map((f, i) => (f.content_kind !== 'text' ? i : -1)).filter((i) => i >= 0),
+      )
+      const acked = [...new Set(session.draft.acknowledged_opaque ?? [])].filter((i) =>
+        opaqueIdx.has(i),
+      )
+      this.draft = { ...session.draft, acknowledged_opaque: acked }
       this.selectedIdx = 0
       this.phase = session.submitted ? 'submitted' : 'review'
     } catch {

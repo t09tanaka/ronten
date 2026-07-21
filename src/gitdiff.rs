@@ -1188,7 +1188,15 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     for entry in &entries {
         if entry.old_oid == entry.new_oid {
             // Pure rename (R100), mode-only change, or a gitlink pointing at
-            // the same commit on both sides: nothing to show.
+            // the same commit on both sides: nothing to show. Equal oids mean
+            // the blob bytes are byte-for-byte identical, so there is no
+            // content diff to display and nothing to hide in it either —
+            // this holds regardless of whether the blob happens to be
+            // binary or non-UTF-8. `content_kind` is therefore set to `Text`
+            // below ("no opaque content change") rather than inspecting the
+            // blob to classify it as Binary/NonUtf8, and the review-gate ack
+            // requirement (only opaque `content_kind`s need acking) does not
+            // apply to this file.
             plans.push(Plan::NoContent);
             continue;
         }

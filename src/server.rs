@@ -465,6 +465,28 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
+    async fn draft_roundtrip_acknowledged_opaque() {
+        let (state, _rx) = build_opaque_state();
+        let app = build_router(state);
+
+        let draft_body = json!({
+            "concerns": {},
+            "general_comments": [],
+            "acknowledged_opaque": [1]
+        });
+        let (status, _) = call(
+            app.clone(),
+            put_json(&format!("/api/{TOKEN}/draft"), draft_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draft"]["acknowledged_opaque"], json!([1]));
+    }
+
+    #[tokio::test]
     async fn submit_incomplete_422() {
         let (state, _rx) = build_state();
         let app = build_router(state);

@@ -25,15 +25,17 @@ describe('contentNote', () => {
   })
 
   it('describes a binary file', () => {
-    expect(contentNote('binary')).toBe('Binary file changed (content not displayed)')
+    expect(contentNote('binary')).toBe('Binary file changed — contents not displayed')
   })
 
   it('describes a non-utf8 file', () => {
-    expect(contentNote('non-utf8')).toBe('Non-UTF-8 file changed (content not displayed)')
+    expect(contentNote('non-utf8')).toBe('Non-UTF-8 file changed — contents not displayed')
   })
 
   it('describes a too-large file', () => {
-    expect(contentNote('too-large')).toBe('File too large to display (content not displayed)')
+    expect(contentNote('too-large')).toBe(
+      'File changed — contents omitted because a display limit was exceeded',
+    )
   })
 })
 

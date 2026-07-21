@@ -9,11 +9,11 @@ export function contentNote(kind: ContentKind): string {
     case 'text':
       return ''
     case 'binary':
-      return 'Binary file changed (content not displayed)'
+      return 'Binary file changed — contents not displayed'
     case 'non-utf8':
-      return 'Non-UTF-8 file changed (content not displayed)'
+      return 'Non-UTF-8 file changed — contents not displayed'
     case 'too-large':
-      return 'File too large to display (content not displayed)'
+      return 'File changed — contents omitted because a display limit was exceeded'
     default: {
       const exhaustive: never = kind
       return exhaustive
