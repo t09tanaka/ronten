@@ -184,7 +184,7 @@
     font-weight: 600;
     /* Trojan Source defense: pin display order to logical order so bidi
        control characters in the path can't reorder how it renders (their
-       codepoints are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
+       codepoints are also revealed as ⟨U+XXXX⟩ tokens by revealControlChars). */
     unicode-bidi: isolate;
     direction: ltr;
   }

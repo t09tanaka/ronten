@@ -5,7 +5,7 @@
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
   import { interpretKey } from './lib/keynav'
-  import { revealInvisibles } from './lib/invisibles'
+  import { revealControlChars, revealInvisibles } from './lib/invisibles'
   import { focusGeneralComments } from './lib/scroll'
   import type { Verdict } from './lib/types'
 
@@ -272,9 +272,9 @@
       <div class="topbar-title">
         <span class="seal" aria-hidden="true">論</span>
         <div class="topbar-text">
-          <h1>{revealInvisibles(rs.session.title)}</h1>
+          <h1>{revealControlChars(rs.session.title)}</h1>
           {#if rs.session.summary}
-            <p class="summary">{revealInvisibles(rs.session.summary)}</p>
+            <p class="summary">{revealControlChars(rs.session.summary)}</p>
           {/if}
         </div>
       </div>
@@ -306,9 +306,9 @@
         <ul class="warnings-banner-list">
           {#each rs.session.warnings as warning, i (i)}
             <li>
-              {#if warning.path}<span class="warning-path">{revealInvisibles(warning.path)}:</span
+              {#if warning.path}<span class="warning-path">{revealControlChars(warning.path)}:</span
                 >{/if}
-              {revealInvisibles(warning.message)}
+              {revealControlChars(warning.message)}
             </li>
           {/each}
         </ul>
@@ -341,7 +341,7 @@
           {@const selected = rs.selected}
           {@const selectedComments = rs.draft.concerns[selected.id]?.comments ?? []}
           <div class="concern-header">
-            <h2>{revealInvisibles(selected.title)}</h2>
+            <h2>{revealControlChars(selected.title)}</h2>
             {#if selected.risk}
               <span class="risk-badge risk-{selected.risk}">{selected.risk}</span>
             {/if}
@@ -354,7 +354,7 @@
             <ul class="concern-comment-list">
               {#each selectedComments as comment, i (i)}
                 <li>
-                  <span class="comment-loc">{revealInvisibles(comment.path)}:{comment.line}</span>
+                  <span class="comment-loc">{revealControlChars(comment.path)}:{comment.line}</span>
                   {comment.body}
                 </li>
               {/each}
@@ -420,7 +420,7 @@
     <ul class="verdict-summary">
       {#each rs.session.concerns as c (c.id)}
         <li>
-          <span class="vs-title">{revealInvisibles(c.title)}</span>
+          <span class="vs-title">{revealControlChars(c.title)}</span>
           <span class="vs-verdict vs-{rs.draft.concerns[c.id]?.verdict ?? 'none'}"
             >{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span
           >
@@ -516,7 +516,7 @@
     letter-spacing: 0.01em;
     /* Trojan Source defense: isolate agent-supplied text so bidi control
        characters in it can't reorder neighboring elements (their codepoints
-       are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
+       are also revealed as ⟨U+XXXX⟩ tokens by revealControlChars). */
     unicode-bidi: isolate;
   }
 

@@ -660,6 +660,50 @@ fn untracked_file_blocks_start_by_default() {
     );
 }
 
+/// Unix filenames may contain bytes a terminal or log line would otherwise
+/// interpret specially — here an ESC (start of an ANSI/OSC escape sequence)
+/// and a raw newline (which could forge an extra, fake log line). The dirty
+/// listing must escape both to the visible `⟨U+XXXX⟩` token instead of
+/// echoing them verbatim to stderr.
+#[cfg(unix)]
+#[test]
+fn dirty_listing_escapes_control_chars() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let td = fixture_repo();
+    let name = OsStr::from_bytes(b"evil\x1binjected\nname.txt");
+    std::fs::write(td.path().join(name), "danger\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("⟨U+001B⟩"),
+        "stderr must escape the raw ESC byte as a visible token: {stderr}"
+    );
+    assert!(
+        stderr.contains("⟨U+000A⟩"),
+        "stderr must escape the embedded newline as a visible token: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "stderr must not contain a raw, unescaped ESC byte: {stderr:?}"
+    );
+}
+
 /// The concerns file being ronten's own input does not exempt it from the
 /// dirty gate once it is tracked: a tracked, uncommitted modification to
 /// concerns.json must still block start, exactly like any other tracked

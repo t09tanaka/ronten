@@ -9,6 +9,7 @@ use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
 use crate::session::{DraftSlot, Phase, SessionState};
+use crate::termsafe::sanitize;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -203,7 +204,7 @@ fn preflight_out_checks(out: &Path, concerns_spec: &str, root: &Path) -> Result<
             Err(GitError::GitFailed(msg)) => {
                 return Err(format!(
                     "could not determine the repository's git directory: {}",
-                    msg.trim()
+                    sanitize(msg.trim())
                 ));
             }
             Err(_) => {}
@@ -226,7 +227,7 @@ fn preflight_out_checks(out: &Path, concerns_spec: &str, root: &Path) -> Result<
                         Err(GitError::GitFailed(msg)) => {
                             return Err(format!(
                                 "could not check whether --out is tracked: {}",
-                                msg.trim()
+                                sanitize(msg.trim())
                             ));
                         }
                         Err(_) => {}
@@ -337,7 +338,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let root = match repo_root() {
         Ok(root) => root,
         Err(GitError::GitFailed(msg)) => {
-            eprintln!("git failed: {}", msg.trim());
+            eprintln!("git failed: {}", sanitize(msg.trim()));
             return exitcode::GIT_FAILED;
         }
         Err(_) => {
@@ -370,11 +371,11 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let diff_output = match compute_diff(&root, &args.base) {
         Ok(output) => output,
         Err(GitError::BadBase(msg)) => {
-            eprintln!("bad base ref {:?}: {}", args.base, msg.trim());
+            eprintln!("bad base ref {:?}: {}", args.base, sanitize(msg.trim()));
             return exitcode::BAD_BASE;
         }
         Err(GitError::GitFailed(msg)) => {
-            eprintln!("git failed: {}", msg.trim());
+            eprintln!("git failed: {}", sanitize(msg.trim()));
             return exitcode::GIT_FAILED;
         }
         Err(GitError::NotARepo) => {
@@ -440,13 +441,13 @@ pub async fn run(args: ReviewArgs) -> u8 {
                 if args.dirty_policy == DirtyPolicy::Error {
                     eprintln!(
                         "git status failed, cannot verify the worktree is clean: {}",
-                        msg.trim()
+                        sanitize(msg.trim())
                     );
                     return exitcode::GIT_FAILED;
                 }
                 eprintln!(
                     "warning: git status failed ({}); could not verify the worktree is clean",
-                    msg.trim()
+                    sanitize(msg.trim())
                 );
                 None
             }
@@ -455,13 +456,13 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
     let print_dirty = |status: &crate::gitdiff::WorktreeStatus| {
         for path in &status.tracked_changes {
-            eprintln!("  uncommitted change (tracked): {path}");
+            eprintln!("  uncommitted change (tracked): {}", sanitize(path));
         }
         for path in &status.untracked {
-            eprintln!("  untracked file: {path}");
+            eprintln!("  untracked file: {}", sanitize(path));
         }
         for path in &status.submodules_dirty {
-            eprintln!("  dirty submodule: {path}");
+            eprintln!("  dirty submodule: {}", sanitize(path));
         }
     };
     if let Some(status) = &dirty {

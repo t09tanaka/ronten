@@ -10,6 +10,7 @@ mod schema_cmd;
 mod server;
 mod session;
 mod snapshot;
+mod termsafe;
 
 pub mod exitcode {
     pub const APPROVED: u8 = 0;
