@@ -234,7 +234,7 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitdiff::{FileStatus, Hunk};
+    use crate::gitdiff::{ChangeKind, ContentKind, Hunk};
     use crate::model::{Concern, Location, Risk};
 
     /// Fabricates a `FileDiff` with `old_path == new_path == path` and one
@@ -244,7 +244,14 @@ mod tests {
         FileDiff {
             old_path: Some(path.to_string()),
             new_path: Some(path.to_string()),
-            status: FileStatus::Modified,
+            change_kind: ChangeKind::Modified,
+            content_kind: ContentKind::Text,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            old_size: None,
+            new_size: None,
             hunks: hunks
                 .iter()
                 .map(|&(old_start, old_count, new_start, new_count)| Hunk {
@@ -336,7 +343,14 @@ mod tests {
         let files = vec![FileDiff {
             old_path: Some("gone.txt".to_string()),
             new_path: None,
-            status: FileStatus::Deleted,
+            change_kind: ChangeKind::Deleted,
+            content_kind: ContentKind::Text,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            old_size: None,
+            new_size: None,
             hunks: vec![Hunk {
                 old_start: 1,
                 old_count: 5,
@@ -421,13 +435,27 @@ mod tests {
             FileDiff {
                 old_path: Some("logo.png".to_string()),
                 new_path: Some("logo.png".to_string()),
-                status: FileStatus::Binary,
+                change_kind: ChangeKind::Modified,
+                content_kind: ContentKind::Binary,
+                old_mode: None,
+                new_mode: None,
+                old_oid: None,
+                new_oid: None,
+                old_size: None,
+                new_size: None,
                 hunks: Vec::new(),
             },
             FileDiff {
                 old_path: Some("other.png".to_string()),
                 new_path: Some("other.png".to_string()),
-                status: FileStatus::Binary,
+                change_kind: ChangeKind::Modified,
+                content_kind: ContentKind::Binary,
+                old_mode: None,
+                new_mode: None,
+                old_oid: None,
+                new_oid: None,
+                old_size: None,
+                new_size: None,
                 hunks: Vec::new(),
             },
         ];

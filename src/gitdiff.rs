@@ -1,12 +1,20 @@
 use serde::Serialize;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
-pub enum FileStatus {
-    Modified,
+pub enum ChangeKind {
     Added,
     Deleted,
+    Modified,
     Renamed,
+    Copied,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub enum ContentKind {
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "binary")]
     Binary,
     #[serde(rename = "non-utf8")]
     NonUtf8,
@@ -18,8 +26,30 @@ pub enum FileStatus {
 pub struct FileDiff {
     pub old_path: Option<String>,
     pub new_path: Option<String>,
-    pub status: FileStatus,
+    pub change_kind: ChangeKind,
+    pub content_kind: ContentKind,
+    /// Git file mode（例 "100644", "100755", "120000", "160000"）。
+    /// 存在しない側（added の old / deleted の new、mode "000000"）は None。
+    pub old_mode: Option<String>,
+    pub new_mode: Option<String>,
+    /// フル OID。zero-oid の側は None。`parse_unified_diff` 経由（demo）は常に None。
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+    /// blob サイズ（bytes）。gitlink・存在しない側・不明（demo 経由）は None。
+    pub old_size: Option<u64>,
+    pub new_size: Option<u64>,
     pub hunks: Vec<Hunk>,
+}
+
+impl FileDiff {
+    /// 内容が描画されない変更（binary / non-utf8 / too-large）。
+    /// submit 時に明示 acknowledge が必要（Task 3）。
+    // Task 3 wires this into the submit-acknowledgment gate; until then it
+    // has no production caller (only the unit test below exercises it).
+    #[allow(dead_code)]
+    pub fn is_opaque(&self) -> bool {
+        self.content_kind != ContentKind::Text
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,7 +153,14 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
             files.push(FileDiff {
                 old_path,
                 new_path,
-                status: FileStatus::Modified,
+                change_kind: ChangeKind::Modified,
+                content_kind: ContentKind::Text,
+                old_mode: None,
+                new_mode: None,
+                old_oid: None,
+                new_oid: None,
+                old_size: None,
+                new_size: None,
                 hunks: Vec::new(),
             });
             continue;
@@ -147,28 +184,30 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
                 continue;
             }
         }
-        if line.starts_with("new file mode") {
-            file.status = FileStatus::Added;
+        if let Some(rest) = line.strip_prefix("new file mode ") {
+            file.change_kind = ChangeKind::Added;
+            file.new_mode = Some(rest.trim().to_string());
             continue;
         }
-        if line.starts_with("deleted file mode") {
-            file.status = FileStatus::Deleted;
+        if let Some(rest) = line.strip_prefix("deleted file mode ") {
+            file.change_kind = ChangeKind::Deleted;
+            file.old_mode = Some(rest.trim().to_string());
             continue;
         }
         if let Some(rest) = line.strip_prefix("rename from ") {
-            file.status = FileStatus::Renamed;
+            file.change_kind = ChangeKind::Renamed;
             file.old_path = Some(rest.to_string());
             continue;
         }
         if let Some(rest) = line.strip_prefix("rename to ") {
-            file.status = FileStatus::Renamed;
+            file.change_kind = ChangeKind::Renamed;
             file.new_path = Some(rest.to_string());
             continue;
         }
         if (line.starts_with("Binary files") && line.ends_with("differ"))
             || line.starts_with("GIT binary patch")
         {
-            file.status = FileStatus::Binary;
+            file.content_kind = ContentKind::Binary;
             continue;
         }
 
@@ -245,6 +284,30 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
 mod tests {
     use super::*;
 
+    fn file_diff_with_content_kind(content_kind: ContentKind) -> FileDiff {
+        FileDiff {
+            old_path: None,
+            new_path: None,
+            change_kind: ChangeKind::Modified,
+            content_kind,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            old_size: None,
+            new_size: None,
+            hunks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn is_opaque_true_only_for_non_text_content() {
+        assert!(!file_diff_with_content_kind(ContentKind::Text).is_opaque());
+        assert!(file_diff_with_content_kind(ContentKind::Binary).is_opaque());
+        assert!(file_diff_with_content_kind(ContentKind::NonUtf8).is_opaque());
+        assert!(file_diff_with_content_kind(ContentKind::TooLarge).is_opaque());
+    }
+
     const MODIFIED: &str = "\
 diff --git a/src/app.ts b/src/app.ts
 index 1111111..2222222 100644
@@ -269,7 +332,7 @@ index 1111111..2222222 100644
         assert_eq!(files.len(), 1);
         let f = &files[0];
         assert_eq!(f.new_path.as_deref(), Some("src/app.ts"));
-        assert_eq!(f.status, FileStatus::Modified);
+        assert_eq!(f.change_kind, ChangeKind::Modified);
         assert_eq!(f.hunks.len(), 2);
         let h = &f.hunks[0];
         assert_eq!(
@@ -303,7 +366,7 @@ index 0000000..3333333
     #[test]
     fn parses_added_file() {
         let f = &parse_unified_diff(ADDED)[0];
-        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!(f.change_kind, ChangeKind::Added);
         assert_eq!(f.old_path, None);
         assert_eq!(f.new_path.as_deref(), Some("new.txt"));
         assert_eq!(f.hunks[0].new_count, 2);
@@ -323,7 +386,7 @@ index 4444444..0000000
     #[test]
     fn parses_deleted_file() {
         let f = &parse_unified_diff(DELETED)[0];
-        assert_eq!(f.status, FileStatus::Deleted);
+        assert_eq!(f.change_kind, ChangeKind::Deleted);
         assert_eq!(f.new_path, None);
         assert_eq!(f.hunks[0].new_count, 0);
         assert_eq!(f.hunks[0].lines[0].new_no, None);
@@ -339,7 +402,7 @@ rename to new_name.rs
     #[test]
     fn parses_pure_rename_without_hunks() {
         let f = &parse_unified_diff(RENAME_NO_CHANGE)[0];
-        assert_eq!(f.status, FileStatus::Renamed);
+        assert_eq!(f.change_kind, ChangeKind::Renamed);
         assert_eq!(f.old_path.as_deref(), Some("old_name.rs"));
         assert_eq!(f.new_path.as_deref(), Some("new_name.rs"));
         assert!(f.hunks.is_empty());
@@ -354,7 +417,7 @@ Binary files a/logo.png and b/logo.png differ
     #[test]
     fn parses_binary_file() {
         let f = &parse_unified_diff(BINARY)[0];
-        assert_eq!(f.status, FileStatus::Binary);
+        assert_eq!(f.content_kind, ContentKind::Binary);
         assert!(f.hunks.is_empty());
         assert_eq!(f.new_path.as_deref(), Some("logo.png"));
     }
@@ -456,11 +519,11 @@ pub fn current_branch(root: &std::path::Path) -> String {
 }
 
 /// Largest single blob that will be rendered inline. Files with a bigger
-/// blob on either side are reported as `FileStatus::TooLarge` with a warning.
+/// blob on either side are reported as `ContentKind::TooLarge` with a warning.
 pub const MAX_FILE_BYTES: usize = 1_048_576;
 
 /// Total blob-content budget for one diff. Once exceeded, remaining files
-/// are reported as `FileStatus::TooLarge` with a warning rather than being
+/// are reported as `ContentKind::TooLarge` with a warning rather than being
 /// silently truncated.
 pub const MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024;
 
@@ -489,7 +552,7 @@ enum Plan {
     /// gitlink pointing at the same commit on both sides): no hunks, no
     /// content needed.
     NoContent,
-    /// Over a size limit: `FileStatus::TooLarge`, no hunks.
+    /// Over a size limit: `ContentKind::TooLarge`, no hunks.
     TooLarge,
     /// Diff two text representations. Gitlink (mode 160000) sides never have
     /// their oid fetched (it usually doesn't exist locally as a blob);
@@ -747,6 +810,39 @@ fn is_gitlink_mode(mode: &str) -> bool {
     mode == "160000"
 }
 
+/// `Some(mode)` unless `mode` is the "no such side" sentinel `"000000"`
+/// (added's old side, deleted's new side).
+fn mode_opt(mode: &str) -> Option<String> {
+    if mode == "000000" {
+        None
+    } else {
+        Some(mode.to_string())
+    }
+}
+
+/// `Some(oid)` unless `oid` is the all-zero sentinel (no such side).
+fn oid_opt(oid: &str) -> Option<String> {
+    if is_zero_oid(oid) {
+        None
+    } else {
+        Some(oid.to_string())
+    }
+}
+
+/// Blob size for one side of an entry, looked up from the `--batch-check`
+/// results. `None` for a nonexistent side (zero oid) or a gitlink (never
+/// queried, since its oid is a commit in another repo, not a blob here).
+fn blob_size(
+    sizes: &std::collections::HashMap<String, usize>,
+    mode: &str,
+    oid: &str,
+) -> Option<u64> {
+    if is_zero_oid(oid) || is_gitlink_mode(mode) {
+        return None;
+    }
+    sizes.get(oid).map(|&size| size as u64)
+}
+
 /// Path to show in user-facing warnings: the post-change path when present.
 fn display_path(entry: &RawEntry) -> &str {
     entry.path2.as_deref().unwrap_or(&entry.path)
@@ -761,12 +857,13 @@ fn entry_paths(entry: &RawEntry) -> (Option<String>, Option<String>) {
     }
 }
 
-fn entry_status(entry: &RawEntry) -> FileStatus {
+fn entry_change_kind(entry: &RawEntry) -> ChangeKind {
     match entry.status {
-        'A' => FileStatus::Added,
-        'D' => FileStatus::Deleted,
-        'R' => FileStatus::Renamed,
-        _ => FileStatus::Modified,
+        'A' => ChangeKind::Added,
+        'D' => ChangeKind::Deleted,
+        'R' => ChangeKind::Renamed,
+        'C' => ChangeKind::Copied,
+        _ => ChangeKind::Modified,
     }
 }
 
@@ -1038,12 +1135,13 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     // Sizes first (--batch-check), so oversized blobs are never ingested.
     // Gitlink sides are excluded: their oid is a commit in a submodule repo,
     // not a blob in this one, and usually doesn't exist locally at all.
+    // Equal-oid entries (pure rename / mode-only change) are still included
+    // here so their size can be exposed in `FileDiff`, even though they get
+    // `Plan::NoContent` below (--batch-check is cheap: it never reads blob
+    // content).
     let mut size_oids: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for entry in &entries {
-        if entry.old_oid == entry.new_oid {
-            continue;
-        }
         for (mode, oid) in [
             (&entry.old_mode, &entry.old_oid),
             (&entry.new_mode, &entry.new_oid),
@@ -1118,18 +1216,18 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     let mut files = Vec::with_capacity(entries.len());
     for (entry, plan) in entries.iter().zip(&plans) {
         let (old_path, new_path) = entry_paths(entry);
-        let (status, hunks) = match plan {
-            Plan::NoContent => (entry_status(entry), Vec::new()),
-            Plan::TooLarge => (FileStatus::TooLarge, Vec::new()),
+        let (content_kind, hunks) = match plan {
+            Plan::NoContent => (ContentKind::Text, Vec::new()),
+            Plan::TooLarge => (ContentKind::TooLarge, Vec::new()),
             Plan::Content => {
                 let old = side_bytes(&entry.old_mode, &entry.old_oid, &contents)?;
                 let new = side_bytes(&entry.new_mode, &entry.new_oid, &contents)?;
                 if is_binary(&old) || is_binary(&new) {
-                    (FileStatus::Binary, Vec::new())
+                    (ContentKind::Binary, Vec::new())
                 } else {
                     match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
                         (Ok(old_text), Ok(new_text)) => {
-                            (entry_status(entry), text_hunks(old_text, new_text))
+                            (ContentKind::Text, text_hunks(old_text, new_text))
                         }
                         _ => {
                             // Different byte contents can lossy-decode to the
@@ -1138,7 +1236,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
                                 "file content is not valid UTF-8, not rendered: {}",
                                 display_path(entry)
                             ));
-                            (FileStatus::NonUtf8, Vec::new())
+                            (ContentKind::NonUtf8, Vec::new())
                         }
                     }
                 }
@@ -1147,7 +1245,14 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
         files.push(FileDiff {
             old_path,
             new_path,
-            status,
+            change_kind: entry_change_kind(entry),
+            content_kind,
+            old_mode: mode_opt(&entry.old_mode),
+            new_mode: mode_opt(&entry.new_mode),
+            old_oid: oid_opt(&entry.old_oid),
+            new_oid: oid_opt(&entry.new_oid),
+            old_size: blob_size(&sizes, &entry.old_mode, &entry.old_oid),
+            new_size: blob_size(&sizes, &entry.new_mode, &entry.new_oid),
             hunks,
         });
     }
@@ -1255,7 +1360,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         let a = find(&out.files, "a.txt");
-        assert_eq!(a.status, FileStatus::Modified);
+        assert_eq!(a.change_kind, ChangeKind::Modified);
         assert!(hunk_contents(a).contains(&"EVIL"));
     }
 
@@ -1287,7 +1392,7 @@ mod git_tests {
         assert!(out.warnings.is_empty());
         assert_eq!(out.files.len(), 2);
         let a = find(&out.files, "a.txt");
-        assert_eq!(a.status, FileStatus::Modified);
+        assert_eq!(a.change_kind, ChangeKind::Modified);
         let h = &a.hunks[0];
         assert_eq!(
             (h.old_start, h.old_count, h.new_start, h.new_count),
@@ -1307,7 +1412,7 @@ mod git_tests {
             .unwrap();
         assert_eq!((removed.old_no, removed.new_no), (Some(2), None));
         let b = find(&out.files, "b.txt");
-        assert_eq!(b.status, FileStatus::Added);
+        assert_eq!(b.change_kind, ChangeKind::Added);
         assert_eq!(b.old_path, None);
         assert_eq!(b.hunks[0].old_start, 0);
         assert_eq!(b.hunks[0].old_count, 0);
@@ -1352,7 +1457,7 @@ mod git_tests {
         let f = out
             .files
             .iter()
-            .find(|f| f.status == FileStatus::Added)
+            .find(|f| f.change_kind == ChangeKind::Added)
             .expect("added file present");
         assert_eq!(f.new_path.as_deref(), Some("日本語.txt"));
     }
@@ -1370,7 +1475,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         let a = find(&out.files, "a.txt");
-        assert_eq!(a.status, FileStatus::Modified);
+        assert_eq!(a.change_kind, ChangeKind::Modified);
         assert!(hunk_contents(a).contains(&"TWO"));
     }
 
@@ -1387,7 +1492,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         let a = find(&out.files, "a.txt");
-        assert_eq!(a.status, FileStatus::Modified);
+        assert_eq!(a.change_kind, ChangeKind::Modified);
         assert!(hunk_contents(a).contains(&"TWO"));
     }
 
@@ -1457,7 +1562,7 @@ mod git_tests {
         let out = compute_diff(d, "main").unwrap();
         assert_eq!(out.files.len(), 1);
         let f = &out.files[0];
-        assert_eq!(f.status, FileStatus::Renamed);
+        assert_eq!(f.change_kind, ChangeKind::Renamed);
         assert_eq!(f.old_path.as_deref(), Some("a.txt"));
         assert_eq!(f.new_path.as_deref(), Some("renamed.txt"));
         assert!(f.hunks.is_empty());
@@ -1483,7 +1588,7 @@ mod git_tests {
         let out = compute_diff(d, "main").unwrap();
         assert_eq!(out.files.len(), 1);
         let f = &out.files[0];
-        assert_eq!(f.status, FileStatus::Renamed);
+        assert_eq!(f.change_kind, ChangeKind::Renamed);
         assert_eq!(f.old_path.as_deref(), Some("a.txt"));
         assert_eq!(f.new_path.as_deref(), Some("moved.txt"));
         let contents = hunk_contents(f);
@@ -1550,7 +1655,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         let f = find(&out.files, "sub");
-        assert_eq!(f.status, FileStatus::Added);
+        assert_eq!(f.change_kind, ChangeKind::Added);
         assert_eq!(f.hunks.len(), 1);
         let lines = &f.hunks[0].lines;
         assert_eq!(lines.len(), 1);
@@ -1641,7 +1746,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         let f = find(&out.files, "blob.bin");
-        assert_eq!(f.status, FileStatus::Binary);
+        assert_eq!(f.content_kind, ContentKind::Binary);
         assert!(f.hunks.is_empty());
     }
 
@@ -1665,7 +1770,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         assert_eq!(out.files.len(), 1);
-        assert_eq!(out.files[0].status, FileStatus::NonUtf8);
+        assert_eq!(out.files[0].content_kind, ContentKind::NonUtf8);
         assert!(out.files[0].hunks.is_empty());
         assert_eq!(out.warnings.len(), 1);
         assert!(
@@ -1687,7 +1792,7 @@ mod git_tests {
 
         let out = compute_diff(d, "main").unwrap();
         let big_file = find(&out.files, "big.txt");
-        assert_eq!(big_file.status, FileStatus::TooLarge);
+        assert_eq!(big_file.content_kind, ContentKind::TooLarge);
         assert!(big_file.hunks.is_empty());
         assert_eq!(out.warnings.len(), 1);
         assert!(
@@ -1725,5 +1830,45 @@ mod git_tests {
         let contents = hunk_contents(a);
         assert!(contents.contains(&"TWO"));
         assert!(!contents.iter().any(|c| c.contains("main edit")));
+    }
+
+    #[test]
+    fn mode_only_change_exposes_modes() {
+        let td = base_repo();
+        let d = td.path();
+        git(d, &["update-index", "--chmod=+x", "a.txt"]);
+        git(d, &["commit", "-m", "make executable"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let a = find(&out.files, "a.txt");
+        assert_eq!(a.change_kind, ChangeKind::Modified);
+        assert_eq!(a.content_kind, ContentKind::Text);
+        assert!(a.hunks.is_empty());
+        assert_eq!(a.old_mode.as_deref(), Some("100644"));
+        assert_eq!(a.new_mode.as_deref(), Some("100755"));
+        assert_eq!(a.old_oid, a.new_oid);
+        assert!(a.old_oid.is_some());
+        assert!(
+            a.old_size.is_some(),
+            "size must be fetched even for equal-oid entries"
+        );
+    }
+
+    #[test]
+    fn binary_file_exposes_oids_and_sizes() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("blob.bin"), b"\x00\x01\x02text").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "binary"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "blob.bin");
+        assert_eq!(f.content_kind, ContentKind::Binary);
+        assert_eq!(f.change_kind, ChangeKind::Added);
+        assert_eq!(f.old_oid, None);
+        assert!(f.new_oid.is_some());
+        assert_eq!(f.new_size, Some(7));
+        assert_eq!(f.new_mode.as_deref(), Some("100644"));
     }
 }
