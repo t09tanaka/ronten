@@ -536,6 +536,7 @@ pub struct DiffOutput {
 }
 
 /// One record of `git diff-tree -r -z --raw` output.
+#[derive(Debug)]
 struct RawEntry {
     old_mode: String,
     new_mode: String,
@@ -661,6 +662,19 @@ fn is_hex_oid_field(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Converts a NUL-delimited path token to UTF-8, failing closed instead of
+/// lossily collapsing invalid bytes to `�`: two different non-UTF-8 paths
+/// would otherwise render identically, making concern mapping and comment
+/// anchors ambiguous.
+fn utf8_path(token: &[u8], malformed: &impl Fn(&str) -> GitError) -> Result<String, GitError> {
+    std::str::from_utf8(token).map(str::to_string).map_err(|_| {
+        malformed(&format!(
+            "non-UTF-8 path {:?} (ronten requires UTF-8 paths)",
+            String::from_utf8_lossy(token)
+        ))
+    })
+}
+
 /// Parses `git diff-tree -r -z --raw` output:
 /// `:<oldmode> <newmode> <oldoid> <newoid> <status>\0<path>\0[<path2>\0]`.
 /// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
@@ -721,12 +735,12 @@ fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
             .next()
             .filter(|t| !t.is_empty())
             .ok_or_else(|| malformed(&format!("record {meta:?} has no path")))?;
-        let path = String::from_utf8_lossy(path_token).to_string();
+        let path = utf8_path(path_token, &malformed)?;
         let path2 = if matches!(status, 'R' | 'C') {
             let token = tokens.next().filter(|t| !t.is_empty()).ok_or_else(|| {
                 malformed(&format!("rename/copy record {meta:?} has no second path"))
             })?;
-            Some(String::from_utf8_lossy(token).to_string())
+            Some(utf8_path(token, &malformed)?)
         } else {
             None
         };
@@ -791,6 +805,22 @@ mod raw_tests {
         assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 Q\0a.txt\0").is_err());
         // interior empty token
         assert!(parse_raw_z(b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0a.txt\0\0b.txt\0").is_err());
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_non_utf8_path() {
+        let raw = b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0\x80path\0";
+        let err = parse_raw_z(raw).unwrap_err();
+        let GitError::GitFailed(msg) = err else {
+            panic!("expected GitFailed")
+        };
+        assert!(msg.contains("non-UTF-8"), "message should explain: {msg}");
+    }
+
+    #[test]
+    fn parse_raw_z_rejects_non_utf8_second_path() {
+        let raw = b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 R90\0ok.txt\0\x81new\0";
+        assert!(parse_raw_z(raw).is_err());
     }
 }
 
