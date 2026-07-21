@@ -122,22 +122,35 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
     let files = diff_output.files;
     let diff_warnings = diff_output.warnings;
-    if files.is_empty() {
-        eprintln!("nothing to review: no diff between {} and HEAD", args.base);
-        return exitcode::EMPTY_DIFF;
-    }
 
     // The diff above only ever covers `<base>...HEAD` (committed state); if
     // the agent forgot to commit some of its work, those changes are
-    // reviewed nowhere. Warn about it here (after the diff is computed, so
-    // there is something to compare against; before serving, so it's visible
-    // before the reviewer ever opens the URL). Display-only, so a git
-    // failure here is not itself a reason to abort the review.
-    if has_tracked_changes(&root) {
+    // reviewed nowhere. Checked here (after the diff is computed, so there is
+    // something to compare against) and printed before *any* early return —
+    // including the empty-diff one below, which is exactly the case where an
+    // agent committed nothing at all and every change sits uncommitted. This
+    // must run and warn even though the process is about to exit, so the
+    // reviewer isn't left staring at "nothing to review" with no clue that
+    // uncommitted changes exist. Display-only, so a git failure here is not
+    // itself a reason to abort the review.
+    let dirty_warning = || {
         eprintln!(
             "warning: tracked files have uncommitted changes; this review covers committed state only ({}...HEAD)",
             args.base
         );
+    };
+    let dirty = has_tracked_changes(&root);
+
+    if files.is_empty() {
+        eprintln!("nothing to review: no diff between {} and HEAD", args.base);
+        if dirty {
+            dirty_warning();
+        }
+        return exitcode::EMPTY_DIFF;
+    }
+
+    if dirty {
+        dirty_warning();
     }
 
     // 4. Build the session state.

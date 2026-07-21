@@ -18,9 +18,13 @@ use std::sync::Arc;
 /// API JSON). `style-src` allows `'unsafe-inline'` because Svelte's `style:`
 /// directive (and similar bound-style bindings) compiles down to inline
 /// `style="..."` attributes on elements — there is no build-time way to hash
-/// or nonce those, so a strict `style-src 'self'` would break the UI. Every
-/// other directive stays locked to `'self'`/`'none'`.
-const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
+/// or nonce those, so a strict `style-src 'self'` would break the UI.
+/// `font-src` allows `data:` because `app.css` embeds the "論" seal glyph
+/// (unicode-range U+8AD6) as an inline `data:font/woff2;base64` subset — with
+/// only `default-src 'self'` this glyph's `document.fonts.load` fails with a
+/// network error (confirmed against a live build). Every other directive
+/// stays locked to `'self'`/`'none'`.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
 
 /// Sets response headers that matter because the session token lives in the
 /// URL path: caching or leaking it (via history, shared caches, referrers, or
@@ -966,6 +970,7 @@ index 1111111..2222222 100644
         assert!(csp.contains("default-src 'self'"));
         assert!(csp.contains("script-src 'self'"));
         assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("font-src 'self' data:"));
         assert!(csp.contains("connect-src 'self'"));
         assert!(csp.contains("img-src 'self' data:"));
         assert!(csp.contains("frame-ancestors 'none'"));

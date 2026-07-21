@@ -324,6 +324,48 @@ fn dirty_tracked_file_prints_uncommitted_changes_warning() {
 }
 
 #[test]
+fn empty_diff_with_dirty_tracked_file_exits_13_with_warning() {
+    // Regression test: the empty-diff early return used to happen before the
+    // dirty-worktree check, so the single most important case — an agent
+    // that committed nothing at all, leaving every change uncommitted — never
+    // got the warning. `--base feature` against HEAD (also `feature`) is an
+    // empty diff by construction; then a tracked file is modified without
+    // committing.
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "feature",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(13));
+    assert!(out.stdout.is_empty(), "stdout must be empty on empty diff");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("nothing to review"),
+        "stderr missing empty-diff message: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "warning: tracked files have uncommitted changes; this review covers committed state only (feature...HEAD)"
+        ),
+        "stderr missing dirty-worktree warning: {stderr}"
+    );
+}
+
+#[test]
 fn clean_worktree_prints_no_uncommitted_changes_warning() {
     let td = fixture_repo();
     let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
