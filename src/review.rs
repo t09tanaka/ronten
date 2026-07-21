@@ -351,6 +351,19 @@ pub async fn run(args: ReviewArgs) -> u8 {
 /// at most this long.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Waits for the next interrupt on the eagerly registered handler (unix);
+/// elsewhere falls back to `ctrl_c()`, whose lazy registration is the best
+/// available on that platform.
+#[cfg(unix)]
+async fn wait_interrupt(interrupt: &mut tokio::signal::unix::Signal) {
+    interrupt.recv().await;
+}
+
+#[cfg(not(unix))]
+async fn wait_interrupt(_interrupt: &mut ()) {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 /// Serve a prepared session until it reaches an outcome, then print the result
 /// and return the exit code. Shared by `review::run` and the demo command so
 /// both drive an identical serve/select/report loop.
@@ -363,6 +376,25 @@ pub async fn serve_session(
     timeout: Option<Duration>,
     out: Option<PathBuf>,
 ) -> u8 {
+    // Install the SIGINT handler BEFORE the banner: once the session URL is
+    // visible, a ctrl-c must produce the clean abort exit (2). Without eager
+    // registration there is a gap between printing the URL and the select!
+    // loop's first poll in which a SIGINT hits the default disposition and
+    // kills the process with no exit code at all (observed as a flaky
+    // sigint test in CI). `signal()` registers the OS handler at call time,
+    // so anything delivered after this line is queued, not fatal.
+    #[cfg(unix)]
+    let mut interrupt =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+            Ok(signal) => signal,
+            Err(e) => {
+                eprintln!("failed to install the SIGINT handler: {e}");
+                return exitcode::SERVER_FAILED;
+            }
+        };
+    #[cfg(not(unix))]
+    let mut interrupt = ();
+
     eprintln!("Review session: {url}");
     let _ = std::io::stderr().flush();
 
@@ -416,7 +448,7 @@ pub async fn serve_session(
                 }
             }
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = wait_interrupt(&mut interrupt) => {
             if state.try_finish(Outcome::Aborted) {
                 Outcome::Aborted
             } else {
@@ -454,7 +486,7 @@ pub async fn serve_session(
     let finished_cleanly = tokio::select! {
         _ = &mut server_handle => true,
         _ = tokio::time::sleep(SHUTDOWN_GRACE) => false,
-        _ = tokio::signal::ctrl_c() => false,
+        _ = wait_interrupt(&mut interrupt) => false,
     };
     if !finished_cleanly {
         server_handle.abort();
