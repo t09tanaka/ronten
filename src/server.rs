@@ -317,19 +317,28 @@ async fn post_abort(State(state): State<Arc<SessionState>>, Path(token): Path<St
 }
 
 pub fn build_router(state: Arc<SessionState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/r/{token}", get(get_index))
         .route("/assets/{*path}", get(get_asset))
         .route("/api/{token}/session", get(get_session))
         .route("/api/{token}/draft", put(put_draft))
         .route("/api/{token}/submit", post(post_submit))
         .route("/api/{token}/abort", post(post_abort))
-        .with_state(state)
+        .with_state(state);
+    with_middleware(router, REQUEST_TIMEOUT)
+}
+
+/// Applies the shared middleware stack. Layer order matters: the LAST
+/// `.layer()` is the outermost, and `security_headers` must be outermost so
+/// that even a synthesized 408 from the timeout layer (which drops the inner
+/// future, headers and all) still passes through it and gets
+/// no-store/CSP/etc. — every response, no exceptions, per the header
+/// invariant. Split out of `build_router` so tests can exercise this exact
+/// ordering with a short timeout.
+fn with_middleware(router: Router, timeout: std::time::Duration) -> Router {
+    router
+        .layer(middleware::from_fn_with_state(timeout, request_timeout))
         .layer(middleware::from_fn(security_headers))
-        .layer(middleware::from_fn_with_state(
-            REQUEST_TIMEOUT,
-            request_timeout,
-        ))
 }
 
 #[cfg(test)]
@@ -1169,23 +1178,48 @@ index 1111111..2222222 100644
     }
 
     /// A handler that overruns the request timeout gets a 408 instead of
-    /// holding its connection open forever.
+    /// holding its connection open forever — and, because the test goes
+    /// through `with_middleware` (the exact production stack/order), the
+    /// synthesized 408 must still carry the security headers: the timeout
+    /// layer drops the inner future, so only a `security_headers`-outermost
+    /// ordering can add them.
     #[tokio::test]
-    async fn overrunning_request_gets_408() {
-        let app = Router::new()
-            .route(
+    async fn overrunning_request_gets_408_with_security_headers() {
+        let app = with_middleware(
+            Router::new().route(
                 "/slow",
                 axum::routing::get(|| async {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     "too late"
                 }),
-            )
-            .layer(middleware::from_fn_with_state(
-                std::time::Duration::from_millis(20),
-                request_timeout,
-            ));
-        let (status, body) = call(app, get("/slow")).await;
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+            ),
+            std::time::Duration::from_millis(20),
+        );
+        let res = app.oneshot(get("/slow")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::REQUEST_TIMEOUT);
+
+        let headers = res.headers();
+        assert_eq!(
+            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            "no-store",
+            "a synthesized 408 must not bypass the security headers"
+        );
+        assert!(headers
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .is_some());
+        assert_eq!(
+            headers.get(axum::http::header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "request timed out");
     }
 }
