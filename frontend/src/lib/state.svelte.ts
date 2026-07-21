@@ -16,7 +16,7 @@ import type {
 } from './types'
 import { buildUnmappedSet, isUnmappedInSet } from './unmappedLines'
 
-const SAVE_DEBOUNCE_MS = 500
+export const SAVE_DEBOUNCE_MS = 500
 
 export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error'
 
@@ -51,11 +51,21 @@ export class ReviewState {
   draftConflict = $state(false)
 
   #saveTimer: ReturnType<typeof setTimeout> | null = null
-  #saveInFlight = false
-  #saveQueued = false
   /** Revision the server holds for our draft; echoed on every PUT and
    * replaced with the one the server returns on success. */
   #revision = 0
+  /** Single serialization point for every server mutation (save PUT, submit,
+   * abort): each is chained after everything already queued, so at most one
+   * is ever in flight and each reads `this.draft`/`this.#revision` only once
+   * its turn actually arrives — never a stale snapshot from when it was
+   * scheduled. This is what closes the P0-3 race: Submit no longer races an
+   * in-flight autosave from this same tab. */
+  #mutationChain: Promise<void> = Promise.resolve()
+  /** True while a submit or abort is in flight, additional to the
+   * phase-based lock below — it closes the window between "user clicked
+   * Submit/Abort" and "the server answered" during which further edits
+   * could be silently left out of what's actually being submitted/aborted. */
+  #actionLocked = false
 
   /** Server-side validation limits (null until the session has loaded). */
   get limits() {
@@ -137,9 +147,11 @@ export class ReviewState {
     this.select(this.selectedIdx + delta)
   }
 
-  /** True once the review has been finalized (submitted or aborted) — mutations and saves are inert past this point. */
+  /** True once the review has been finalized (submitted or aborted), or
+   * while a submit/abort is actively in flight — mutations and saves are
+   * inert in either case. */
   get #locked(): boolean {
-    return this.phase === 'submitted' || this.phase === 'aborted'
+    return this.phase === 'submitted' || this.phase === 'aborted' || this.#actionLocked
   }
 
   #ensureConcernDraft(id: string): ConcernDraft {
@@ -219,50 +231,67 @@ export class ReviewState {
     if (this.#saveTimer != null) clearTimeout(this.#saveTimer)
     this.#saveTimer = setTimeout(() => {
       this.#saveTimer = null
-      void this.#runSave()
+      this.#queueSave()
     }, SAVE_DEBOUNCE_MS)
   }
 
-  // Serializes draft PUTs: at most one request in flight, and a save
-  // requested while one is running re-reads the (then-current) draft after
-  // it finishes. This prevents an older payload from racing past a newer
-  // one and overwriting it on the server.
+  /** Runs `fn` only after everything already queued (a save PUT, a submit,
+   * an abort) has settled, and leaves `#mutationChain` pointing at this call
+   * so anything queued next waits its turn too. This is the single
+   * serialization point: no two mutations against the server ever run
+   * concurrently, and `fn` always sees `this.draft` / `this.#revision` as of
+   * when it actually starts, not when it was scheduled. */
+  #enqueueMutation<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.#mutationChain.then(fn, fn)
+    // The chain itself must never reject — a rejected #mutationChain would
+    // permanently skip every `fn` chained after it.
+    this.#mutationChain = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+
+  /** Waits for any save currently running or queued to finish, so
+   * `this.#revision` reflects the server's true latest state afterward.
+   * Submit/abort call this before reading the draft/revision they send. */
+  #flushSave(): Promise<void> {
+    return this.#mutationChain
+  }
+
+  #queueSave(): void {
+    // #enqueueMutation already updates #mutationChain in place; its return
+    // value isn't needed here (unlike submit/abort, nothing inspects a
+    // save's own result — #runSave applies it to state internally).
+    this.#enqueueMutation(() => this.#runSave())
+  }
+
   async #runSave(): Promise<void> {
-    if (this.draftConflict) return
-    if (this.#saveInFlight) {
-      this.#saveQueued = true
-      return
-    }
-    this.#saveInFlight = true
+    if (this.draftConflict || this.#locked) return
     this.saveState = 'saving'
     try {
-      do {
-        this.#saveQueued = false
-        const result = await saveDraft(this.draft, this.#revision)
-        if (!result.ok) {
-          if (result.error === 'session finished') {
-            // The session ended elsewhere; join the matching terminal
-            // state (an abort must not render as "submitted") rather than
-            // surfacing a save error.
-            this.phase = phaseForFinished(result.finished ?? 'submitted')
-            this.saveState = 'idle'
-          } else {
-            // Draft conflict: another tab saved a newer revision. Retrying
-            // would overwrite it, so autosave stays off until a reload.
-            this.draftConflict = true
-            this.#cancelPendingSave()
-            this.saveState = 'error'
-          }
-          return
+      const result = await saveDraft(this.draft, this.#revision)
+      if (!result.ok) {
+        if (result.error === 'session finished') {
+          // The session ended elsewhere; join the matching terminal state
+          // (an abort must not render as "submitted") rather than
+          // surfacing a save error.
+          this.phase = phaseForFinished(result.finished ?? 'submitted')
+          this.saveState = 'idle'
+        } else {
+          // Draft conflict: another tab saved a newer revision. Retrying
+          // would overwrite it, so autosave stays off until a reload.
+          this.draftConflict = true
+          this.#cancelPendingSave()
+          this.saveState = 'error'
         }
-        this.#revision = result.revision
-      } while (this.#saveQueued)
+        return
+      }
+      this.#revision = result.revision
       this.saveState = 'saved'
     } catch {
       // The next scheduleSave (triggered by any draft change) retries.
       this.saveState = 'error'
-    } finally {
-      this.#saveInFlight = false
     }
   }
 
@@ -280,9 +309,23 @@ export class ReviewState {
     if (this.#locked || this.submitting || this.draftConflict) return
     this.#cancelPendingSave()
     this.submitting = true
+    // Locks editing/autosave for the duration of the submit, closing the
+    // P0-3 race: without this, edits made while we're awaiting the flush
+    // below could be scheduled as a save that runs concurrently with (or
+    // right after) submit reads the draft, or could simply be left out of
+    // what gets submitted.
+    this.#actionLocked = true
     this.submitError = null
     try {
-      const result = await submit(this.draft, this.#revision)
+      // Wait for any in-flight/queued save (e.g. an autosave from just
+      // before Submit was clicked) to land first, so the revision we submit
+      // with is the server's true current one — not a stale snapshot that
+      // the save-in-progress is about to invalidate.
+      await this.#flushSave()
+      // The flushed save may have surfaced a conflict, or ended the session
+      // from elsewhere; either way there's nothing left for us to submit.
+      if (this.draftConflict || this.phase !== 'review') return
+      const result = await this.#enqueueMutation(() => submit(this.draft, this.#revision))
       if ('ok' in result) {
         this.phase = 'submitted'
         return
@@ -303,14 +346,18 @@ export class ReviewState {
       if (result.missing && result.missing.length > 0) parts.push(result.missing.join(', '))
       if (result.details && result.details.length > 0) parts.push(result.details.join(', '))
       this.submitError = parts.join(': ')
-      // The pending save was cancelled above; make sure the latest draft
-      // still gets persisted now that the submit didn't go through.
+      // Unlock before rescheduling: scheduleSave is a no-op while locked.
+      this.#actionLocked = false
+      // Make sure the latest draft still gets persisted now that the
+      // submit didn't go through.
       this.scheduleSave()
     } catch (e) {
       this.submitError = e instanceof Error ? e.message : 'Submit failed'
+      this.#actionLocked = false
       this.scheduleSave()
     } finally {
       this.submitting = false
+      this.#actionLocked = false
     }
   }
 
@@ -318,16 +365,23 @@ export class ReviewState {
     if (this.#locked || this.submitting) return
     this.#cancelPendingSave()
     this.submitting = true
+    this.#actionLocked = true
     this.submitError = null
     try {
-      await abortSession()
+      // Same reasoning as submit: don't race an in-flight save — let it
+      // land first so abort isn't chasing a PUT that's still on the wire.
+      await this.#flushSave()
+      if (this.phase !== 'review') return
+      await this.#enqueueMutation(() => abortSession())
       this.phase = 'aborted'
     } catch (e) {
       this.submitError = e instanceof Error ? e.message : 'Abort failed'
+      this.#actionLocked = false
       // Same as submitReview: re-persist the draft after a failed abort.
       this.scheduleSave()
     } finally {
       this.submitting = false
+      this.#actionLocked = false
     }
   }
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Session } from './types'
+import type { SaveDraftResult, Session } from './types'
 
 vi.mock('./api', () => ({
   fetchSession: vi.fn(),
@@ -8,12 +8,13 @@ vi.mock('./api', () => ({
   abortSession: vi.fn(),
 }))
 
-import { fetchSession, saveDraft, submit } from './api'
-import { ReviewState } from './state.svelte'
+import { abortSession, fetchSession, saveDraft, submit } from './api'
+import { ReviewState, SAVE_DEBOUNCE_MS } from './state.svelte'
 
 const fetchSessionMock = vi.mocked(fetchSession)
 const saveDraftMock = vi.mocked(saveDraft)
 const submitMock = vi.mocked(submit)
+const abortSessionMock = vi.mocked(abortSession)
 
 function makeSession(): Session {
   return {
@@ -141,5 +142,83 @@ describe('draft conflict handling', () => {
     expect(rs.phase).toBe('aborted')
     expect(rs.saveState).toBe('idle')
     expect(rs.draftConflict).toBe(false)
+  })
+})
+
+describe('mutation serialization', () => {
+  it('submit_waits_for_inflight_save_and_sends_latest_draft', async () => {
+    const rs = await loadedState()
+
+    // Draft A: an edit fires the debounce timer and the resulting save is
+    // left pending (a controllable deferred), simulating "autosave started
+    // but hasn't landed yet".
+    const saveGate: { resolve: ((v: SaveDraftResult) => void) | null } = { resolve: null }
+    saveDraftMock.mockImplementationOnce(
+      () =>
+        new Promise<SaveDraftResult>((resolve) => {
+          saveGate.resolve = resolve
+        }),
+    )
+    rs.addGeneralComment('draft A')
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    expect(saveDraftMock).toHaveBeenCalledTimes(1)
+    expect(saveDraftMock).toHaveBeenLastCalledWith(rs.draft, 3)
+
+    // Draft B: a further edit while that save is still in flight.
+    rs.addGeneralComment('draft B')
+
+    // Submit fires while the autosave from draft A is still pending.
+    let capturedRevision: number | undefined
+    let capturedComments: string[] | undefined
+    submitMock.mockImplementationOnce((draft, revision) => {
+      capturedRevision = revision
+      capturedComments = [...draft.general_comments]
+      return Promise.resolve({ ok: true })
+    })
+    const submitPromise = rs.submitReview()
+
+    // Submit must not fire yet — it has to wait for the in-flight save.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(submitMock).not.toHaveBeenCalled()
+
+    // The in-flight save (draft A, rev 3) now lands, advancing the server's
+    // revision to 4.
+    saveGate.resolve?.({ ok: true, revision: 4 })
+    await submitPromise
+
+    expect(submitMock).toHaveBeenCalledTimes(1)
+    expect(capturedRevision).toBe(4)
+    expect(capturedComments).toEqual(['draft A', 'draft B'])
+    expect(rs.phase).toBe('submitted')
+  })
+
+  it('waits for an in-flight save before aborting, instead of racing it', async () => {
+    const rs = await loadedState()
+
+    const saveGate: { resolve: ((v: SaveDraftResult) => void) | null } = { resolve: null }
+    saveDraftMock.mockImplementationOnce(
+      () =>
+        new Promise<SaveDraftResult>((resolve) => {
+          saveGate.resolve = resolve
+        }),
+    )
+    rs.addGeneralComment('draft A')
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    expect(saveDraftMock).toHaveBeenCalledTimes(1)
+
+    abortSessionMock.mockResolvedValueOnce(undefined)
+    const abortPromise = rs.abortReview()
+
+    // Abort must not fire while the save is still in flight.
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(abortSessionMock).not.toHaveBeenCalled()
+
+    saveGate.resolve?.({ ok: true, revision: 4 })
+    await abortPromise
+
+    expect(abortSessionMock).toHaveBeenCalledTimes(1)
+    expect(rs.phase).toBe('aborted')
   })
 })

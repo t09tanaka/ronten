@@ -88,6 +88,23 @@
     generalCommentText = ''
   }
 
+  let draftCopyState = $state<'idle' | 'copied' | 'error'>('idle')
+
+  // A genuine cross-tab draft conflict means this tab's edits can no longer
+  // be saved and the only way forward is a reload — copying the local draft
+  // out first is the one way to avoid silently losing that work.
+  async function copyDraftJson(): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(rs.draft, null, 2))
+      draftCopyState = 'copied'
+    } catch {
+      draftCopyState = 'error'
+    }
+    setTimeout(() => {
+      draftCopyState = 'idle'
+    }, 2000)
+  }
+
   function scrollSelectedIntoView(): void {
     document.querySelector(`[data-idx="${rs.selectedIdx}"]`)?.scrollIntoView({ block: 'nearest' })
   }
@@ -216,8 +233,17 @@
     </header>
     {#if rs.draftConflict}
       <div class="conflict-banner" role="alert">
-        This review was edited in another tab. Changes made here are no longer being saved —
-        reload the page to continue.
+        <span>
+          This review was edited in another tab. Changes made here are no longer being saved —
+          reload the page to continue.
+        </span>
+        <button type="button" class="btn-ghost conflict-banner-copy" onclick={copyDraftJson}>
+          {draftCopyState === 'copied'
+            ? 'Copied'
+            : draftCopyState === 'error'
+              ? 'Copy failed'
+              : 'Copy draft JSON'}
+        </button>
       </div>
     {/if}
     {#if rs.session.warnings.length > 0 && !warningsDismissed}
@@ -562,11 +588,21 @@
   /* Persistent: unlike the warnings banner there is no dismiss — the only
      way out is a reload, so the message must stay visible. */
   .conflict-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
     padding: 8px 16px;
     background: var(--c-shu-tint);
     border-bottom: 1px solid var(--c-shu-tint-2);
     color: var(--c-shu);
     font-size: 13px;
+  }
+
+  .conflict-banner-copy {
+    flex-shrink: 0;
+    border-color: var(--c-shu);
+    color: var(--c-shu);
   }
 
   .warnings-banner {
