@@ -9,7 +9,7 @@
 //! concern are reported in `Mapping.unmapped_lines` / `Mapping.unmapped`.
 
 use crate::gitdiff::{FileDiff, LineKind};
-use crate::model::{ConcernsInput, Side, SUPPORTED_VERSION};
+use crate::model::{ConcernsInput, Severity, Side, Warning, SUPPORTED_VERSION};
 use serde::Serialize;
 
 /// Reserved concern id for the synthetic "everything nobody claimed" bucket
@@ -48,7 +48,7 @@ pub struct Mapping {
     pub concerns: Vec<MappedConcern>,
     pub unmapped: Vec<HunkRef>,
     pub unmapped_lines: Vec<UnmappedLine>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
 }
 
 /// True when `id` matches `^[A-Za-z0-9][A-Za-z0-9._-]*$` (hand-rolled to
@@ -300,10 +300,15 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
                     (None, Some(e)) => format!(":-{e}"),
                     (None, None) => String::new(),
                 };
-                warnings.push(format!(
-                    "location matched no changed lines: {}{}",
-                    loc.path, range
-                ));
+                warnings.push(
+                    Warning::new(
+                        "LOCATION_MATCHED_NOTHING",
+                        Severity::Warning,
+                        format!("location matched no changed lines: {}{}", loc.path, range),
+                    )
+                    .with_path(loc.path.clone())
+                    .with_concern(c.id.clone()),
+                );
             }
         }
 
@@ -396,10 +401,13 @@ mod tests {
             content_kind: ContentKind::Text,
             old_mode: None,
             new_mode: None,
+            old_type: None,
+            new_type: None,
             old_oid: None,
             new_oid: None,
             old_size: None,
             new_size: None,
+            lfs_pointer: false,
             hunks: hunks
                 .iter()
                 .map(|&(old_start, old_count, new_start, new_count)| {
@@ -408,6 +416,7 @@ mod tests {
                         lines.push(DiffLine {
                             kind: LineKind::Remove,
                             content: String::new(),
+                            eol: crate::gitdiff::Eol::Lf,
                             old_no: Some(old_start + i),
                             new_no: None,
                         });
@@ -416,6 +425,7 @@ mod tests {
                         lines.push(DiffLine {
                             kind: LineKind::Add,
                             content: String::new(),
+                            eol: crate::gitdiff::Eol::Lf,
                             old_no: None,
                             new_no: Some(new_start + i),
                         });
@@ -451,6 +461,7 @@ mod tests {
             .map(|&(kind, old_no, new_no)| DiffLine {
                 kind,
                 content: String::new(),
+                eol: crate::gitdiff::Eol::Lf,
                 old_no,
                 new_no,
             })
@@ -459,6 +470,7 @@ mod tests {
             lines.push(DiffLine {
                 kind: LineKind::Context,
                 content: String::new(),
+                eol: crate::gitdiff::Eol::Lf,
                 old_no: Some(n),
                 new_no: Some(n),
             });
@@ -471,10 +483,13 @@ mod tests {
             content_kind: ContentKind::Text,
             old_mode: None,
             new_mode: None,
+            old_type: None,
+            new_type: None,
             old_oid: None,
             new_oid: None,
             old_size: None,
             new_size: None,
+            lfs_pointer: false,
             hunks: vec![Hunk {
                 old_start,
                 old_count,
@@ -556,9 +571,11 @@ mod tests {
         );
         assert_eq!(mapping.warnings.len(), 1);
         assert_eq!(
-            mapping.warnings[0],
+            mapping.warnings[0].message,
             "location matched no changed lines: a.ts:20-"
         );
+        assert_eq!(mapping.warnings[0].code, "LOCATION_MATCHED_NOTHING");
+        assert_eq!(mapping.warnings[0].concern_id.as_deref(), Some("c1"));
     }
 
     #[test]
@@ -570,10 +587,13 @@ mod tests {
             content_kind: ContentKind::Text,
             old_mode: None,
             new_mode: None,
+            old_type: None,
+            new_type: None,
             old_oid: None,
             new_oid: None,
             old_size: None,
             new_size: None,
+            lfs_pointer: false,
             hunks: vec![Hunk {
                 old_start: 1,
                 old_count: 5,
@@ -585,6 +605,7 @@ mod tests {
                     .map(|n| DiffLine {
                         kind: LineKind::Remove,
                         content: String::new(),
+                        eol: crate::gitdiff::Eol::Lf,
                         old_no: Some(n),
                         new_no: None,
                     })
@@ -655,7 +676,11 @@ mod tests {
         let mapping = resolve_mapping(&files, &inp);
         assert_eq!(mapping.concerns[0].hunks, Vec::new());
         assert_eq!(
-            mapping.warnings,
+            mapping
+                .warnings
+                .iter()
+                .map(|w| w.message.clone())
+                .collect::<Vec<_>>(),
             vec!["location matched no changed lines: a.ts:5-10".to_string()]
         );
     }
@@ -670,10 +695,13 @@ mod tests {
                 content_kind: ContentKind::Binary,
                 old_mode: None,
                 new_mode: None,
+                old_type: None,
+                new_type: None,
                 old_oid: None,
                 new_oid: None,
                 old_size: None,
                 new_size: None,
+                lfs_pointer: false,
                 hunks: Vec::new(),
             },
             FileDiff {
@@ -683,10 +711,13 @@ mod tests {
                 content_kind: ContentKind::Binary,
                 old_mode: None,
                 new_mode: None,
+                old_type: None,
+                new_type: None,
                 old_oid: None,
                 new_oid: None,
                 old_size: None,
                 new_size: None,
+                lfs_pointer: false,
                 hunks: Vec::new(),
             },
         ];
@@ -717,7 +748,11 @@ mod tests {
         let mapping = resolve_mapping(&files, &inp);
         assert_eq!(mapping.concerns[0].hunks, Vec::new());
         assert_eq!(
-            mapping.warnings,
+            mapping
+                .warnings
+                .iter()
+                .map(|w| w.message.clone())
+                .collect::<Vec<_>>(),
             vec!["location matched no changed lines: a.ts:-30".to_string()]
         );
     }
@@ -764,7 +799,11 @@ mod tests {
         let mapping_new = resolve_mapping(&files, &new_side);
         assert_eq!(mapping_new.concerns[0].hunks, Vec::new());
         assert_eq!(
-            mapping_new.warnings,
+            mapping_new
+                .warnings
+                .iter()
+                .map(|w| w.message.clone())
+                .collect::<Vec<_>>(),
             vec!["location matched no changed lines: a.ts:5-5".to_string()]
         );
 
@@ -807,7 +846,9 @@ mod tests {
         let mapping = resolve_mapping(&files, &inp);
         assert!(mapping.concerns[0].hunks.is_empty());
         assert_eq!(mapping.warnings.len(), 1);
-        assert!(mapping.warnings[0].contains("matched no changed lines"));
+        assert!(mapping.warnings[0]
+            .message
+            .contains("matched no changed lines"));
         // The only changed line is unclaimed -> its hunk is unmapped, and
         // the line itself shows up in unmapped_lines.
         assert_eq!(
@@ -1120,10 +1161,13 @@ mod tests {
             content_kind: ContentKind::Text,
             old_mode: None,
             new_mode: None,
+            old_type: None,
+            new_type: None,
             old_oid: None,
             new_oid: None,
             old_size: None,
             new_size: None,
+            lfs_pointer: false,
             hunks: vec![Hunk {
                 old_start: 1,
                 old_count: 3,
@@ -1134,6 +1178,7 @@ mod tests {
                     .map(|n| DiffLine {
                         kind: LineKind::Remove,
                         content: String::new(),
+                        eol: crate::gitdiff::Eol::Lf,
                         old_no: Some(n),
                         new_no: None,
                     })
@@ -1183,10 +1228,13 @@ mod tests {
             content_kind: ContentKind::Text,
             old_mode: None,
             new_mode: None,
+            old_type: None,
+            new_type: None,
             old_oid: None,
             new_oid: None,
             old_size: None,
             new_size: None,
+            lfs_pointer: false,
             hunks: vec![Hunk {
                 old_start: 10,
                 old_count: 1,
@@ -1197,12 +1245,14 @@ mod tests {
                     DiffLine {
                         kind: LineKind::Remove,
                         content: String::new(),
+                        eol: crate::gitdiff::Eol::Lf,
                         old_no: Some(10),
                         new_no: None,
                     },
                     DiffLine {
                         kind: LineKind::Add,
                         content: String::new(),
+                        eol: crate::gitdiff::Eol::Lf,
                         old_no: None,
                         new_no: Some(10),
                     },

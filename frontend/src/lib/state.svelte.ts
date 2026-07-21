@@ -2,12 +2,12 @@
 
 import { abortSession, fetchSession, saveDraft, submit } from './api'
 import { isVerdictConfirmed } from './confirmation'
+import { requiresAck } from './opaque'
 import type {
   Comment,
   ConcernDraft,
   ConcernView,
   Draft,
-  FileDiff,
   HunkRef,
   Session,
   Side,
@@ -76,12 +76,6 @@ class ReviewState {
     return this.session != null && this.reviewedCount === this.session.concerns.length
   }
 
-  /** Opaque files (non-text content) can't be reviewed line-by-line, so they
-   * require an explicit ack instead of a verdict-driven confirmation. */
-  isOpaque(f: FileDiff): boolean {
-    return f.content_kind !== 'text'
-  }
-
   isAcked(fileIndex: number): boolean {
     return this.draft.acknowledged_opaque.includes(fileIndex)
   }
@@ -94,9 +88,12 @@ class ReviewState {
     this.scheduleSave()
   }
 
+  /** Files that can't be judged from the rendered diff body alone (opaque
+   * content, gitlink, mode change — see requiresAck) need an explicit ack
+   * instead of a verdict-driven confirmation. */
   get allOpaqueAcked(): boolean {
     if (!this.session) return true
-    return this.session.files.every((f, i) => !this.isOpaque(f) || this.isAcked(i))
+    return this.session.files.every((f, i) => !requiresAck(f) || this.isAcked(i))
   }
 
   /** Concern ids whose hunks include `ref` (used to render shared-hunk badges). */
@@ -171,15 +168,15 @@ class ReviewState {
       this.session = session
       // Older drafts predate acknowledged_opaque — default it so allOpaqueAcked
       // and toggleAck can assume the array always exists. The lenient PUT
-      // /draft endpoint can also have persisted unknown/non-opaque/duplicate
-      // indices (e.g. from a stale client); normalize to the set of actually
-      // opaque file indices so the UI can't get stuck unrecoverable on bad
-      // saved state.
-      const opaqueIdx = new Set(
-        session.files.map((f, i) => (f.content_kind !== 'text' ? i : -1)).filter((i) => i >= 0),
+      // /draft endpoint can also have persisted unknown/stale/duplicate
+      // indices (e.g. from a stale client); normalize to the set of file
+      // indices that actually require an ack so the UI can't get stuck
+      // unrecoverable on bad saved state.
+      const ackIdx = new Set(
+        session.files.map((f, i) => (requiresAck(f) ? i : -1)).filter((i) => i >= 0),
       )
       const acked = [...new Set(session.draft.acknowledged_opaque ?? [])].filter((i) =>
-        opaqueIdx.has(i),
+        ackIdx.has(i),
       )
       this.draft = { ...session.draft, acknowledged_opaque: acked }
       this.selectedIdx = 0

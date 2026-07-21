@@ -14,16 +14,19 @@ function makeFile(
     content_kind: 'text',
     old_mode: null,
     new_mode: null,
+    old_type: null,
+    new_type: null,
     old_oid: null,
     new_oid: null,
     old_size: null,
     new_size: null,
+    lfs_pointer: false,
     hunks: [],
   }
 }
 
 function makeLine(kind: LineKind, old_no: number | null, new_no: number | null): DiffLine {
-  return { kind, content: 'x', old_no, new_no }
+  return { kind, content: 'x', eol: 'lf', old_no, new_no }
 }
 
 describe('oldTarget / newTarget', () => {

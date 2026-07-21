@@ -249,7 +249,7 @@
     !rs.allReviewed
       ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
       : !rs.allOpaqueAcked
-        ? 'Acknowledge all changes whose contents are not displayed to submit'
+        ? 'Acknowledge all flagged changes (undisplayed contents, mode or submodule changes) to submit'
         : 'Submit review',
   )
 </script>
@@ -297,7 +297,11 @@
         </div>
         <ul class="warnings-banner-list">
           {#each rs.session.warnings as warning, i (i)}
-            <li>{revealInvisibles(warning)}</li>
+            <li>
+              {#if warning.path}<span class="warning-path">{revealInvisibles(warning.path)}:</span
+                >{/if}
+              {revealInvisibles(warning.message)}
+            </li>
           {/each}
         </ul>
       </div>
@@ -665,6 +669,15 @@
     line-height: 1.4;
     /* Trojan Source defense: warnings may quote agent-supplied paths. */
     unicode-bidi: isolate;
+  }
+
+  .warning-path {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    /* Trojan Source defense: the path itself is agent-supplied — pin
+       display order to logical order. */
+    unicode-bidi: isolate;
+    direction: ltr;
   }
 
   .body {
