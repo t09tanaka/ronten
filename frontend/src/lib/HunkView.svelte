@@ -68,14 +68,14 @@
       >@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@</span
     >
     {#if hunk.section}
-      <span class="hunk-section">{hunk.section}</span>
+      <span class="hunk-section">{revealInvisibles(hunk.section)}</span>
     {/if}
     {#if otherOwners.length > 0}
       <span class="shared-badge">
         shared with
         {#each otherOwners as owner, i (owner.id)}
           <button type="button" class="owner-link" onclick={() => jumpTo(owner.id)}
-            >{owner.title}</button
+            >{revealInvisibles(owner.title)}</button
           >{i < otherOwners.length - 1 ? ',' : ''}
         {/each}
       </span>
@@ -196,6 +196,11 @@
 
   .hunk-section {
     color: var(--c-ink-2);
+    /* Trojan Source defense: isolate the agent-supplied section text from
+       the surrounding UI so bidi control characters in it can't reorder
+       neighboring elements (their codepoints are also revealed as
+       ⟨U+XXXX⟩ tokens by revealInvisibles). */
+    unicode-bidi: isolate;
   }
 
   .shared-badge {
@@ -216,6 +221,7 @@
     font-size: 11px;
     text-decoration: underline;
     font-family: inherit;
+    unicode-bidi: isolate;
   }
 
   .collapse-toggle {

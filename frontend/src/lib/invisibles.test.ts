@@ -11,6 +11,9 @@ describe('revealInvisibles', () => {
   it('replaces every listed isolate control', () => {
     expect(revealInvisibles('⁦⁧⁨⁩')).toBe('⟨U+2066⟩⟨U+2067⟩⟨U+2068⟩⟨U+2069⟩')
   })
+  it('replaces LRM, RLM, and ALM', () => {
+    expect(revealInvisibles('a‎‏؜b')).toBe('a⟨U+200E⟩⟨U+200F⟩⟨U+061C⟩b')
+  })
   it('leaves normal text (including CJK and emoji) untouched', () => {
     expect(revealInvisibles('日本語 emoji 🎉 tab\t')).toBe('日本語 emoji 🎉 tab\t')
   })

@@ -2,6 +2,7 @@
   import { rs } from './state.svelte'
   import HunkView from './HunkView.svelte'
   import type { CommentLineInfo } from './anchors'
+  import { hasInvisibles, reveal } from './invisibles'
   import { contentNote, opaqueDetails } from './opaque'
   import type { ChangeKind, FileDiff, HunkRef } from './types'
 
@@ -32,11 +33,26 @@
   // files get the detail card + ack checkbox below instead.
   function statusCardText(file: FileDiff): string {
     const changeKind: ChangeKind = file.change_kind
+    if (changeKind === 'added') return 'Empty file added'
+    if (changeKind === 'deleted') return 'Empty file deleted'
     if (changeKind === 'renamed') return 'File renamed (no content changes)'
     if (file.old_mode != null && file.new_mode != null && file.old_mode !== file.new_mode) {
       return 'File mode changed'
     }
     return 'File changed (no content changes)'
+  }
+
+  // Trojan Source defense (see invisibles.ts): a badge on the file header so
+  // a reviewer knows to look for the revealed ⟨U+XXXX⟩ tokens, driven off
+  // either path or any displayed hunk line for this concern.
+  function fileHasInvisibles(file: FileDiff, refs: HunkRef[]): boolean {
+    if (file.old_path != null && hasInvisibles(file.old_path)) return true
+    if (file.new_path != null && hasInvisibles(file.new_path)) return true
+    for (const ref of refs) {
+      if (ref.hunk == null) continue
+      if (file.hunks[ref.hunk].lines.some((line) => hasInvisibles(line.content))) return true
+    }
+    return false
   }
 
   function handleCommentLine(info: CommentLineInfo): void {
@@ -61,13 +77,20 @@
     <section class="file-group">
       <header class="file-header">
         {#if file.old_path && file.new_path && file.old_path !== file.new_path}
-          <span class="file-path">{file.old_path} → {file.new_path}</span>
+          <span class="file-path">{reveal(file.old_path)} → {reveal(file.new_path)}</span>
         {:else}
-          <span class="file-path">{file.new_path ?? file.old_path}</span>
+          <span class="file-path">{reveal(file.new_path ?? file.old_path)}</span>
         {/if}
         <span class="file-status kind-{file.change_kind}">{file.change_kind}</span>
         {#if file.content_kind !== 'text'}
           <span class="file-status kind-{file.content_kind}">{file.content_kind}</span>
+        {/if}
+        {#if fileHasInvisibles(file, group.refs)}
+          <span
+            class="file-status kind-invisible"
+            title="Contains invisible or bidirectional Unicode characters (revealed inline as ⟨U+XXXX⟩)"
+            >hidden unicode</span
+          >
         {/if}
       </header>
       {#each group.refs as hunkRef (hunkRef.hunk ?? -1)}
@@ -92,7 +115,7 @@
                   disabled={rs.phase !== 'review'}
                   onchange={() => rs.toggleAck(group.fileIndex)}
                 />
-                I acknowledge this change (content cannot be reviewed)
+                I acknowledge this change without reviewing its contents
               </label>
             </div>
           {/if}
@@ -130,6 +153,11 @@
 
   .file-path {
     font-weight: 600;
+    /* Trojan Source defense: pin display order to logical order so bidi
+       control characters in the path can't reorder how it renders (their
+       codepoints are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
+    unicode-bidi: isolate;
+    direction: ltr;
   }
 
   .file-status {
@@ -139,6 +167,11 @@
     background: var(--c-neutral-tint);
     padding: 1px 6px;
     border-radius: 3px;
+  }
+
+  .kind-invisible {
+    color: var(--c-odo);
+    background: var(--c-odo-tint);
   }
 
   .status-card {

@@ -5,6 +5,7 @@
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
   import { interpretKey } from './lib/keynav'
+  import { revealInvisibles } from './lib/invisibles'
   import { focusGeneralComments } from './lib/scroll'
   import type { Verdict } from './lib/types'
 
@@ -248,7 +249,7 @@
     !rs.allReviewed
       ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
       : !rs.allOpaqueAcked
-        ? 'Acknowledge all opaque changes to submit'
+        ? 'Acknowledge all changes whose contents are not displayed to submit'
         : 'Submit review',
   )
 </script>
@@ -269,9 +270,9 @@
       <div class="topbar-title">
         <span class="seal" aria-hidden="true">論</span>
         <div class="topbar-text">
-          <h1>{rs.session.title}</h1>
+          <h1>{revealInvisibles(rs.session.title)}</h1>
           {#if rs.session.summary}
-            <p class="summary">{rs.session.summary}</p>
+            <p class="summary">{revealInvisibles(rs.session.summary)}</p>
           {/if}
         </div>
       </div>
@@ -296,7 +297,7 @@
         </div>
         <ul class="warnings-banner-list">
           {#each rs.session.warnings as warning, i (i)}
-            <li>{warning}</li>
+            <li>{revealInvisibles(warning)}</li>
           {/each}
         </ul>
       </div>
@@ -328,7 +329,7 @@
           {@const selected = rs.selected}
           {@const selectedComments = rs.draft.concerns[selected.id]?.comments ?? []}
           <div class="concern-header">
-            <h2>{selected.title}</h2>
+            <h2>{revealInvisibles(selected.title)}</h2>
             {#if selected.risk}
               <span class="risk-badge risk-{selected.risk}">{selected.risk}</span>
             {/if}
@@ -340,12 +341,17 @@
           {#if selectedComments.length > 0}
             <ul class="concern-comment-list">
               {#each selectedComments as comment, i (i)}
-                <li><span class="comment-loc">{comment.path}:{comment.line}</span> {comment.body}</li>
+                <li>
+                  <span class="comment-loc">{revealInvisibles(comment.path)}:{comment.line}</span>
+                  {comment.body}
+                </li>
               {/each}
             </ul>
           {/if}
           {#if selected.description}
-            <div class="concern-description">{@html renderMarkdown(selected.description)}</div>
+            <div class="concern-description">
+              {@html renderMarkdown(revealInvisibles(selected.description))}
+            </div>
           {/if}
           <DiffView />
         {/if}
@@ -398,7 +404,7 @@
     <ul class="verdict-summary">
       {#each rs.session.concerns as c (c.id)}
         <li>
-          <span class="vs-title">{c.title}</span>
+          <span class="vs-title">{revealInvisibles(c.title)}</span>
           <span class="vs-verdict vs-{rs.draft.concerns[c.id]?.verdict ?? 'none'}"
             >{verdictLabel(rs.draft.concerns[c.id]?.verdict)}</span
           >
@@ -492,6 +498,10 @@
     font-size: 17px;
     font-weight: 600;
     letter-spacing: 0.01em;
+    /* Trojan Source defense: isolate agent-supplied text so bidi control
+       characters in it can't reorder neighboring elements (their codepoints
+       are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
+    unicode-bidi: isolate;
   }
 
   .topbar-text .summary {
@@ -499,6 +509,7 @@
     font-size: 12px;
     color: var(--c-ink-2);
     max-width: 60ch;
+    unicode-bidi: isolate;
   }
 
   .reviewed-counter {
@@ -652,6 +663,8 @@
   .warnings-banner-list li {
     font-size: 12px;
     line-height: 1.4;
+    /* Trojan Source defense: warnings may quote agent-supplied paths. */
+    unicode-bidi: isolate;
   }
 
   .body {
@@ -713,6 +726,7 @@
     font-family: var(--font-display);
     font-size: 20px;
     font-weight: 600;
+    unicode-bidi: isolate;
   }
 
   .concern-description {
@@ -721,6 +735,7 @@
     color: var(--c-ink);
     margin-bottom: 16px;
     max-width: 80ch;
+    unicode-bidi: isolate;
   }
 
   .concern-description :global(p) {
@@ -777,6 +792,10 @@
     font-size: 12px;
     color: var(--c-ink-2);
     margin-right: 6px;
+    /* Trojan Source defense: this echoes the file path the comment anchors
+       to (agent-supplied) — pin display order to logical order. */
+    unicode-bidi: isolate;
+    direction: ltr;
   }
 
   .general-comments {
@@ -903,6 +922,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    unicode-bidi: isolate;
   }
 
   .vs-verdict {

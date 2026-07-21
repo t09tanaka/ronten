@@ -11,6 +11,7 @@
 const INVISIBLE_CODEPOINTS: readonly number[] = [
   0x202a, 0x202b, 0x202c, 0x202d, 0x202e, // LRE RLE PDF LRO RLO
   0x2066, 0x2067, 0x2068, 0x2069, // LRI RLI FSI PDI
+  0x200e, 0x200f, 0x061c, // LRM RLM ALM
   0x200b, 0x200c, 0x200d, 0x2060, // ZWSP ZWNJ ZWJ WJ
   0xfeff, // ZWNBSP/BOM
   0x00ad, // SOFT HYPHEN
@@ -38,4 +39,9 @@ export function hasInvisibles(s: string): boolean {
     if (INVISIBLE_SET.has(ch.codePointAt(0) ?? -1)) return true
   }
   return false
+}
+
+/** Null-tolerant `revealInvisibles`, for agent-supplied fields that may be absent. */
+export function reveal(s: string | null | undefined): string | null | undefined {
+  return s == null ? s : revealInvisibles(s)
 }
