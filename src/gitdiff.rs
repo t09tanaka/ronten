@@ -598,8 +598,9 @@ pub enum GitError {
     NotARepo,
     BadBase(String),
     GitFailed(String),
-    /// The diff exceeds a hard resource budget (file count / line totals)
-    /// and reviewing it in one session would be meaningless or unsafe.
+    /// The diff exceeds the changed-file-count budget and reviewing it in
+    /// one session would be meaningless (byte/line budgets never produce
+    /// this error — they degrade individual files to `TooLarge` instead).
     BudgetExceeded(String),
 }
 
@@ -678,7 +679,10 @@ fn timed_output(mut cmd: std::process::Command) -> std::io::Result<std::process:
 pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     let mut cmd = base_git();
     cmd.args(["rev-parse", "--show-toplevel"]);
-    let output = timed_output(cmd).map_err(|_| GitError::NotARepo)?;
+    // Only a clean non-zero exit means "not a repository"; a spawn failure
+    // or a killed-at-deadline git is a git problem and must not be
+    // misreported as "run this from inside a repo".
+    let output = timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))?;
     if !output.status.success() {
         return Err(GitError::NotARepo);
     }
@@ -843,10 +847,10 @@ pub const MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024;
 
 /// Every hard resource limit the diff pipeline enforces, in one place. The
 /// posture is bounded-refuse, never unbounded-process: inputs inside the
-/// budget render fully; a file over a per-file limit degrades to an
-/// explicitly acknowledged `TooLarge` card with a structured warning; a diff
-/// over a whole-review limit refuses to start (`GitError::BudgetExceeded`).
-/// Nothing is ever silently truncated.
+/// budget render fully; a file over a per-file limit — or past a whole-review
+/// byte/line budget — degrades to an explicitly acknowledged `TooLarge` card
+/// with a structured warning; only a diff over `max_files` refuses to start
+/// (`GitError::BudgetExceeded`). Nothing is ever silently truncated.
 #[derive(Debug, Clone)]
 pub struct ResourceBudget {
     /// Maximum changed files in one review; beyond this the review refuses

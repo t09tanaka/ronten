@@ -144,6 +144,10 @@ pub async fn run(args: ReviewArgs) -> u8 {
     // 1. Resolve repo root.
     let root = match repo_root() {
         Ok(root) => root,
+        Err(GitError::GitFailed(msg)) => {
+            eprintln!("git failed: {}", msg.trim());
+            return exitcode::GIT_FAILED;
+        }
         Err(_) => {
             eprintln!("not a git repository (run ronten from inside a git worktree)");
             return exitcode::NOT_A_REPO;
