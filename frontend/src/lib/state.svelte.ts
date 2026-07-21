@@ -267,7 +267,12 @@ export class ReviewState {
   }
 
   async #runSave(): Promise<void> {
-    if (this.draftConflict || this.#locked) return
+    // Deliberately not `|| this.#locked`: a save already chained onto
+    // #mutationChain before a submit/abort set the lock must still run to
+    // completion — #flushSave() is waiting on exactly this, and skipping it
+    // would leave #revision stale and reintroduce the P0-3 race under a
+    // different name.
+    if (this.draftConflict) return
     this.saveState = 'saving'
     try {
       const result = await saveDraft(this.draft, this.#revision)
