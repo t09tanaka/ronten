@@ -77,6 +77,22 @@ ronten review --base <ref> --concerns <file|-> [options]
 result JSON — goes to stdout only, and only stdout. An agent can always do
 `result=$(ronten review ...)` and safely `jq` the output.
 
+**The diff is `<base>...HEAD` only** (merge-base semantics): it covers committed state, not
+the working tree. If the agent forgot to commit some of its changes before starting the
+review, those changes are reviewed nowhere — they're invisible to both the diff and the
+reviewer. To catch this, `ronten review` checks `git status --porcelain -uno` right after
+computing the diff (before serving) and, if any tracked file has uncommitted changes, prints
+one line to stderr:
+
+```
+warning: tracked files have uncommitted changes; this review covers committed state only (<base>...HEAD)
+```
+
+Untracked files don't trigger it (they were never committed either way, so they aren't a
+regression from some prior committed state). The check fails open: if `git status` itself
+can't run, the review proceeds without the warning rather than blocking on a display-only
+check.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -90,6 +106,8 @@ result JSON — goes to stdout only, and only stdout. An agent can always do
 | 12 | not a git repository |
 | 13 | empty diff (nothing to review) |
 | 14 | git invocation failed |
+| 15 | `--out` write failed (the review outcome still printed to stdout; only the file write failed) |
+| 16 | server failed before an outcome was reached |
 
 ### `ronten schema`
 
@@ -133,6 +151,13 @@ EXIT_CODE=$?
 
 Either way, `ronten review` remains a single foreground-equivalent process for the duration
 of the review — nothing is left running once a result exists.
+
+`--out` is written atomically: the result is written to a same-directory temp file, flushed,
+then renamed into place. A poller watching for `result.json` to appear can never observe a
+partially-written file — it either isn't there yet or is complete. If the write itself fails
+(e.g. the parent directory doesn't exist), the process exits with the dedicated code 15
+rather than the approve/request-changes code; the result JSON has still been printed to
+stdout by that point, so the review outcome itself is not lost, only the file copy.
 
 ## Examples
 
@@ -300,6 +325,17 @@ already exists from a previous build:
 ```sh
 RONTEN_SKIP_FRONTEND_BUILD=1 cargo test
 ```
+
+### Packaging: `frontend/dist` in the published crate
+
+`frontend/dist/` is gitignored (it's a Vite build artifact, not source), but it is
+deliberately included in the published crate via `Cargo.toml`'s `include`, so that
+`cargo install ronten` needs no Node.js at all (see [Install](#install)). Because the
+directory is gitignored, `cargo package`'s normal "working tree must be clean" check can
+never pass for it, so CI's `package` job runs `cargo package --allow-dirty` and then
+verifies the crate's actual contents directly — asserting `frontend/dist/index.html` and
+hashed `assets/*.js`/`*.css` files are present in the package listing, and that
+`node_modules` did not leak in — rather than relying on the (defeated) dirty-tree gate.
 
 ## License
 

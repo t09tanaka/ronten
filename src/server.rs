@@ -32,6 +32,12 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; st
 ///   forever.
 /// - Everything else (index / API) must never be cached and gets a strict CSP.
 async fn security_headers(req: Request, next: Next) -> Response {
+    // Prefix-based, so a 404 for a nonexistent file under `/assets/` (e.g. a
+    // typo'd hash) still gets the long-lived immutable cache header below
+    // instead of `no-store`. That's fine: unlike `/r/{token}` and
+    // `/api/{token}/*`, no session token ever appears anywhere in an assets
+    // path, so there is nothing sensitive to leak into a shared/browser
+    // cache by over-caching a miss.
     let is_asset = req.uri().path().starts_with("/assets/");
     let mut res = next.run(req).await;
     let headers = res.headers_mut();
@@ -964,5 +970,29 @@ index 1111111..2222222 100644
         assert!(csp.contains("img-src 'self' data:"));
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("base-uri 'none'"));
+    }
+
+    /// A path that matches no route at all (not `/r/*`, not `/assets/*`, not
+    /// `/api/*`) still goes through `security_headers`, since the middleware
+    /// wraps the whole router including its fallback 404 — this must not
+    /// regress into an uncached bare 404 with no security headers.
+    #[tokio::test]
+    async fn unmatched_path_404_has_no_store_and_csp() {
+        let (state, _rx) = build_state();
+        let app = build_router(state);
+        let res = app.oneshot(get("/totally/unknown/path")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let headers = res.headers();
+        assert_eq!(
+            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert!(
+            headers
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .is_some(),
+            "expected a Content-Security-Policy header on an unmatched 404"
+        );
     }
 }
