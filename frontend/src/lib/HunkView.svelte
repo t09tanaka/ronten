@@ -3,6 +3,7 @@
   import CommentEditor from './CommentEditor.svelte'
   import { newTarget, oldTarget, type CommentLineInfo } from './anchors'
   import { highlightLine, langForPath } from './highlight'
+  import { revealInvisibles } from './invisibles'
   import type { Comment, ConcernView, FileDiff, Hunk, HunkRef } from './types'
 
   const COLLAPSE_THRESHOLD = 200
@@ -67,14 +68,14 @@
       >@@ -{hunk.old_start},{hunk.old_count} +{hunk.new_start},{hunk.new_count} @@</span
     >
     {#if hunk.section}
-      <span class="hunk-section">{hunk.section}</span>
+      <span class="hunk-section">{revealInvisibles(hunk.section)}</span>
     {/if}
     {#if otherOwners.length > 0}
       <span class="shared-badge">
         shared with
         {#each otherOwners as owner, i (owner.id)}
           <button type="button" class="owner-link" onclick={() => jumpTo(owner.id)}
-            >{owner.title}</button
+            >{revealInvisibles(owner.title)}</button
           >{i < otherOwners.length - 1 ? ',' : ''}
         {/each}
       </span>
@@ -122,8 +123,10 @@
               </td>
               <!-- highlightLine always returns HTML-escaped markup (hljs
                    escapes its input; the fallback path escapes explicitly),
-                   so agent-supplied diff content cannot inject HTML here. -->
-              <td class="content">{@html highlightLine(line.content, lang)}</td>
+                   so agent-supplied diff content cannot inject HTML here.
+                   revealInvisibles runs first, on the plain content, so its
+                   ⟨U+XXXX⟩ markers also flow through that escaping. -->
+              <td class="content">{@html highlightLine(revealInvisibles(line.content), lang)}</td>
             </tr>
             {#each [...commentsFor(oldT), ...commentsFor(newT)] as comment (comment)}
               <tr class="comment-row">
@@ -193,6 +196,11 @@
 
   .hunk-section {
     color: var(--c-ink-2);
+    /* Trojan Source defense: isolate the agent-supplied section text from
+       the surrounding UI so bidi control characters in it can't reorder
+       neighboring elements (their codepoints are also revealed as
+       ⟨U+XXXX⟩ tokens by revealInvisibles). */
+    unicode-bidi: isolate;
   }
 
   .shared-badge {
@@ -213,6 +221,7 @@
     font-size: 11px;
     text-decoration: underline;
     font-family: inherit;
+    unicode-bidi: isolate;
   }
 
   .collapse-toggle {
@@ -304,6 +313,11 @@
   .content {
     padding: 0 10px;
     white-space: pre;
+    /* Trojan Source defense: pin display order to logical order so bidi
+       control characters in the diff can't reorder how code renders (their
+       codepoints are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
+    unicode-bidi: isolate;
+    direction: ltr;
   }
 
   .line-add {

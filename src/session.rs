@@ -36,6 +36,10 @@ pub struct Draft {
     pub concerns: HashMap<String, ConcernDraft>,
     #[serde(default)]
     pub general_comments: Vec<String>,
+    /// content が描画されない file（FileDiff::is_opaque）の明示 acknowledge。
+    /// 値は session payload の files[] における index。
+    #[serde(default)]
+    pub acknowledged_opaque: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -200,6 +204,43 @@ impl SessionState {
                     ));
                 }
             }
+        }
+
+        let opaque_indices: HashSet<usize> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.is_opaque())
+            .map(|(i, _)| i)
+            .collect();
+        let acknowledged: HashSet<usize> = draft.acknowledged_opaque.iter().copied().collect();
+        let mut acked: Vec<usize> = acknowledged.iter().copied().collect();
+        acked.sort_unstable();
+        for i in acked {
+            let Some(file) = self.files.get(i) else {
+                violations.push(format!("acknowledged_opaque: unknown file index {i}"));
+                continue;
+            };
+            if !opaque_indices.contains(&i) {
+                let path = file
+                    .new_path
+                    .as_deref()
+                    .or(file.old_path.as_deref())
+                    .unwrap_or("");
+                violations.push(format!("acknowledged_opaque: file {path} is not opaque"));
+            }
+        }
+        let mut missing_ack: Vec<usize> =
+            opaque_indices.difference(&acknowledged).copied().collect();
+        missing_ack.sort_unstable();
+        for i in missing_ack {
+            let file = &self.files[i];
+            let path = file
+                .new_path
+                .as_deref()
+                .or(file.old_path.as_deref())
+                .unwrap_or("");
+            violations.push(format!("opaque change not acknowledged: {path}"));
         }
 
         violations

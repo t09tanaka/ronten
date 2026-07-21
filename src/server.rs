@@ -188,7 +188,7 @@ pub fn build_router(state: Arc<SessionState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitdiff::parse_unified_diff;
+    use crate::gitdiff::{parse_unified_diff, ChangeKind, ContentKind, FileDiff};
     use crate::mapping::resolve_mapping;
     use crate::model::{Concern, ConcernsInput, Decision, Location, Risk};
     use http_body_util::BodyExt;
@@ -314,6 +314,65 @@ index 1111111..2222222 100644
         (state, rx)
     }
 
+    /// Binary ファイルを1つ含む state（c1 が whole-file location で claim）。
+    fn build_opaque_state() -> (Arc<SessionState>, tokio::sync::mpsc::Receiver<Outcome>) {
+        let mut files = parse_unified_diff(MODIFIED);
+        files.push(FileDiff {
+            old_path: Some("logo.png".to_string()),
+            new_path: Some("logo.png".to_string()),
+            change_kind: ChangeKind::Modified,
+            content_kind: ContentKind::Binary,
+            old_mode: Some("100644".to_string()),
+            new_mode: Some("100644".to_string()),
+            old_oid: Some("1111111111111111111111111111111111111111".to_string()),
+            new_oid: Some("2222222222222222222222222222222222222222".to_string()),
+            old_size: Some(10),
+            new_size: Some(20),
+            hunks: Vec::new(),
+        });
+        let input = ConcernsInput {
+            version: 1,
+            summary: None,
+            concerns: vec![Concern {
+                id: "c1".to_string(),
+                title: "All".to_string(),
+                description: None,
+                risk: Risk::Medium,
+                locations: vec![
+                    Location {
+                        path: "src/app.ts".to_string(),
+                        side: None,
+                        start: None,
+                        end: None,
+                    },
+                    Location {
+                        path: "logo.png".to_string(),
+                        side: None,
+                        start: None,
+                        end: None,
+                    },
+                ],
+            }],
+        };
+        let mapping = resolve_mapping(&files, &input);
+        assert!(mapping.unmapped.is_empty());
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let state = Arc::new(SessionState {
+            title: "opaque review".to_string(),
+            summary: None,
+            files,
+            mapping,
+            input,
+            token: TOKEN.to_string(),
+            started_at: chrono::Utc::now(),
+            draft: std::sync::Mutex::new(Draft::default()),
+            finished: std::sync::Mutex::new(None),
+            outcome_tx: tx,
+        });
+        (state, rx)
+    }
+
     async fn call(app: Router, req: http::Request<Body>) -> (StatusCode, serde_json::Value) {
         let res = app.oneshot(req).await.unwrap();
         let status = res.status();
@@ -403,6 +462,28 @@ index 1111111..2222222 100644
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["draft"]["concerns"]["c1"]["verdict"], "approve");
+    }
+
+    #[tokio::test]
+    async fn draft_roundtrip_acknowledged_opaque() {
+        let (state, _rx) = build_opaque_state();
+        let app = build_router(state);
+
+        let draft_body = json!({
+            "concerns": {},
+            "general_comments": [],
+            "acknowledged_opaque": [1]
+        });
+        let (status, _) = call(
+            app.clone(),
+            put_json(&format!("/api/{TOKEN}/draft"), draft_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+
+        let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["draft"]["acknowledged_opaque"], json!([1]));
     }
 
     #[tokio::test]
@@ -663,6 +744,46 @@ index 1111111..2222222 100644
         let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), good)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_without_opaque_ack_422() {
+        let (state, _rx) = build_opaque_state();
+        let app = build_router(state);
+        let draft = json!({
+            "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+            "general_comments": []
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert!(body["details"].to_string().contains("logo.png"));
+    }
+
+    #[tokio::test]
+    async fn submit_with_opaque_ack_succeeds() {
+        let (state, mut rx) = build_opaque_state();
+        let app = build_router(state);
+        let draft = json!({
+            "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+            "general_comments": [],
+            "acknowledged_opaque": [1]
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
+    }
+
+    #[tokio::test]
+    async fn submit_ack_on_non_opaque_file_422() {
+        let (state, _rx) = build_opaque_state();
+        let app = build_router(state);
+        let draft = json!({
+            "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+            "general_comments": [],
+            "acknowledged_opaque": [0, 1, 99]
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
     }
 
     /// Regression test for the embedded-asset 404 bug: the wildcard

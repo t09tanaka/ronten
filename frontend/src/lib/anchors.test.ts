@@ -1,13 +1,25 @@
 import { describe, expect, it } from 'vitest'
 import { newTarget, oldTarget } from './anchors'
-import type { DiffLine, FileDiff, FileStatus, LineKind } from './types'
+import type { ChangeKind, DiffLine, FileDiff, LineKind } from './types'
 
 function makeFile(
   old_path: string | null,
   new_path: string | null,
-  status: FileStatus = 'modified',
+  change_kind: ChangeKind = 'modified',
 ): FileDiff {
-  return { old_path, new_path, status, hunks: [] }
+  return {
+    old_path,
+    new_path,
+    change_kind,
+    content_kind: 'text',
+    old_mode: null,
+    new_mode: null,
+    old_oid: null,
+    new_oid: null,
+    old_size: null,
+    new_size: null,
+    hunks: [],
+  }
 }
 
 function makeLine(kind: LineKind, old_no: number | null, new_no: number | null): DiffLine {
