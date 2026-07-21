@@ -5,7 +5,8 @@
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
   import { interpretKey } from './lib/keynav'
-  import { revealControlChars, revealInvisibles } from './lib/invisibles'
+  import { revealControlChars } from './lib/invisibles'
+  import { renderMarkdown } from './lib/markdown'
   import { focusGeneralComments } from './lib/scroll'
   import type { Verdict } from './lib/types'
 
@@ -172,79 +173,6 @@
     e.preventDefault()
   }
 
-  // Tiny hand-rolled markdown converter for concern descriptions: paragraphs,
-  // `- ` bullet lists, `code` spans, and fenced ``` code blocks. No external
-  // markdown dependency. HTML is escaped first since descriptions come from
-  // agent-supplied JSON.
-  function escapeHtml(s: string): string {
-    return s
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;')
-      .replace(/'/g, '&#39;')
-  }
-
-  function renderInline(s: string): string {
-    return s.replace(/`([^`]+)`/g, '<code>$1</code>')
-  }
-
-  function renderMarkdown(src: string): string {
-    const lines = escapeHtml(src).split('\n')
-    const out: string[] = []
-    let paragraph: string[] = []
-    let list: string[] = []
-
-    function flushParagraph(): void {
-      if (paragraph.length > 0) {
-        out.push(`<p>${renderInline(paragraph.join(' '))}</p>`)
-        paragraph = []
-      }
-    }
-    function flushList(): void {
-      if (list.length > 0) {
-        out.push(`<ul>${list.map((item) => `<li>${renderInline(item)}</li>`).join('')}</ul>`)
-        list = []
-      }
-    }
-
-    let i = 0
-    while (i < lines.length) {
-      const line = lines[i]
-      if (line.startsWith('```')) {
-        flushParagraph()
-        flushList()
-        const codeLines: string[] = []
-        i++
-        while (i < lines.length && !lines[i].startsWith('```')) {
-          codeLines.push(lines[i])
-          i++
-        }
-        out.push(`<pre><code>${codeLines.join('\n')}</code></pre>`)
-        i++ // skip closing fence
-        continue
-      }
-      if (line.startsWith('- ')) {
-        flushParagraph()
-        list.push(line.slice(2))
-        i++
-        continue
-      }
-      if (line.trim() === '') {
-        flushParagraph()
-        flushList()
-        i++
-        continue
-      }
-      flushList()
-      paragraph.push(line.trim())
-      i++
-    }
-    flushParagraph()
-    flushList()
-    return out.join('')
-  }
-
   const maxCommentChars = $derived(rs.limits?.max_comment_chars)
 
   const submitTitle = $derived(
@@ -362,7 +290,7 @@
           {/if}
           {#if selected.description}
             <div class="concern-description">
-              {@html renderMarkdown(revealInvisibles(selected.description))}
+              {@html renderMarkdown(selected.description)}
             </div>
           {/if}
           <DiffView />

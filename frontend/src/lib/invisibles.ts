@@ -87,12 +87,29 @@ export function revealControlChars(s: string): string {
   return revealWith(s, true)
 }
 
-/** True if `s` contains any character that `revealControlChars` would escape. */
-export function hasInvisibles(s: string): boolean {
+function hasEscapable(s: string, includeTab: boolean): boolean {
   for (const ch of s) {
-    if (needsEscape(ch.codePointAt(0) ?? -1, true)) return true
+    if (needsEscape(ch.codePointAt(0) ?? -1, includeTab)) return true
   }
   return false
+}
+
+/**
+ * True if `s` contains any character that `revealInvisibles` would escape
+ * (TAB excluded) — use for diff line content, so the "contains invisible
+ * characters" badge agrees with what actually gets a visible token there
+ * (an ordinary tab-indented line must not trip this).
+ */
+export function hasInvisibles(s: string): boolean {
+  return hasEscapable(s, false)
+}
+
+/**
+ * True if `s` contains any character that `revealControlChars` would escape
+ * (TAB included) — use for paths/titles/identifiers.
+ */
+export function hasControlChars(s: string): boolean {
+  return hasEscapable(s, true)
 }
 
 /** Null-tolerant `revealControlChars`, for agent-supplied path fields that may be absent. */

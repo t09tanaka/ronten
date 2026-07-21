@@ -2,7 +2,7 @@
   import { rs } from './state.svelte'
   import HunkView from './HunkView.svelte'
   import type { CommentLineInfo } from './anchors'
-  import { hasInvisibles, reveal } from './invisibles'
+  import { hasControlChars, hasInvisibles, reveal } from './invisibles'
   import { contentNote, fileNotices, modeChangeBadge, opaqueDetails, requiresAck, typeChangeBadge } from './opaque'
   import type { ChangeKind, FileDiff, HunkRef } from './types'
 
@@ -46,8 +46,12 @@
   // a reviewer knows to look for the revealed ⟨U+XXXX⟩ tokens, driven off
   // either path or any displayed hunk line for this concern.
   function fileHasInvisibles(file: FileDiff, refs: HunkRef[]): boolean {
-    if (file.old_path != null && hasInvisibles(file.old_path)) return true
-    if (file.new_path != null && hasInvisibles(file.new_path)) return true
+    // Paths use the TAB-including check (matches revealControlChars, which
+    // is what actually renders them); line content uses the TAB-excluding
+    // check (matches revealInvisibles) so an ordinary tab-indented line
+    // doesn't trip the badge when no token would actually be revealed.
+    if (file.old_path != null && hasControlChars(file.old_path)) return true
+    if (file.new_path != null && hasControlChars(file.new_path)) return true
     for (const ref of refs) {
       if (ref.hunk == null) continue
       if (file.hunks[ref.hunk].lines.some((line) => hasInvisibles(line.content))) return true

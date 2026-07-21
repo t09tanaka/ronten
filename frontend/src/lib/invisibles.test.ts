@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { hasInvisibles, revealControlChars, revealInvisibles } from './invisibles'
+import { hasControlChars, hasInvisibles, revealControlChars, revealInvisibles } from './invisibles'
 
 describe('revealInvisibles', () => {
   it('replaces RLO with a visible token', () => {
@@ -26,11 +26,13 @@ describe('revealInvisibles', () => {
   it('replaces U+2028 and U+2029', () => {
     expect(revealInvisibles('a\u2028b\u2029c')).toBe('a⟨U+2028⟩b⟨U+2029⟩c')
   })
-  it('hasInvisibles detects and rejects accordingly', () => {
+  it('hasInvisibles detects bidi/control characters but not TAB', () => {
     expect(hasInvisibles('plain')).toBe(false)
     expect(hasInvisibles('a‮b')).toBe(true)
     expect(hasInvisibles('a\x1bb')).toBe(true)
-    expect(hasInvisibles('a\tb')).toBe(true)
+    // TAB renders literally in line content (revealInvisibles leaves it
+    // alone), so it must not trip the "contains invisible characters" badge.
+    expect(hasInvisibles('a\tb')).toBe(false)
   })
 })
 
@@ -46,5 +48,18 @@ describe('revealControlChars', () => {
   })
   it('leaves plain text untouched', () => {
     expect(revealControlChars('日本語 emoji 🎉')).toBe('日本語 emoji 🎉')
+  })
+})
+
+describe('hasControlChars', () => {
+  it('detects TAB, unlike hasInvisibles', () => {
+    expect(hasControlChars('a\tb')).toBe(true)
+  })
+  it('detects ESC and bidi characters the same as hasInvisibles', () => {
+    expect(hasControlChars('a\x1bb')).toBe(true)
+    expect(hasControlChars('a‮b')).toBe(true)
+  })
+  it('returns false for plain text', () => {
+    expect(hasControlChars('plain')).toBe(false)
   })
 })
