@@ -43,10 +43,7 @@ pub struct FileDiff {
 
 impl FileDiff {
     /// 内容が描画されない変更（binary / non-utf8 / too-large）。
-    /// submit 時に明示 acknowledge が必要（Task 3）。
-    // Task 3 wires this into the submit-acknowledgment gate; until then it
-    // has no production caller (only the unit test below exercises it).
-    #[allow(dead_code)]
+    /// submit 時に明示 acknowledge が必要（`SessionState::validate_draft`）。
     pub fn is_opaque(&self) -> bool {
         self.content_kind != ContentKind::Text
     }
