@@ -274,14 +274,29 @@ export class ReviewState {
   }
 
   async submitReview(): Promise<void> {
-    if (this.#locked || this.submitting) return
+    // A tab that already lost the draft-conflict race must not submit: the
+    // server would refuse it anyway, and locally it would look like a
+    // transient error rather than the standing "reload" condition.
+    if (this.#locked || this.submitting || this.draftConflict) return
     this.#cancelPendingSave()
     this.submitting = true
     this.submitError = null
     try {
-      const result = await submit(this.draft)
+      const result = await submit(this.draft, this.#revision)
       if ('ok' in result) {
         this.phase = 'submitted'
+        return
+      }
+      if (result.error === 'draft conflict') {
+        // Same standing condition as a conflicting save: stop autosave and
+        // show the reload banner instead of a transient submit error.
+        this.draftConflict = true
+        this.#cancelPendingSave()
+        this.saveState = 'error'
+        return
+      }
+      if (result.error === 'session finished') {
+        this.phase = phaseForFinished(result.finished ?? 'submitted')
         return
       }
       const parts = [result.error]

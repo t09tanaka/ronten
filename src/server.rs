@@ -338,11 +338,12 @@ async fn check_head_freshness(state: &SessionState) -> Option<Response> {
 async fn post_submit(
     State(state): State<Arc<SessionState>>,
     Path(token): Path<String>,
-    Json(draft): Json<Draft>,
+    Json(body): Json<DraftPut>,
 ) -> Response {
     if token != state.token {
         return not_found();
     }
+    let draft = body.draft;
 
     // Freshness first: if the reviewed commit is gone, no draft state makes
     // the submit valid, so this is the dominant error.
@@ -372,16 +373,34 @@ async fn post_submit(
             .into_response();
     }
 
-    // Build the result first, then claim the terminal state: `try_finish`
-    // stores the outcome and claims the terminal in one atomic step, so
-    // there is no window where the session is finished but its outcome is
-    // unreadable. Claimed only after full validation, so a rejected submit
-    // never consumes the session.
+    // Build the result first, then claim the terminal state at the caller's
+    // draft revision: revision check, terminal claim, and outcome publish
+    // are one atomic step. A stale tab (another tab saved a newer draft)
+    // gets the same draft-conflict refusal a stale save does — submitting
+    // must not be a side door around it. Claimed only after full
+    // validation, so a rejected submit never consumes the session.
     let result = state.build_result(&draft);
-    if !state.try_finish(Outcome::Submitted(Box::new(result))) {
-        return finished_conflict(&state);
+    match state.try_finish_at_revision(Outcome::Submitted(Box::new(result)), body.revision) {
+        crate::session::FinishAttempt::Won => Json(json!({"ok": true})).into_response(),
+        crate::session::FinishAttempt::AlreadyFinished(kind) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "session finished",
+                "finished": kind,
+                "details": [format!("this review already ended ({kind})")],
+            })),
+        )
+            .into_response(),
+        crate::session::FinishAttempt::RevisionConflict(current) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "draft conflict",
+                "current_revision": current,
+                "details": ["the draft was changed elsewhere (another tab?); reload the review before submitting"],
+            })),
+        )
+            .into_response(),
     }
-    Json(json!({"ok": true})).into_response()
 }
 
 /// 409 for an action against a session that already ended, naming how it
@@ -777,6 +796,50 @@ index 1111111..2222222 100644
         assert_eq!(body["draft"]["concerns"]["c1"]["verdict"], "approve");
     }
 
+    /// Submitting with a stale revision must be refused exactly like a
+    /// stale save — submit is not a side door around the conflict
+    /// protection — and must not consume the session: a submit at the
+    /// current revision afterwards succeeds.
+    #[tokio::test]
+    async fn stale_revision_submit_conflicts_without_consuming_session() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        // Another tab saved once: revision is now 1.
+        let save = json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
+        let (status, _) = call(app.clone(), put_json(&format!("/api/{TOKEN}/draft"), save)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The stale tab (still at revision 0) tries to submit.
+        let (status, body) = call(
+            app.clone(),
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                submit_body(complete_draft()),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(body["error"], "draft conflict");
+        assert_eq!(body["current_revision"], 1);
+        assert!(state.finished_outcome().is_none(), "session must survive");
+
+        // The up-to-date tab submits at the current revision.
+        let (status, body) = call(
+            app,
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                json!({"revision": 1, "draft": complete_draft()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(matches!(
+            state.finished_outcome().unwrap(),
+            Outcome::Submitted(_)
+        ));
+    }
+
     /// After the session finishes, the draft is frozen: a late autosave gets
     /// 409 instead of rewriting what the outcome was built from.
     #[tokio::test]
@@ -785,7 +848,10 @@ index 1111111..2222222 100644
         let app = build_router(state.clone());
         let (status, _) = call(
             app.clone(),
-            post_json(&format!("/api/{TOKEN}/submit"), complete_draft()),
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                submit_body(complete_draft()),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -874,8 +940,11 @@ index 1111111..2222222 100644
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": []
         });
-        let (status, body) =
-            call(app, post_json(&format!("/api/{TOKEN}/submit"), draft_body)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft_body)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         let missing: Vec<String> = body["missing"]
             .as_array()
@@ -900,8 +969,11 @@ index 1111111..2222222 100644
             },
             "general_comments": ["looks mostly fine"]
         });
-        let (status, body) =
-            call(app, post_json(&format!("/api/{TOKEN}/submit"), draft_body)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft_body)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
 
@@ -928,7 +1000,11 @@ index 1111111..2222222 100644
             },
             "general_comments": []
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert!(body["details"]
             .to_string()
@@ -947,7 +1023,11 @@ index 1111111..2222222 100644
             },
             "general_comments": ["fix the auth check"]
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(matches!(
             state.finished_outcome().unwrap(),
@@ -970,14 +1050,20 @@ index 1111111..2222222 100644
         });
         let (status, _) = call(
             app.clone(),
-            post_json(&format!("/api/{TOKEN}/submit"), draft_body.clone()),
+            post_json(
+                &format!("/api/{TOKEN}/submit"),
+                submit_body(draft_body.clone()),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         state.finished_outcome().unwrap();
 
-        let (status, body) =
-            call(app, post_json(&format!("/api/{TOKEN}/submit"), draft_body)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft_body)),
+        )
+        .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body["error"], "session finished");
         assert_eq!(body["finished"], "submitted");
@@ -1013,7 +1099,11 @@ index 1111111..2222222 100644
     async fn assert_invalid_draft(draft: serde_json::Value, expect_in_details: &[&str]) {
         let state = build_state();
         let app = build_router(state.clone());
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert_eq!(body["error"], "invalid draft");
         let details = body["details"].as_array().unwrap();
@@ -1121,7 +1211,11 @@ index 1111111..2222222 100644
             },
             "general_comments": []
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let outcome = state.finished_outcome().unwrap();
@@ -1149,8 +1243,11 @@ index 1111111..2222222 100644
             ]}},
             "general_comments": []
         });
-        let (status, body) =
-            call(app.clone(), post_json(&format!("/api/{TOKEN}/submit"), bad)).await;
+        let (status, body) = call(
+            app.clone(),
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(bad)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert_eq!(body["error"], "invalid draft");
 
@@ -1162,7 +1259,11 @@ index 1111111..2222222 100644
             ]}},
             "general_comments": []
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), good)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(good)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(matches!(
             state.finished_outcome().unwrap(),
@@ -1178,7 +1279,11 @@ index 1111111..2222222 100644
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": []
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert!(body["details"].to_string().contains("logo.png"));
     }
@@ -1192,7 +1297,11 @@ index 1111111..2222222 100644
             "general_comments": [],
             "acknowledged_opaque": [1]
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(matches!(
             state.finished_outcome().unwrap(),
@@ -1209,7 +1318,11 @@ index 1111111..2222222 100644
             "general_comments": [],
             "acknowledged_opaque": [0, 1, 99]
         });
-        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
     }
 
@@ -1335,6 +1448,12 @@ index 1111111..2222222 100644
         );
     }
 
+    /// Wraps a draft in the submit wire shape at revision 0 (tests that
+    /// never save keep revision 0).
+    fn submit_body(draft: serde_json::Value) -> serde_json::Value {
+        json!({"revision": 0, "draft": draft})
+    }
+
     /// Complete draft with every required verdict approved.
     fn complete_draft() -> serde_json::Value {
         json!({
@@ -1362,7 +1481,10 @@ index 1111111..2222222 100644
             let submit = tokio::spawn(async move {
                 call(
                     submit_app,
-                    post_json(&format!("/api/{TOKEN}/submit"), complete_draft()),
+                    post_json(
+                        &format!("/api/{TOKEN}/submit"),
+                        submit_body(complete_draft()),
+                    ),
                 )
                 .await
             });

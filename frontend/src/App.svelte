@@ -329,7 +329,7 @@
           <button
             type="button"
             class="btn-primary"
-            disabled={!rs.allReviewed || !rs.allOpaqueAcked}
+            disabled={!rs.allReviewed || !rs.allOpaqueAcked || rs.draftConflict}
             title={submitTitle}
             onclick={openSubmitConfirm}>Submit review</button
           >

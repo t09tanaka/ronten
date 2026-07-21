@@ -8,11 +8,12 @@ vi.mock('./api', () => ({
   abortSession: vi.fn(),
 }))
 
-import { fetchSession, saveDraft } from './api'
+import { fetchSession, saveDraft, submit } from './api'
 import { ReviewState } from './state.svelte'
 
 const fetchSessionMock = vi.mocked(fetchSession)
 const saveDraftMock = vi.mocked(saveDraft)
+const submitMock = vi.mocked(submit)
 
 function makeSession(): Session {
   return {
@@ -82,6 +83,34 @@ describe('draft conflict handling', () => {
     rs.addGeneralComment('more')
     await vi.runAllTimersAsync()
     expect(saveDraftMock).toHaveBeenCalledTimes(1)
+  })
+
+  it('refuses to submit once a draft conflict is standing', async () => {
+    const rs = await loadedState()
+
+    saveDraftMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'draft conflict',
+      current_revision: 9,
+    })
+    rs.addGeneralComment('mine')
+    await vi.runAllTimersAsync()
+    expect(rs.draftConflict).toBe(true)
+
+    await rs.submitReview()
+    expect(submitMock).not.toHaveBeenCalled()
+  })
+
+  it('raises the conflict banner when the submit itself hits a stale revision', async () => {
+    const rs = await loadedState()
+
+    submitMock.mockResolvedValueOnce({
+      error: 'draft conflict',
+      current_revision: 9,
+    })
+    await rs.submitReview()
+    expect(rs.draftConflict).toBe(true)
+    expect(rs.phase).toBe('review')
   })
 
   it('joins the submitted state on a finished(submitted) conflict', async () => {

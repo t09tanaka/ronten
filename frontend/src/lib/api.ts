@@ -1,4 +1,4 @@
-import type { Draft, SaveDraftResult, Session } from './types'
+import type { Draft, FinishedKind, SaveDraftResult, Session } from './types'
 
 /**
  * The SPA is served at `/r/{token}`, so the token is the second path
@@ -45,12 +45,13 @@ export async function saveDraft(draft: Draft, revision: number): Promise<SaveDra
     return { ok: true, revision: body.revision }
   }
   // 409 carries a JSON error body the caller must inspect (draft conflict
-  // vs already submitted), so it's returned rather than thrown; anything
+  // vs session finished), so it's returned rather than thrown; anything
   // else is an ordinary failure.
   if (res.status === 409) {
     const body = (await res.json()) as {
       error: string
       current_revision?: number
+      finished?: FinishedKind
       details?: string[]
     }
     return { ok: false, ...body }
@@ -60,13 +61,21 @@ export async function saveDraft(draft: Draft, revision: number): Promise<SaveDra
 
 export type SubmitResult =
   | { ok: true }
-  | { error: string; missing?: string[]; details?: string[] }
+  | {
+      error: string
+      missing?: string[]
+      details?: string[]
+      current_revision?: number
+      finished?: FinishedKind
+    }
 
-export async function submit(draft: Draft): Promise<SubmitResult> {
+/** Submit carries the same revision handshake as a save: a stale tab must
+ * not be able to submit past another tab's newer draft. */
+export async function submit(draft: Draft, revision: number): Promise<SubmitResult> {
   const res = await apiFetch('/submit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(draft),
+    body: JSON.stringify({ revision, draft }),
   })
   // Non-2xx responses (422/409) carry a JSON error body that callers need,
   // so they're parsed rather than thrown; only network failures throw.

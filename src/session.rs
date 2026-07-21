@@ -185,6 +185,27 @@ impl SessionState {
         }
     }
 
+    /// Like [`try_finish`](Self::try_finish), but only wins if the caller's
+    /// draft revision is still current — all under the same single lock, so
+    /// neither another finish nor a concurrent save can interleave. This is
+    /// what keeps a stale tab's submit from silently discarding a newer
+    /// draft another tab saved.
+    pub fn try_finish_at_revision(&self, outcome: Outcome, revision: u64) -> FinishAttempt {
+        let mut phase = lock_ignore_poison(&self.phase);
+        match &*phase {
+            Phase::Finished(o) => FinishAttempt::AlreadyFinished(outcome_kind(o)),
+            Phase::Reviewing(slot) => {
+                if slot.revision != revision {
+                    return FinishAttempt::RevisionConflict(slot.revision);
+                }
+                *phase = Phase::Finished(outcome);
+                drop(phase);
+                self.outcome_tx.send_replace(());
+                FinishAttempt::Won
+            }
+        }
+    }
+
     /// Wire name of the terminal state, if any.
     pub fn finished_kind(&self) -> Option<&'static str> {
         match &*lock_ignore_poison(&self.phase) {
@@ -384,6 +405,17 @@ impl SessionState {
             submitted_at: chrono::Utc::now().to_rfc3339(),
         }
     }
+}
+
+/// Outcome of [`SessionState::try_finish_at_revision`].
+#[derive(Debug)]
+pub enum FinishAttempt {
+    /// The caller claimed the terminal state.
+    Won,
+    /// Another path already finished the session (wire name of how).
+    AlreadyFinished(&'static str),
+    /// The caller's draft revision is stale; the current revision is given.
+    RevisionConflict(u64),
 }
 
 /// Wire name of an outcome, used in the session payload's `finished` field
