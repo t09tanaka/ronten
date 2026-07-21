@@ -107,6 +107,32 @@ async fn request_timeout(
     }
 }
 
+/// Explicit request-body cap for every route (draft saves and submits are
+/// the only bodies). This — not axum's implicit default — is the wire
+/// contract, and it matches the concerns-input cap: a draft cannot
+/// legitimately outgrow the review it annotates. Application-level per-field
+/// limits (comment length/count) are far below this; the byte cap exists so
+/// the extractor bound and the documented contract are the same number.
+pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Converts the bare 413 the body-limit extractor produces into the same
+/// JSON error shape every other refusal uses, so clients never need a
+/// second error-decoding path.
+async fn json_payload_too_large(req: Request, next: Next) -> Response {
+    let res = next.run(req).await;
+    if res.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({
+                "error": "payload too large",
+                "details": [format!("request body exceeds {MAX_BODY_BYTES} bytes")],
+            })),
+        )
+            .into_response();
+    }
+    res
+}
+
 /// 16 random bytes, rendered as lowercase hex — used as the session's
 /// unguessable URL token.
 pub fn new_token() -> String {
@@ -168,7 +194,10 @@ async fn get_session(
         });
     }
 
-    let draft = crate::session::lock_ignore_poison(&state.draft).clone();
+    let (draft, draft_revision) = {
+        let slot = crate::session::lock_ignore_poison(&state.draft);
+        (slot.draft.clone(), slot.revision)
+    };
     let submitted = state.is_finished();
     let payload = SessionPayload {
         title: &state.title,
@@ -178,21 +207,61 @@ async fn get_session(
         unmapped_lines: &state.mapping.unmapped_lines,
         warnings: &state.mapping.warnings,
         draft,
+        draft_revision,
+        limits: crate::session::Limits {
+            max_comments: crate::session::MAX_COMMENTS,
+            max_comment_chars: crate::session::MAX_COMMENT_CHARS,
+            max_draft_bytes: MAX_BODY_BYTES,
+        },
         submitted,
     };
     Json(payload).into_response()
 }
 
+/// Wire shape of `PUT /draft`: the draft plus the revision the client
+/// believes is current. A mismatch means another tab (or an older copy of
+/// this one) saved in between; accepting the write would silently discard
+/// that save, so it is refused with 409 instead.
+#[derive(serde::Deserialize)]
+struct DraftPut {
+    revision: u64,
+    draft: Draft,
+}
+
 async fn put_draft(
     State(state): State<Arc<SessionState>>,
     Path(token): Path<String>,
-    Json(draft): Json<Draft>,
+    Json(body): Json<DraftPut>,
 ) -> Response {
     if token != state.token {
         return not_found();
     }
-    *crate::session::lock_ignore_poison(&state.draft) = draft;
-    StatusCode::NO_CONTENT.into_response()
+    // A finished session's draft is frozen: its submitted content is what
+    // the outcome was built from, and a late autosave must not rewrite it.
+    if state.is_finished() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "already submitted"})),
+        )
+            .into_response();
+    }
+    let mut slot = crate::session::lock_ignore_poison(&state.draft);
+    if body.revision != slot.revision {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "draft conflict",
+                "current_revision": slot.revision,
+                "details": ["the draft was changed elsewhere (another tab?); reload the review before editing further"],
+            })),
+        )
+            .into_response();
+    }
+    slot.draft = body.draft;
+    slot.revision += 1;
+    let revision = slot.revision;
+    drop(slot);
+    Json(json!({"revision": revision})).into_response()
 }
 
 /// Re-resolves `HEAD` and refuses the submit if it no longer matches the
@@ -324,7 +393,8 @@ pub fn build_router(state: Arc<SessionState>) -> Router {
         .route("/api/{token}/draft", put(put_draft))
         .route("/api/{token}/submit", post(post_submit))
         .route("/api/{token}/abort", post(post_abort))
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES));
     with_middleware(router, REQUEST_TIMEOUT)
 }
 
@@ -338,6 +408,7 @@ pub fn build_router(state: Arc<SessionState>) -> Router {
 fn with_middleware(router: Router, timeout: std::time::Duration) -> Router {
     router
         .layer(middleware::from_fn_with_state(timeout, request_timeout))
+        .layer(middleware::from_fn(json_payload_too_large))
         .layer(middleware::from_fn(security_headers))
 }
 
@@ -414,7 +485,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
-            draft: std::sync::Mutex::new(Draft::default()),
+            draft: std::sync::Mutex::new(crate::session::DraftSlot::default()),
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
             outcome_tx: tx,
         })
@@ -470,7 +541,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
-            draft: std::sync::Mutex::new(Draft::default()),
+            draft: std::sync::Mutex::new(crate::session::DraftSlot::default()),
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
             outcome_tx: tx,
         })
@@ -535,7 +606,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
-            draft: std::sync::Mutex::new(Draft::default()),
+            draft: std::sync::Mutex::new(crate::session::DraftSlot::default()),
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
             outcome_tx: tx,
         })
@@ -617,19 +688,101 @@ index 1111111..2222222 100644
         let app = build_router(state.clone());
 
         let draft_body = json!({
-            "concerns": { "c1": { "verdict": "approve", "comments": [] } },
-            "general_comments": []
+            "revision": 0,
+            "draft": {
+                "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+                "general_comments": []
+            }
         });
-        let (status, _) = call(
+        let (status, body) = call(
             app.clone(),
             put_json(&format!("/api/{TOKEN}/draft"), draft_body),
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["revision"], 1);
 
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["draft"]["concerns"]["c1"]["verdict"], "approve");
+        assert_eq!(body["draft_revision"], 1);
+        assert_eq!(body["limits"]["max_comment_chars"], 10_000);
+        assert_eq!(body["limits"]["max_comments"], 500);
+    }
+
+    /// A save presenting a stale revision must be refused (409) without
+    /// overwriting the newer draft — this is what stops two tabs from
+    /// silently clobbering each other via last-write-wins.
+    #[tokio::test]
+    async fn stale_draft_revision_conflicts_without_overwrite() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let save = |verdict: &str, revision: u64| {
+            json!({
+                "revision": revision,
+                "draft": {
+                    "concerns": { "c1": { "verdict": verdict, "comments": [] } },
+                    "general_comments": []
+                }
+            })
+        };
+        let (status, _) = call(
+            app.clone(),
+            put_json(&format!("/api/{TOKEN}/draft"), save("approve", 0)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // A second writer still holding revision 0 (the other tab).
+        let (status, body) = call(
+            app.clone(),
+            put_json(&format!("/api/{TOKEN}/draft"), save("request-changes", 0)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(body["error"], "draft conflict");
+        assert_eq!(body["current_revision"], 1);
+
+        // The first tab's save survived.
+        let (_, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(body["draft"]["concerns"]["c1"]["verdict"], "approve");
+    }
+
+    /// After the session finishes, the draft is frozen: a late autosave gets
+    /// 409 instead of rewriting what the outcome was built from.
+    #[tokio::test]
+    async fn draft_save_after_finish_conflicts() {
+        let state = build_state();
+        let app = build_router(state.clone());
+        let (status, _) = call(
+            app.clone(),
+            post_json(&format!("/api/{TOKEN}/submit"), complete_draft()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let draft_body =
+            json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
+        let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), draft_body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(body["error"], "already submitted");
+    }
+
+    /// An oversized body gets the same JSON error shape as every other
+    /// refusal, not a bare 413.
+    #[tokio::test]
+    async fn oversized_draft_body_gets_json_413() {
+        let state = build_state();
+        let app = build_router(state.clone());
+        let huge = "x".repeat(MAX_BODY_BYTES + 1024);
+        let draft_body = json!({
+            "revision": 0,
+            "draft": { "concerns": {}, "general_comments": [huge] }
+        });
+        let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), draft_body)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(body["error"], "payload too large");
     }
 
     #[tokio::test]
@@ -638,16 +791,19 @@ index 1111111..2222222 100644
         let app = build_router(state.clone());
 
         let draft_body = json!({
-            "concerns": {},
-            "general_comments": [],
-            "acknowledged_opaque": [1]
+            "revision": 0,
+            "draft": {
+                "concerns": {},
+                "general_comments": [],
+                "acknowledged_opaque": [1]
+            }
         });
-        let (status, _) = call(
+        let (status, body) = call(
             app.clone(),
             put_json(&format!("/api/{TOKEN}/draft"), draft_body),
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);

@@ -6,7 +6,7 @@ use crate::gitdiff::{compute_diff, current_branch, repo_root, worktree_status, G
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
-use crate::session::{Draft, Phase, SessionState};
+use crate::session::{DraftSlot, Phase, SessionState};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -312,7 +312,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
         snapshot,
         repo_root: Some(root),
         started_at: chrono::Utc::now(),
-        draft: Mutex::new(Draft::default()),
+        draft: Mutex::new(DraftSlot::default()),
         phase: Mutex::new(Phase::Reviewing),
         outcome_tx: tx,
     });

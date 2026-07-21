@@ -36,9 +36,29 @@ pub enum Phase {
 }
 
 /// Maximum number of comments per concern (and of general comments).
-const MAX_COMMENTS: usize = 500;
+pub const MAX_COMMENTS: usize = 500;
 /// Maximum comment body length in characters.
-const MAX_COMMENT_CHARS: usize = 10_000;
+pub const MAX_COMMENT_CHARS: usize = 10_000;
+
+/// The draft plus its monotonically increasing revision. Every accepted
+/// `PUT /draft` must present the current revision and bumps it by one, so
+/// two tabs editing the same session cannot silently overwrite each other:
+/// the stale tab's save is refused with a conflict instead.
+#[derive(Debug, Default)]
+pub struct DraftSlot {
+    pub draft: Draft,
+    pub revision: u64,
+}
+
+/// Validation limits the server enforces, sent to the UI in the session
+/// payload so input fields can enforce the same bounds client-side instead
+/// of hardcoding a mirror of these numbers.
+#[derive(Serialize)]
+pub struct Limits {
+    pub max_comments: usize,
+    pub max_comment_chars: usize,
+    pub max_draft_bytes: usize,
+}
 
 /// The human's in-progress (or final, at submit time) review state.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -73,6 +93,9 @@ pub struct SessionPayload<'a> {
     pub unmapped_lines: &'a [UnmappedLine],
     pub warnings: &'a [Warning],
     pub draft: Draft,
+    /// Current draft revision; `PUT /draft` must echo it back.
+    pub draft_revision: u64,
+    pub limits: Limits,
     pub submitted: bool,
 }
 
@@ -104,7 +127,7 @@ pub struct SessionState {
     /// check.
     pub repo_root: Option<std::path::PathBuf>,
     pub started_at: chrono::DateTime<chrono::Utc>,
-    pub draft: Mutex<Draft>,
+    pub draft: Mutex<DraftSlot>,
     /// Lifecycle phase; see [`Phase`]. Written only by [`try_finish`].
     ///
     /// [`try_finish`]: SessionState::try_finish

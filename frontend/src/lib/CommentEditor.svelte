@@ -13,6 +13,8 @@
 
   let body = $state('')
 
+  const maxChars = $derived(rs.limits?.max_comment_chars)
+
   function add(): void {
     const trimmed = body.trim()
     if (!trimmed) return
@@ -31,8 +33,12 @@
     bind:value={body}
     placeholder="Add a comment…"
     rows="3"
+    maxlength={maxChars}
     autofocus
   ></textarea>
+  {#if maxChars != null && body.length > maxChars * 0.9}
+    <span class="char-count">{body.length}/{maxChars}</span>
+  {/if}
   <div class="comment-editor-actions">
     <button type="button" class="editor-add" onclick={add} disabled={!body.trim()}>Add comment</button>
     <button type="button" class="editor-cancel" onclick={cancel}>Cancel</button>
@@ -59,6 +65,15 @@
     background: var(--c-paper);
     color: var(--c-ink);
     resize: vertical;
+  }
+
+  .char-count {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--c-ink-3);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   .comment-editor-actions {

@@ -107,6 +107,14 @@ export interface Warning {
   concern_id?: string
 }
 
+/** Server-side validation limits echoed to the client so the UI can apply
+ * the same bounds to its inputs (see session.rs / server.rs). */
+export interface Limits {
+  max_comments: number
+  max_comment_chars: number
+  max_draft_bytes: number
+}
+
 export interface Session {
   title: string
   summary: string | null
@@ -114,6 +122,17 @@ export interface Session {
   concerns: ConcernView[]
   warnings: Warning[]
   draft: Draft
+  /** Current draft revision — PUT /draft must echo it back. */
+  draft_revision: number
+  limits: Limits
   submitted: boolean
   unmapped_lines: UnmappedLine[]
 }
+
+/** Result of `PUT /draft`. Success carries the new revision to echo on the
+ * next save. A 409 is returned (not thrown) so callers can tell "another
+ * tab saved" (`error: 'draft conflict'`, with the server's revision) apart
+ * from "session already finished" (`error: 'already submitted'`). */
+export type SaveDraftResult =
+  | { ok: true; revision: number }
+  | { ok: false; error: string; current_revision?: number; details?: string[] }
