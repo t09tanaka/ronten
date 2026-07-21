@@ -34,6 +34,9 @@ pub async fn run(args: DemoArgs) -> u8 {
 
     let files = parse_unified_diff(DEMO_DIFF);
     let mapping = resolve_mapping(&files, &input);
+    // No git repo behind the demo: digests are still real, commit oids are
+    // absent, and the submit-time HEAD re-check is skipped (repo_root: None).
+    let snapshot = crate::snapshot::ReviewSnapshot::without_git("demo", &files, &input);
     let summary = input.summary.clone();
     let token = new_token();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -44,6 +47,9 @@ pub async fn run(args: DemoArgs) -> u8 {
         mapping,
         input,
         token: token.clone(),
+        session_id: new_token(),
+        snapshot,
+        repo_root: None,
         started_at: chrono::Utc::now(),
         draft: Mutex::new(Draft::default()),
         finished: Mutex::new(None),

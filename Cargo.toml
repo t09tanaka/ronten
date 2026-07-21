@@ -37,6 +37,7 @@ rand = "0.9"
 open = "5"
 mime_guess = "2"
 similar = "2"
+sha2 = "0.10"
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -122,6 +122,17 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
     let files = diff_output.files;
     let diff_warnings = diff_output.warnings;
+    // Pin the session to what was just diffed: the resolved endpoints plus
+    // canonical digests of the diff and concerns input. Submit re-checks
+    // HEAD against this snapshot, and the result JSON embeds it.
+    let snapshot = crate::snapshot::ReviewSnapshot {
+        base_ref: args.base.clone(),
+        base_oid: Some(diff_output.base_oid),
+        head_oid: Some(diff_output.head_oid),
+        merge_base_oid: Some(diff_output.merge_base_oid),
+        diff_sha256: crate::snapshot::diff_digest(&files),
+        concerns_sha256: crate::snapshot::concerns_digest(&input),
+    };
 
     // The diff above only ever covers `<base>...HEAD` (committed state); if
     // the agent forgot to commit some of its work, those changes are
@@ -173,6 +184,9 @@ pub async fn run(args: ReviewArgs) -> u8 {
         mapping,
         input,
         token: token.clone(),
+        session_id: new_token(),
+        snapshot,
+        repo_root: Some(root),
         started_at: chrono::Utc::now(),
         draft: Mutex::new(Draft::default()),
         finished: Mutex::new(None),

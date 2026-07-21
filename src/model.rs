@@ -8,9 +8,13 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// The only concerns/result contract version this build of ronten accepts
-/// (and the version it stamps on every emitted result).
+/// The only concerns *input* contract version this build of ronten accepts.
 pub const SUPPORTED_VERSION: u32 = 1;
+
+/// The result *output* contract version this build of ronten emits. v2 added
+/// the `review` block pinning the result to the reviewed commits and to
+/// canonical digests of the diff and concerns input.
+pub const OUTPUT_VERSION: u32 = 2;
 
 /// Top-level input: a list of concerns an agent wants a human to review.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -87,16 +91,63 @@ pub enum Side {
     New,
 }
 
-/// Top-level output: the human's decision plus per-concern verdicts.
+/// Top-level output: the human's decision plus per-concern verdicts, pinned
+/// to exactly what was reviewed via the `review` block.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResultOutput {
     pub version: u32,
+    /// What this result applies to: the reviewed commits and digests of the
+    /// diff and concerns input, plus the assurance level of the outcome.
+    pub review: ReviewInfo,
     pub decision: Decision,
     pub concerns: Vec<ConcernResult>,
     pub general_comments: Vec<String>,
     pub warnings: Vec<String>,
     pub started_at: String,
     pub submitted_at: String,
+}
+
+/// Identifies exactly what a result applies to. Consumers deciding whether
+/// to act on a result must compare `head_oid` against the commit they are
+/// about to act on — a result for one commit must never be applied to
+/// another.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewInfo {
+    /// Random id of this review session (not the session URL token).
+    pub session_id: String,
+    /// Version of the ronten binary that produced this result.
+    pub ronten_version: String,
+    /// The base ref exactly as passed via `--base`.
+    pub base_ref: String,
+    /// Full commit oid the base ref resolved to at session start. Null only
+    /// for sessions without a git repository (`ronten demo`).
+    pub base_oid: Option<String>,
+    /// Full commit oid `HEAD` resolved to at session start. Submit re-checks
+    /// that `HEAD` still resolves to this oid, so a result always describes
+    /// this exact commit.
+    pub head_oid: Option<String>,
+    /// Full oid of `merge-base(base, HEAD)` — the left side of the diff.
+    pub merge_base_oid: Option<String>,
+    /// SHA-256 (lowercase hex) of the canonical serialization of the diff
+    /// the reviewer saw.
+    pub diff_sha256: String,
+    /// SHA-256 (lowercase hex) of the canonical serialization of the full
+    /// concerns input (ids, titles, descriptions, risks, locations).
+    pub concerns_sha256: String,
+    /// Assurance level of this result. Always `advisory` today: the launching
+    /// agent can read the session URL from stderr, so ronten cannot prove the
+    /// submit came from a human. Do not use an advisory result as a
+    /// security-enforcing approval gate.
+    pub assurance: Assurance,
+}
+
+/// How much a consumer may trust that a human produced this result.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Assurance {
+    /// The result reflects what the review UI submitted, but the launching
+    /// agent had access to the session URL and could have submitted itself.
+    Advisory,
 }
 
 /// Overall decision derived from the per-concern verdicts.

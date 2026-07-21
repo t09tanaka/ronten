@@ -156,8 +156,128 @@ fn approve_all_exits_0() {
     let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(result["decision"], "approve");
     assert_eq!(result["concerns"].as_array().unwrap().len(), 2);
-    // The result carries the contract version ronten processed.
-    assert_eq!(result["version"], 1);
+    // The result carries the output contract version.
+    assert_eq!(result["version"], 2);
+}
+
+/// stdout of `git <args>` in `dir`, trimmed.
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// The result JSON must pin the review to the exact commits and inputs it
+/// covered: base/head/merge-base oids as resolved at session start (even if
+/// the base ref moves afterwards), plus canonical digests and the advisory
+/// assurance marker.
+#[test]
+fn result_pins_reviewed_commits_and_inputs() {
+    let td = fixture_repo();
+    let base_oid = git_stdout(td.path(), &["rev-parse", "main"]);
+    let head_oid = git_stdout(td.path(), &["rev-parse", "feature"]);
+    let (child, url) = spawn_review(td.path(), &[]);
+
+    // Move the base ref after the session started: the result must keep the
+    // oid resolved at start, not re-resolve the moved ref.
+    git(td.path(), &["branch", "-f", "main", "feature"]);
+
+    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
+        .send_json(full_draft("approve"))
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let review = &result["review"];
+    assert_eq!(review["base_ref"], "main");
+    assert_eq!(review["base_oid"], serde_json::json!(base_oid));
+    assert_eq!(review["head_oid"], serde_json::json!(head_oid));
+    // merge-base(main, feature) is main itself in the linear fixture.
+    assert_eq!(review["merge_base_oid"], serde_json::json!(base_oid));
+    assert_eq!(review["assurance"], "advisory");
+    assert_eq!(review["ronten_version"], env!("CARGO_PKG_VERSION"));
+    for key in ["diff_sha256", "concerns_sha256"] {
+        let digest = review[key].as_str().unwrap();
+        assert_eq!(digest.len(), 64, "{key} must be a sha256 hex digest");
+        assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+    assert!(
+        !review["session_id"].as_str().unwrap().is_empty(),
+        "session_id must be present"
+    );
+}
+
+/// Posts `draft` to `/submit` and returns `(status, body)` without treating
+/// non-2xx as a transport error.
+fn submit_raw(url: &str, draft: serde_json::Value) -> (u16, serde_json::Value) {
+    match ureq::post(&format!("{}/submit", api_base(url))).send_json(draft) {
+        Ok(resp) => {
+            let status = resp.status();
+            (status, resp.into_json().unwrap())
+        }
+        Err(ureq::Error::Status(status, resp)) => (status, resp.into_json().unwrap()),
+        Err(e) => panic!("submit transport error: {e}"),
+    }
+}
+
+/// Advancing HEAD after the session started must make submit fail with 409
+/// "review stale": the human approved the diff of the old HEAD, and that
+/// approval must not be attachable to the new commit.
+#[test]
+fn head_advance_makes_submit_stale_409() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &[]);
+
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nSNEAK\n").unwrap();
+    git(td.path(), &["add", "a.txt"]);
+    git(td.path(), &["commit", "-m", "sneaky extra commit"]);
+
+    let (status, body) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 409, "body: {body}");
+    assert_eq!(body["error"], "review stale");
+    assert!(
+        body["details"].to_string().contains("HEAD changed"),
+        "details missing HEAD-changed explanation: {body}"
+    );
+
+    // The stale session emits no result: abort it and expect the abort code.
+    ureq::post(&format!("{}/abort", api_base(&url)))
+        .call()
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "stale session must not emit a result"
+    );
+}
+
+/// Checking out a different branch mid-review must also 409: HEAD no longer
+/// resolves to the reviewed commit.
+#[test]
+fn branch_switch_makes_submit_stale_409() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &[]);
+
+    git(td.path(), &["checkout", "main"]);
+
+    let (status, body) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 409, "body: {body}");
+    assert_eq!(body["error"], "review stale");
+
+    // Switching back restores the reviewed commit, so submit succeeds again.
+    git(td.path(), &["checkout", "feature"]);
+    let (status, body) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 200, "body: {body}");
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
 }
 
 #[test]

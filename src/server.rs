@@ -74,7 +74,7 @@ async fn security_headers(req: Request, next: Next) -> Response {
 /// before a submit/abort arrives.
 #[derive(Debug)]
 pub enum Outcome {
-    Submitted(ResultOutput),
+    Submitted(Box<ResultOutput>),
     Aborted,
     Timeout,
 }
@@ -167,6 +167,59 @@ async fn put_draft(
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Re-resolves `HEAD` and refuses the submit if it no longer matches the
+/// commit this session was started on. Returns `None` when the submit may
+/// proceed.
+///
+/// Without this, a human could approve the diff of commit A while the agent
+/// advances `HEAD` to commit B, and the result would be misread as an
+/// approval of B. Sessions without a repo behind them (demo) skip the check.
+/// A git failure here fails closed (503): an unverifiable submit is refused
+/// rather than emitted, but the session is not consumed, so the submit can
+/// be retried.
+async fn check_head_freshness(state: &SessionState) -> Option<Response> {
+    let (root, expected) = match (&state.repo_root, &state.snapshot.head_oid) {
+        (Some(root), Some(expected)) => (root.clone(), expected.clone()),
+        _ => return None,
+    };
+    let resolved =
+        tokio::task::spawn_blocking(move || crate::gitdiff::rev_parse_commit(&root, "HEAD")).await;
+    let current = match resolved {
+        Ok(Ok(oid)) => oid,
+        Ok(Err(_)) | Err(_) => {
+            return Some(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "could not verify HEAD",
+                        "details": ["failed to re-resolve HEAD to confirm the reviewed commit is still checked out; retry the submit"],
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    };
+    if current != expected {
+        let short = |oid: &str| oid.chars().take(12).collect::<String>();
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "review stale",
+                    "details": [format!(
+                        "HEAD changed since this review started ({} -> {}); the diff on screen no longer matches the repository. Close this session and start a new review.",
+                        short(&expected), short(&current)
+                    )],
+                    "expected_head_oid": expected,
+                    "current_head_oid": current,
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn post_submit(
     State(state): State<Arc<SessionState>>,
     Path(token): Path<String>,
@@ -174,6 +227,12 @@ async fn post_submit(
 ) -> Response {
     if token != state.token {
         return not_found();
+    }
+
+    // Freshness first: if the reviewed commit is gone, no draft state makes
+    // the submit valid, so this is the dominant error.
+    if let Some(stale) = check_head_freshness(&state).await {
+        return stale;
     }
 
     let missing: Vec<String> = state
@@ -209,7 +268,10 @@ async fn post_submit(
     }
 
     let result = state.build_result(&draft);
-    let _ = state.outcome_tx.send(Outcome::Submitted(result)).await;
+    let _ = state
+        .outcome_tx
+        .send(Outcome::Submitted(Box::new(result)))
+        .await;
     Json(json!({"ok": true})).into_response()
 }
 
@@ -302,6 +364,7 @@ index 1111111..2222222 100644
         // c1 claims hunk 0; c2 claims nothing; hunk 1 is left unmapped.
         assert_eq!(mapping.unmapped.len(), 1);
 
+        let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let state = Arc::new(SessionState {
             title: "review title".to_string(),
@@ -310,6 +373,9 @@ index 1111111..2222222 100644
             mapping,
             input,
             token: TOKEN.to_string(),
+            session_id: "sessid".to_string(),
+            snapshot,
+            repo_root: None,
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
             finished: std::sync::Mutex::new(None),
@@ -355,6 +421,7 @@ index 1111111..2222222 100644
         let mapping = resolve_mapping(&files, &input);
         assert!(mapping.unmapped.is_empty());
 
+        let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let state = Arc::new(SessionState {
             title: "rename review".to_string(),
@@ -363,6 +430,9 @@ index 1111111..2222222 100644
             mapping,
             input,
             token: TOKEN.to_string(),
+            session_id: "sessid".to_string(),
+            snapshot,
+            repo_root: None,
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
             finished: std::sync::Mutex::new(None),
@@ -414,6 +484,7 @@ index 1111111..2222222 100644
         let mapping = resolve_mapping(&files, &input);
         assert!(mapping.unmapped.is_empty());
 
+        let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         let state = Arc::new(SessionState {
             title: "opaque review".to_string(),
@@ -422,6 +493,9 @@ index 1111111..2222222 100644
             mapping,
             input,
             token: TOKEN.to_string(),
+            session_id: "sessid".to_string(),
+            snapshot,
+            repo_root: None,
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
             finished: std::sync::Mutex::new(None),
@@ -801,7 +875,9 @@ index 1111111..2222222 100644
         let outcome = rx.recv().await.unwrap();
         match outcome {
             Outcome::Submitted(r) => {
-                assert_eq!(r.version, 1);
+                assert_eq!(r.version, 2);
+                assert_eq!(r.review.base_ref, "main");
+                assert!(r.review.base_oid.is_none(), "no git behind test sessions");
                 assert_eq!(r.concerns[0].comments.len(), 3);
             }
             other => panic!("expected Submitted, got {other:?}"),

@@ -553,12 +553,20 @@ pub const MAX_FILE_BYTES: usize = 1_048_576;
 /// silently truncated.
 pub const MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024;
 
-/// Result of [`compute_diff`]: the per-file diffs plus non-fatal warnings
-/// (e.g. files skipped because they exceed size limits).
+/// Result of [`compute_diff`]: the per-file diffs, non-fatal warnings (e.g.
+/// files skipped because they exceed size limits), and the resolved commit
+/// endpoints the diff was computed between — kept so the session can pin its
+/// result to exactly these commits and detect a moved `HEAD` at submit time.
 #[derive(Debug)]
 pub struct DiffOutput {
     pub files: Vec<FileDiff>,
     pub warnings: Vec<String>,
+    /// Full oid the user-supplied base ref resolved to.
+    pub base_oid: String,
+    /// Full oid `HEAD` resolved to when the diff was computed.
+    pub head_oid: String,
+    /// Full oid of `merge-base(base, HEAD)` — the diff's left side.
+    pub merge_base_oid: String,
 }
 
 /// One record of `git diff-tree -r -z --raw` output.
@@ -665,7 +673,7 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output
 /// which rev was being resolved. If git ran and exited non-zero (the rev
 /// doesn't resolve), that's `BadBase` here; callers resolving `HEAD` remap
 /// that to `GitFailed` since `HEAD` is never the user-supplied base.
-fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, GitError> {
+pub(crate) fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, GitError> {
     let output = git_cmd(root)
         .args([
             "rev-parse",
@@ -1333,7 +1341,13 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
         });
     }
 
-    Ok(DiffOutput { files, warnings })
+    Ok(DiffOutput {
+        files,
+        warnings,
+        base_oid,
+        head_oid,
+        merge_base_oid: merge_base,
+    })
 }
 
 #[cfg(test)]
