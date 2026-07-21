@@ -23,19 +23,20 @@ export interface Hunk {
   lines: DiffLine[]
 }
 
-export type FileStatus =
-  | 'modified'
-  | 'added'
-  | 'deleted'
-  | 'renamed'
-  | 'binary'
-  | 'non-utf8'
-  | 'too-large'
+export type ChangeKind = 'added' | 'deleted' | 'modified' | 'renamed' | 'copied'
+export type ContentKind = 'text' | 'binary' | 'non-utf8' | 'too-large'
 
 export interface FileDiff {
   old_path: string | null
   new_path: string | null
-  status: FileStatus
+  change_kind: ChangeKind
+  content_kind: ContentKind
+  old_mode: string | null
+  new_mode: string | null
+  old_oid: string | null
+  new_oid: string | null
+  old_size: number | null
+  new_size: number | null
   hunks: Hunk[]
 }
 
@@ -68,6 +69,7 @@ export interface ConcernDraft {
 export interface Draft {
   concerns: Record<string, ConcernDraft>
   general_comments: string[]
+  acknowledged_opaque: number[]
 }
 
 export interface Session {

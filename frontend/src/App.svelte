@@ -156,7 +156,7 @@
         e.preventDefault()
         if (showSubmitConfirm) {
           void confirmSubmit()
-        } else if (!confirmOpen && rs.allReviewed) {
+        } else if (!confirmOpen && rs.allReviewed && rs.allOpaqueAcked) {
           openSubmitConfirm()
         }
         break
@@ -245,9 +245,11 @@
   }
 
   const submitTitle = $derived(
-    rs.allReviewed
-      ? 'Submit review'
-      : `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`,
+    !rs.allReviewed
+      ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
+      : !rs.allOpaqueAcked
+        ? 'Acknowledge all opaque changes to submit'
+        : 'Submit review',
   )
 </script>
 
@@ -314,7 +316,7 @@
           <button
             type="button"
             class="btn-primary"
-            disabled={!rs.allReviewed}
+            disabled={!rs.allReviewed || !rs.allOpaqueAcked}
             title={submitTitle}
             onclick={openSubmitConfirm}>Submit review</button
           >
