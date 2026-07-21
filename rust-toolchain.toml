@@ -1,0 +1,7 @@
+# Pinned build toolchain: CI and rustup-managed dev environments build with
+# exactly this version, so a silent stable-channel bump can't change what a
+# release is built with. The MSRV floor (1.85) is checked separately in CI.
+# Non-rustup local setups (e.g. Homebrew cargo) ignore this file.
+[toolchain]
+channel = "1.92.0"
+components = ["rustfmt", "clippy"]

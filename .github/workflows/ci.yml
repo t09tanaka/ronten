@@ -5,6 +5,16 @@ on:
     branches: [main]
   pull_request:
 
+# Actions are pinned to full commit SHAs (the version tag is the trailing
+# comment) so a moved tag cannot silently change what runs in CI; Dependabot
+# keeps the pins current (.github/dependabot.yml).
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     strategy:
@@ -12,15 +22,19 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
-      - uses: dtolnay/rust-toolchain@stable
+          node-version: "20.20.2"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
+          # Matches rust-toolchain.toml; the dtolnay action's env override
+          # is what CI actually resolves, so the two must agree.
+          toolchain: "1.92.0"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -30,21 +44,22 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: "20.20.2"
       # 1.85 is the actual floor: it's clap 4.6.2's declared MSRV (the
       # highest among locked build-relevant dependencies — some dev-only
       # deps used solely by integration tests declare higher, but those
       # aren't compiled by a plain `cargo check`). Verified empirically by
       # running this exact check under a 1.85 toolchain locally before
       # adding this job.
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # (same pinned action commit)
         with:
           toolchain: "1.85"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Check at MSRV
         # `cargo check` still runs build.rs (which shells out to npm), hence
         # setup-node here too — kept as a single straightforward step rather
@@ -52,15 +67,31 @@ jobs:
         # complexity of splitting a build.rs-driven install/build across jobs.
         run: cargo check --locked
 
+  supply-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: Advisories, licenses, bans, sources (cargo deny)
+        run: cargo deny check
+      - name: RustSec advisories (cargo audit)
+        run: cargo audit
+
   package:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+          node-version: "20.20.2"
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Build frontend dist
         run: cargo build --locked
       - name: Verify build didn't modify tracked files
@@ -94,17 +125,31 @@ jobs:
         # `ronten-<version>/` prefix, hence the end-anchor-only pattern.
         run: |
           tar -tzf target/package/ronten-*.crate | grep -q 'frontend/dist/index\.html$'
+      - name: Install from the packaged crate and smoke-test
+        # What a `cargo install ronten` user actually gets: unpack the real
+        # .crate (its build.rs must use the shipped frontend/dist without
+        # touching npm), install it, and run it. build.rs's packaged-crate
+        # branch never invokes npm — enforced by the git-diff check above
+        # staying clean plus this install succeeding from the crate contents
+        # alone.
+        run: |
+          mkdir -p /tmp/crate-smoke
+          tar -xzf target/package/ronten-*.crate -C /tmp/crate-smoke
+          cargo install --locked --path /tmp/crate-smoke/ronten-* --root /tmp/crate-smoke/install
+          /tmp/crate-smoke/install/bin/ronten --version
+          /tmp/crate-smoke/install/bin/ronten schema --output > /dev/null
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: frontend
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: "20.20.2"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - name: Install

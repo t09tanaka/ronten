@@ -1,0 +1,35 @@
+# cargo-deny policy: security advisories, license allowlist, and source
+# provenance are CI gates (see the `supply-chain` job in ci.yml).
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Every license expression in the dependency tree must be satisfiable from
+# this list alone. Additions require a deliberate review, not a lockfile
+# drive-by.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CDLA-Permissive-2.0",
+]
+
+[bans]
+# Duplicate major versions are tolerated (e.g. sha2 0.10 direct vs 0.11 via
+# rust-embed) but surfaced in CI logs; wildcard requirements are not.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
