@@ -8,7 +8,7 @@ use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::ConcernsInput;
 use crate::review::serve_session;
 use crate::server::new_token;
-use crate::session::{Draft, Phase, SessionState};
+use crate::session::{DraftSlot, Phase, SessionState};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
@@ -51,8 +51,7 @@ pub async fn run(args: DemoArgs) -> u8 {
         snapshot,
         repo_root: None,
         started_at: chrono::Utc::now(),
-        draft: Mutex::new(Draft::default()),
-        phase: Mutex::new(Phase::Reviewing),
+        phase: Mutex::new(Phase::Reviewing(DraftSlot::default())),
         outcome_tx: tx,
     });
 

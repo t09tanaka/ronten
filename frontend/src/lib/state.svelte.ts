@@ -8,6 +8,7 @@ import type {
   ConcernDraft,
   ConcernView,
   Draft,
+  FinishedKind,
   HunkRef,
   Session,
   Side,
@@ -18,6 +19,15 @@ import { buildUnmappedSet, isUnmappedInSet } from './unmappedLines'
 const SAVE_DEBOUNCE_MS = 500
 
 export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error'
+
+/** UI phase for a server-reported ending. A timeout renders as the aborted
+ * screen: from the reviewer's side both mean "this session ended without a
+ * decision". */
+export function phaseForFinished(finished: FinishedKind | null): Phase {
+  if (finished === 'submitted') return 'submitted'
+  if (finished === 'aborted' || finished === 'timeout') return 'aborted'
+  return 'review'
+}
 export type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
 export interface CommentTarget {
@@ -26,7 +36,7 @@ export interface CommentTarget {
   line: number
 }
 
-class ReviewState {
+export class ReviewState {
   session = $state<Session | null>(null)
   draft = $state<Draft>({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
   selectedIdx = $state(0)
@@ -35,10 +45,22 @@ class ReviewState {
   submitError = $state<string | null>(null)
   pendingCommentTarget = $state<CommentTarget | null>(null)
   saveState = $state<SaveState>('idle')
+  /** True once a save was refused because another tab saved first. Saving
+   * stays off until the user reloads — retrying would overwrite that tab's
+   * draft. A persistent banner tells the user to reload. */
+  draftConflict = $state(false)
 
   #saveTimer: ReturnType<typeof setTimeout> | null = null
   #saveInFlight = false
   #saveQueued = false
+  /** Revision the server holds for our draft; echoed on every PUT and
+   * replaced with the one the server returns on success. */
+  #revision = 0
+
+  /** Server-side validation limits (null until the session has loaded). */
+  get limits() {
+    return this.session?.limits ?? null
+  }
 
   get selected(): ConcernView | null {
     return this.session?.concerns[this.selectedIdx] ?? null
@@ -179,8 +201,9 @@ class ReviewState {
         ackIdx.has(i),
       )
       this.draft = { ...session.draft, acknowledged_opaque: acked }
+      this.#revision = session.draft_revision
       this.selectedIdx = 0
-      this.phase = session.submitted ? 'submitted' : 'review'
+      this.phase = phaseForFinished(session.finished)
     } catch {
       this.phase = 'error'
     }
@@ -192,7 +215,7 @@ class ReviewState {
   }
 
   scheduleSave(): void {
-    if (this.#locked) return
+    if (this.#locked || this.draftConflict) return
     if (this.#saveTimer != null) clearTimeout(this.#saveTimer)
     this.#saveTimer = setTimeout(() => {
       this.#saveTimer = null
@@ -205,6 +228,7 @@ class ReviewState {
   // it finishes. This prevents an older payload from racing past a newer
   // one and overwriting it on the server.
   async #runSave(): Promise<void> {
+    if (this.draftConflict) return
     if (this.#saveInFlight) {
       this.#saveQueued = true
       return
@@ -214,7 +238,24 @@ class ReviewState {
     try {
       do {
         this.#saveQueued = false
-        await saveDraft(this.draft)
+        const result = await saveDraft(this.draft, this.#revision)
+        if (!result.ok) {
+          if (result.error === 'session finished') {
+            // The session ended elsewhere; join the matching terminal
+            // state (an abort must not render as "submitted") rather than
+            // surfacing a save error.
+            this.phase = phaseForFinished(result.finished ?? 'submitted')
+            this.saveState = 'idle'
+          } else {
+            // Draft conflict: another tab saved a newer revision. Retrying
+            // would overwrite it, so autosave stays off until a reload.
+            this.draftConflict = true
+            this.#cancelPendingSave()
+            this.saveState = 'error'
+          }
+          return
+        }
+        this.#revision = result.revision
       } while (this.#saveQueued)
       this.saveState = 'saved'
     } catch {
@@ -233,14 +274,29 @@ class ReviewState {
   }
 
   async submitReview(): Promise<void> {
-    if (this.#locked || this.submitting) return
+    // A tab that already lost the draft-conflict race must not submit: the
+    // server would refuse it anyway, and locally it would look like a
+    // transient error rather than the standing "reload" condition.
+    if (this.#locked || this.submitting || this.draftConflict) return
     this.#cancelPendingSave()
     this.submitting = true
     this.submitError = null
     try {
-      const result = await submit(this.draft)
+      const result = await submit(this.draft, this.#revision)
       if ('ok' in result) {
         this.phase = 'submitted'
+        return
+      }
+      if (result.error === 'draft conflict') {
+        // Same standing condition as a conflicting save: stop autosave and
+        // show the reload banner instead of a transient submit error.
+        this.draftConflict = true
+        this.#cancelPendingSave()
+        this.saveState = 'error'
+        return
+      }
+      if (result.error === 'session finished') {
+        this.phase = phaseForFinished(result.finished ?? 'submitted')
         return
       }
       const parts = [result.error]

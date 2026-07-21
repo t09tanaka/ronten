@@ -245,6 +245,8 @@
     return out.join('')
   }
 
+  const maxCommentChars = $derived(rs.limits?.max_comment_chars)
+
   const submitTitle = $derived(
     !rs.allReviewed
       ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
@@ -284,6 +286,12 @@
         {#if rs.saveState === 'saving'}Saving…{:else if rs.saveState === 'saved'}Saved{:else if rs.saveState === 'error'}Save failed{/if}
       </span>
     </header>
+    {#if rs.draftConflict}
+      <div class="conflict-banner" role="alert">
+        This review was edited in another tab. Changes made here are no longer being saved —
+        reload the page to continue.
+      </div>
+    {/if}
     {#if rs.session.warnings.length > 0 && !warningsDismissed}
       <div class="warnings-banner">
         <div class="warnings-banner-header">
@@ -321,7 +329,7 @@
           <button
             type="button"
             class="btn-primary"
-            disabled={!rs.allReviewed || !rs.allOpaqueAcked}
+            disabled={!rs.allReviewed || !rs.allOpaqueAcked || rs.draftConflict}
             title={submitTitle}
             onclick={openSubmitConfirm}>Submit review</button
           >
@@ -366,7 +374,11 @@
             bind:value={generalCommentText}
             placeholder="Add a general comment…"
             rows="3"
+            maxlength={maxCommentChars}
           ></textarea>
+          {#if maxCommentChars != null && generalCommentText.length > maxCommentChars * 0.9}
+            <span class="char-count">{generalCommentText.length}/{maxCommentChars}</span>
+          {/if}
           <button
             type="button"
             class="btn-outline"
@@ -619,6 +631,16 @@
     cursor: not-allowed;
   }
 
+  /* Persistent: unlike the warnings banner there is no dismiss — the only
+     way out is a reload, so the message must stay visible. */
+  .conflict-banner {
+    padding: 8px 16px;
+    background: var(--c-shu-tint);
+    border-bottom: 1px solid var(--c-shu-tint-2);
+    color: var(--c-shu);
+    font-size: 13px;
+  }
+
   .warnings-banner {
     padding: 8px 16px;
     background: var(--c-odo-tint);
@@ -840,6 +862,15 @@
 
   .general-comments > .btn-outline {
     margin-top: 8px;
+  }
+
+  .char-count {
+    display: block;
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--c-ink-3);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
   }
 
   .general-comment-list {

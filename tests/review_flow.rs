@@ -131,13 +131,18 @@ fn api_base(url: &str) -> String {
     format!("{origin}/api/{token}")
 }
 
+/// Complete submit body (wire shape `{revision, draft}`) at revision 0 —
+/// these tests never save a draft first.
 fn full_draft(verdict: &str) -> serde_json::Value {
     serde_json::json!({
-        "concerns": {
-            "edit": {"verdict": verdict, "comments": []},
-            "add": {"verdict": "approve", "comments": []}
-        },
-        "general_comments": []
+        "revision": 0,
+        "draft": {
+            "concerns": {
+                "edit": {"verdict": verdict, "comments": []},
+                "add": {"verdict": "approve", "comments": []}
+            },
+            "general_comments": []
+        }
     })
 }
 
@@ -286,13 +291,16 @@ fn request_changes_exits_1() {
     let (child, url) = spawn_review(td.path(), &[]);
 
     let draft = serde_json::json!({
-        "concerns": {
-            "edit": {"verdict": "request-changes", "comments": [
-                {"path": "a.txt", "side": "new", "line": 2, "body": "please fix TWO"}
-            ]},
-            "add": {"verdict": "approve", "comments": []}
-        },
-        "general_comments": []
+        "revision": 0,
+        "draft": {
+            "concerns": {
+                "edit": {"verdict": "request-changes", "comments": [
+                    {"path": "a.txt", "side": "new", "line": 2, "body": "please fix TWO"}
+                ]},
+                "add": {"verdict": "approve", "comments": []}
+            },
+            "general_comments": []
+        }
     });
     let resp = ureq::post(&format!("{}/submit", api_base(&url)))
         .send_json(draft)
