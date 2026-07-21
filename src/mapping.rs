@@ -10,6 +10,7 @@
 
 use crate::gitdiff::{FileDiff, LineKind};
 use crate::model::{ConcernsInput, Severity, Side, Warning, SUPPORTED_VERSION};
+use crate::termsafe::sanitize;
 use serde::Serialize;
 
 /// Reserved concern id for the synthetic "everything nobody claimed" bucket
@@ -128,14 +129,16 @@ pub fn validate_concerns(input: &ConcernsInput) -> Result<(), String> {
             if loc.start == Some(0) || loc.end == Some(0) {
                 return Err(format!(
                     "concern {:?}: location {}: line numbers are 1-based (0 is invalid)",
-                    c.id, loc.path
+                    c.id,
+                    sanitize(&loc.path)
                 ));
             }
             if let (Some(start), Some(end)) = (loc.start, loc.end) {
                 if start > end {
                     return Err(format!(
                         "concern {:?}: location {}: start {start} is greater than end {end}",
-                        c.id, loc.path
+                        c.id,
+                        sanitize(&loc.path)
                     ));
                 }
             }

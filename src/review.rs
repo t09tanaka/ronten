@@ -358,12 +358,17 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let input: ConcernsInput = match serde_json::from_str(&raw) {
         Ok(input) => input,
         Err(e) => {
-            eprintln!("invalid concerns JSON: {e}");
+            eprintln!("invalid concerns JSON: {}", sanitize(&e.to_string()));
             return exitcode::INPUT;
         }
     };
     if let Err(e) = validate_concerns(&input) {
-        eprintln!("invalid concerns: {e}");
+        // `e` may already carry a sanitized `loc.path` token (see
+        // `validate_concerns`), but the message is passed through `sanitize`
+        // again regardless — it is cheap (a no-op scan) and makes this print
+        // site safe on its own even if some future error string forgets to
+        // sanitize a field itself.
+        eprintln!("invalid concerns: {}", sanitize(&e));
         return exitcode::INPUT;
     }
 

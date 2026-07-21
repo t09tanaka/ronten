@@ -482,15 +482,15 @@ fn out_written_even_if_stdout_closed() {
 }
 
 #[test]
-fn out_write_failure_exits_15_with_stdout_intact() {
+fn out_reservation_failure_exits_15_before_start() {
     // The parent directory of `--out` doesn't exist. Since `--out` is now
     // reserved (atomically, via `create_new`) before the server ever starts,
     // this failure surfaces at that reservation step rather than at the
     // final write: the process exits with OUT_FAILED before printing the
     // session URL or accepting a submission at all, so stdout stays empty
-    // (there is no review outcome to carry) — unlike the pre-reservation
-    // design, where the outcome was already decided and only the final
-    // write failed.
+    // (there is no review outcome to carry) — unlike the late-write-failure
+    // path (see `out_late_write_failure_exits_15_with_stdout_intact` below),
+    // where the outcome was already decided and only the final write failed.
     let td = fixture_repo();
     let code = expect_exit(
         td.path(),
@@ -510,6 +510,47 @@ fn out_write_failure_exits_15_with_stdout_intact() {
         !td.path().join("no-such-dir").exists(),
         "the missing parent directory must not have been created as a side effect"
     );
+}
+
+/// Companion to `out_reservation_failure_exits_15_before_start`, covering the
+/// other (reachable) way to hit `OUT_FAILED`: a write failure *after* the
+/// session has already started and a decision has been reached. The
+/// reservation placeholder is created successfully (so the session starts
+/// normally and accepts a submission), but by the time `write_out_atomic`
+/// renames its temp file over the reserved path at submit time, that path has
+/// been replaced with a directory — the rename fails, `--out` is not written,
+/// and the process exits `OUT_FAILED` (15). Unlike the pre-start reservation
+/// failure, the review outcome already exists by then, so stdout must still
+/// carry the full result JSON: `--out` failing must never cost the caller the
+/// only other copy of the decision.
+#[test]
+fn out_late_write_failure_exits_15_with_stdout_intact() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--out", "result.json"]);
+    assert!(
+        td.path().join("result.json").exists(),
+        "the placeholder must be reserved before the session is reachable over HTTP"
+    );
+
+    // Swap the reserved placeholder for a directory: `write_out_atomic`'s
+    // final `rename(tmp, path)` fails when `path` is a (non-empty-target)
+    // directory, deterministically reproducing the post-submit write
+    // failure without relying on any timing race.
+    std::fs::remove_file(td.path().join("result.json")).unwrap();
+    std::fs::create_dir(td.path().join("result.json")).unwrap();
+
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(15));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must still carry the result JSON: {e}: {stdout:?}"));
+    assert_eq!(result["decision"], "approve");
 }
 
 /// Spawns `ronten review` (with `--base main --concerns concerns.json
@@ -1259,4 +1300,100 @@ fn reserved_id_exits_10() {
         ],
     );
     assert_eq!(code, 10);
+}
+
+/// The concerns file is untrusted input, and `validate_concerns` interpolates
+/// a location's `path` straight into its error message. A `path` carrying a
+/// raw ESC byte (plus a newline, for good measure) must not reach stderr
+/// unescaped — that would let the concerns file forge extra terminal/log
+/// lines or ANSI-inject the rest of the output. This is the cleanest trigger
+/// for that print site: `start: 0` is rejected by `validate_concerns` (line
+/// numbers are 1-based) before any diff mapping happens, so the message is
+/// guaranteed to include the offending `path` verbatim.
+#[test]
+fn concerns_error_output_escapes_control_chars() {
+    let td = fixture_repo();
+    let evil = "{\"version\":1,\"concerns\":[\
+      {\"id\":\"edit\",\"title\":\"Edit\",\"risk\":\"low\",\"locations\":\
+      [{\"path\":\"a.txt\\u001bevil\\ninjected\",\"start\":0}]}]}";
+    std::fs::write(td.path().join("evil.json"), evil).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "evil.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    assert_eq!(out.status.code(), Some(10));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("⟨U+001B⟩"),
+        "stderr must escape the raw ESC byte from the concerns path as a visible token: {stderr}"
+    );
+    assert!(
+        stderr.contains("⟨U+000A⟩"),
+        "stderr must escape the embedded newline from the concerns path as a visible token: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "stderr must not contain a raw, unescaped ESC byte: {stderr:?}"
+    );
+    // The path's own embedded "\n" must not survive as a real newline: every
+    // line that mentions the concerns error is the one line printed by
+    // `eprintln!`, not split into extra forged lines by the raw byte.
+    let matching_lines: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("invalid concerns"))
+        .collect();
+    assert_eq!(
+        matching_lines.len(),
+        1,
+        "the embedded newline must not have forged an extra log line: {stderr:?}"
+    );
+}
+
+/// Companion to `concerns_error_output_escapes_control_chars` covering the
+/// other raw-bytes-reach-stderr path: `deny_unknown_fields` embeds the
+/// offending field name verbatim in serde's error `Display`, and that error
+/// is printed at the JSON-parse site (`invalid concerns JSON: ...`), a
+/// different print site than `validate_concerns`'s. A control character in an
+/// unknown field name must be escaped there too.
+#[test]
+fn concerns_json_unknown_field_error_escapes_control_chars() {
+    let td = fixture_repo();
+    let evil = "{\"version\":1,\"concerns\":[\
+      {\"id\":\"edit\",\"title\":\"Edit\",\"risk\":\"low\",\"locations\":[],\
+      \"evil\\u001bfield\":true}]}";
+    std::fs::write(td.path().join("evil_field.json"), evil).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "evil_field.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    assert_eq!(out.status.code(), Some(10));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("⟨U+001B⟩"),
+        "stderr must escape the raw ESC byte from the unknown field name as a visible token: {stderr}"
+    );
+    assert!(
+        !stderr.contains('\x1b'),
+        "stderr must not contain a raw, unescaped ESC byte: {stderr:?}"
+    );
 }

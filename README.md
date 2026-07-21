@@ -166,9 +166,16 @@ while kill -0 "$RONTEN_PID" 2>/dev/null; do
 done
 wait "$RONTEN_PID"
 EXIT_CODE=$?
-# result.json holds the real result only when EXIT_CODE is 0 or 1; on
-# abort/timeout (2/3) or a rejected/failed --out (15) it is absent again —
-# the exit code is the only signal either way.
+# result.json holds the real result only when EXIT_CODE is 0 or 1. On
+# abort/timeout (2/3) it is absent again. Exit 15 splits in two: if --out
+# was refused before the session ever started (e.g. the target already
+# existed from a previous run), that pre-existing file is left present and
+# UNTOUCHED — it never held this run's result and must not be assumed
+# empty/absent or auto-deleted. If the reservation succeeded but the final
+# write itself failed after a decision was reached, the placeholder is
+# removed, so the file is genuinely absent again. Either way, the exit code
+# is the only reliable signal of the outcome; treat any pre-existing
+# result.json on a 15 as needing manual triage, not cleanup.
 ```
 
 Either way, `ronten review` remains a single foreground-equivalent process for the duration
