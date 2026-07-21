@@ -3,7 +3,7 @@
 //! turn a submitted draft into a `ResultOutput`.
 
 use crate::gitdiff::FileDiff;
-use crate::mapping::{HunkRef, Mapping, UNMAPPED_ID};
+use crate::mapping::{HunkRef, Mapping, UnmappedLine, UNMAPPED_ID};
 use crate::model::{
     derive_decision, Comment, ConcernResult, ConcernsInput, ResultOutput, Risk, Side, Verdict,
     SUPPORTED_VERSION,
@@ -57,6 +57,7 @@ pub struct SessionPayload<'a> {
     pub summary: Option<&'a str>,
     pub files: &'a [FileDiff],
     pub concerns: Vec<ConcernView<'a>>,
+    pub unmapped_lines: &'a [UnmappedLine],
     pub warnings: &'a [String],
     pub draft: Draft,
     pub submitted: bool,

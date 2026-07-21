@@ -92,6 +92,7 @@ async fn get_session(
         summary: state.summary.as_deref(),
         files: &state.files,
         concerns,
+        unmapped_lines: &state.mapping.unmapped_lines,
         warnings: &state.mapping.warnings,
         draft,
         submitted,

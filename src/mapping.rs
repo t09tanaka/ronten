@@ -1,10 +1,14 @@
 //! Maps git diff hunks to agent-declared concerns.
 //!
-//! A hunk intersecting multiple concern locations belongs to all of them
-//! (overlap is allowed). Hunks (or hunk-less files) claimed by no concern
-//! are reported in `Mapping.unmapped`.
+//! A concern claims individual changed (`Add`/`Remove`) lines, not whole
+//! hunks by range intersection — a location only claims a line whose own
+//! line number falls in its range, never a hunk's context lines. The same
+//! changed line may be claimed by multiple concerns (overlap is allowed).
+//! A hunk is displayed under a concern once it claims at least one changed
+//! line inside it. Changed lines (and hunk-less files) claimed by no
+//! concern are reported in `Mapping.unmapped_lines` / `Mapping.unmapped`.
 
-use crate::gitdiff::FileDiff;
+use crate::gitdiff::{FileDiff, LineKind};
 use crate::model::{ConcernsInput, Side, SUPPORTED_VERSION};
 use serde::Serialize;
 
@@ -28,11 +32,22 @@ pub struct MappedConcern {
     pub hunks: Vec<HunkRef>,
 }
 
+/// A single unclaimed changed line (`_unmapped` highlight target).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct UnmappedLine {
+    pub file: usize,
+    /// `Add` lines are `Side::New`, `Remove` lines are `Side::Old`.
+    pub side: Side,
+    /// The line number on `side` (`new_no` for `Add`, `old_no` for `Remove`).
+    pub line: u32,
+}
+
 /// The result of resolving every concern's locations against a diff.
 #[derive(Debug)]
 pub struct Mapping {
     pub concerns: Vec<MappedConcern>,
     pub unmapped: Vec<HunkRef>,
+    pub unmapped_lines: Vec<UnmappedLine>,
     pub warnings: Vec<String>,
 }
 
@@ -129,61 +144,127 @@ pub fn validate_concerns(input: &ConcernsInput) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolves every concern's locations against the diff's files/hunks.
+/// Sort key for `UnmappedLine.side` in `(file, side, line)` order (`Old`
+/// before `New`); `Side` itself has no `Ord` since nothing else needs one.
+fn side_sort_key(side: Side) -> u8 {
+    match side {
+        Side::Old => 0,
+        Side::New => 1,
+    }
+}
+
+/// Resolves every concern's locations against the diff's individual changed
+/// lines.
 ///
-/// - `side: "new"` intersects a hunk's new range against `file.new_path`;
-///   `side: "old"` intersects the old range against `file.old_path`.
+/// - Path matching is unchanged from whole-hunk mapping: `side: "old"`
+///   matches against `file.old_path`; `"new"` or an unspecified side matches
+///   against `file.new_path`.
 /// - Missing `start`/`end` default to `1`/`u32::MAX` (i.e. the whole file).
+/// - A location claims a changed line when the line's own number (not the
+///   hunk's range) falls in `[start, end]`: `side: "new"` only considers
+///   `Add` lines (by `new_no`); `"old"` only `Remove` lines (by `old_no`);
+///   an unspecified side considers both. Context lines are never claimable,
+///   so a range that only overlaps context claims nothing.
 /// - Hunk-less files (binary/pure rename) are only claimable by whole-file
-///   locations (no `start` and no `end`), as `HunkRef { hunk: None }`.
-/// - A location matching zero hunks produces a warning, never an error.
-/// - Hunks (and hunk-less files) claimed by no concern land in `unmapped`.
+///   locations (no `start` and no `end`), as `HunkRef { hunk: None }`, same
+///   as before.
+/// - A concern's displayed `hunks` are the distinct `(file, hunk)` pairs
+///   (plus any hunk-less files) it claimed at least one line/whole-file in,
+///   sorted by `(file, hunk)`.
+/// - A location that claims nothing (no changed line, no hunk-less file)
+///   produces a warning, never an error.
+/// - `unmapped_lines` lists every changed line no concern claimed, sorted by
+///   `(file, side, line)`.
+/// - `unmapped` lists hunk-less files no concern claimed whole, plus every
+///   hunk that still contains at least one line in `unmapped_lines` — a
+///   concern partially claiming a hunk no longer hides the rest of that
+///   hunk's changes.
 pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
-    let mut warnings = Vec::new();
-    let mut claimed: std::collections::HashSet<HunkRef> = Default::default();
-    let mut concerns = Vec::new();
-    for c in &input.concerns {
-        let mut refs: Vec<HunkRef> = Vec::new();
-        for loc in &c.locations {
-            let side = loc.side.unwrap_or(Side::New);
-            let mut matched = false;
-            for (fi, file) in files.iter().enumerate() {
-                let path = match side {
-                    Side::New => file.new_path.as_deref(),
-                    Side::Old => file.old_path.as_deref(),
-                };
-                if path != Some(loc.path.as_str()) {
-                    continue;
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    // Step 1: per-file changed-line lists, and path -> file-index maps so
+    // the concern/location sweep below never linearly rescans `files`.
+    let mut adds: Vec<Vec<(usize, u32)>> = vec![Vec::new(); files.len()];
+    let mut removes: Vec<Vec<(usize, u32)>> = vec![Vec::new(); files.len()];
+    let mut by_new_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut by_old_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (fi, file) in files.iter().enumerate() {
+        if let Some(p) = file.new_path.as_deref() {
+            by_new_path.entry(p).or_default().push(fi);
+        }
+        if let Some(p) = file.old_path.as_deref() {
+            by_old_path.entry(p).or_default().push(fi);
+        }
+        for (hi, h) in file.hunks.iter().enumerate() {
+            for line in &h.lines {
+                match line.kind {
+                    LineKind::Add => {
+                        if let Some(no) = line.new_no {
+                            adds[fi].push((hi, no));
+                        }
+                    }
+                    LineKind::Remove => {
+                        if let Some(no) = line.old_no {
+                            removes[fi].push((hi, no));
+                        }
+                    }
+                    LineKind::Context => {}
                 }
+            }
+        }
+    }
+
+    // Step 2: claim sets.
+    let mut warnings = Vec::new();
+    let mut claimed_adds: HashSet<(usize, u32)> = HashSet::new();
+    let mut claimed_removes: HashSet<(usize, u32)> = HashSet::new();
+    let mut claimed_hunkless: HashSet<usize> = HashSet::new();
+    let mut concerns = Vec::new();
+
+    // Step 3: each concern's each location.
+    for c in &input.concerns {
+        let mut covered_hunks: BTreeSet<(usize, Option<usize>)> = BTreeSet::new();
+        for loc in &c.locations {
+            let file_indices: &[usize] = match loc.side.unwrap_or(Side::New) {
+                Side::New => by_new_path.get(loc.path.as_str()),
+                Side::Old => by_old_path.get(loc.path.as_str()),
+            }
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+            let want_adds = !matches!(loc.side, Some(Side::Old));
+            let want_removes = !matches!(loc.side, Some(Side::New));
+            let start = loc.start.unwrap_or(1);
+            let end = loc.end.unwrap_or(u32::MAX);
+            let mut matched = false;
+
+            for &fi in file_indices {
+                let file = &files[fi];
                 if file.hunks.is_empty() && loc.start.is_none() && loc.end.is_none() {
-                    refs.push(HunkRef {
-                        file: fi,
-                        hunk: None,
-                    });
+                    covered_hunks.insert((fi, None));
+                    claimed_hunkless.insert(fi);
                     matched = true;
                     continue;
                 }
-                for (hi, h) in file.hunks.iter().enumerate() {
-                    let (hs, hc) = match side {
-                        Side::New => (h.new_start, h.new_count),
-                        Side::Old => (h.old_start, h.old_count),
-                    };
-                    let he = if hc == 0 {
-                        hs
-                    } else {
-                        hs.saturating_add(hc - 1)
-                    };
-                    let ls = loc.start.unwrap_or(1);
-                    let le = loc.end.unwrap_or(u32::MAX);
-                    if hs.max(ls) <= he.min(le) {
-                        refs.push(HunkRef {
-                            file: fi,
-                            hunk: Some(hi),
-                        });
-                        matched = true;
+                if want_adds {
+                    for &(hi, no) in &adds[fi] {
+                        if no >= start && no <= end {
+                            claimed_adds.insert((fi, no));
+                            covered_hunks.insert((fi, Some(hi)));
+                            matched = true;
+                        }
+                    }
+                }
+                if want_removes {
+                    for &(hi, no) in &removes[fi] {
+                        if no >= start && no <= end {
+                            claimed_removes.insert((fi, no));
+                            covered_hunks.insert((fi, Some(hi)));
+                            matched = true;
+                        }
                     }
                 }
             }
+
             if !matched {
                 let range = match (loc.start, loc.end) {
                     (Some(s), Some(e)) => format!(":{s}-{e}"),
@@ -191,42 +272,79 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
                     (None, Some(e)) => format!(":-{e}"),
                     (None, None) => String::new(),
                 };
-                warnings.push(format!("location matched no hunks: {}{}", loc.path, range));
+                warnings.push(format!(
+                    "location matched no changed lines: {}{}",
+                    loc.path, range
+                ));
             }
         }
-        refs.sort_by_key(|r| (r.file, r.hunk));
-        refs.dedup();
-        claimed.extend(refs.iter().copied());
+
+        // Step 4: concern's display hunks, sorted (file, hunk).
+        let hunks: Vec<HunkRef> = covered_hunks
+            .into_iter()
+            .map(|(file, hunk)| HunkRef { file, hunk })
+            .collect();
         concerns.push(MappedConcern {
             id: c.id.clone(),
-            hunks: refs,
+            hunks,
         });
     }
+
+    // Step 5: every changed line no concern claimed, tracking which hunks
+    // they live in as we go (needed for step 6).
+    let mut unmapped_lines = Vec::new();
+    let mut unmapped_hunks_set: HashSet<(usize, usize)> = HashSet::new();
+    for fi in 0..files.len() {
+        for &(hi, no) in &adds[fi] {
+            if !claimed_adds.contains(&(fi, no)) {
+                unmapped_lines.push(UnmappedLine {
+                    file: fi,
+                    side: Side::New,
+                    line: no,
+                });
+                unmapped_hunks_set.insert((fi, hi));
+            }
+        }
+        for &(hi, no) in &removes[fi] {
+            if !claimed_removes.contains(&(fi, no)) {
+                unmapped_lines.push(UnmappedLine {
+                    file: fi,
+                    side: Side::Old,
+                    line: no,
+                });
+                unmapped_hunks_set.insert((fi, hi));
+            }
+        }
+    }
+    unmapped_lines.sort_by_key(|l| (l.file, side_sort_key(l.side), l.line));
+
+    // Step 6: hunk-less files never whole-claimed, plus hunks with >=1
+    // unmapped line, in (file, hunk) order.
     let mut unmapped = Vec::new();
     for (fi, file) in files.iter().enumerate() {
         if file.hunks.is_empty() {
-            let r = HunkRef {
-                file: fi,
-                hunk: None,
-            };
-            if !claimed.contains(&r) {
-                unmapped.push(r);
+            if !claimed_hunkless.contains(&fi) {
+                unmapped.push(HunkRef {
+                    file: fi,
+                    hunk: None,
+                });
             }
         } else {
             for hi in 0..file.hunks.len() {
-                let r = HunkRef {
-                    file: fi,
-                    hunk: Some(hi),
-                };
-                if !claimed.contains(&r) {
-                    unmapped.push(r);
+                if unmapped_hunks_set.contains(&(fi, hi)) {
+                    unmapped.push(HunkRef {
+                        file: fi,
+                        hunk: Some(hi),
+                    });
                 }
             }
         }
     }
+
     Mapping {
         concerns,
         unmapped,
+        unmapped_lines,
         warnings,
     }
 }
@@ -234,12 +352,14 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gitdiff::{ChangeKind, ContentKind, Hunk};
+    use crate::gitdiff::{ChangeKind, ContentKind, DiffLine, Hunk};
     use crate::model::{Concern, Location, Risk};
 
     /// Fabricates a `FileDiff` with `old_path == new_path == path` and one
-    /// `Hunk` per `(old_start, old_count, new_start, new_count)` tuple, each
-    /// with empty `lines`.
+    /// `Hunk` per `(old_start, old_count, new_start, new_count)` tuple. Each
+    /// hunk's `lines` are auto-generated as fully changed (no context): a
+    /// `Remove` for every line in the old range, an `Add` for every line in
+    /// the new range — matching what a real diff hunk header describes.
     fn fd(path: &str, hunks: &[(u32, u32, u32, u32)]) -> FileDiff {
         FileDiff {
             old_path: Some(path.to_string()),
@@ -254,15 +374,87 @@ mod tests {
             new_size: None,
             hunks: hunks
                 .iter()
-                .map(|&(old_start, old_count, new_start, new_count)| Hunk {
-                    old_start,
-                    old_count,
-                    new_start,
-                    new_count,
-                    section: String::new(),
-                    lines: Vec::new(),
+                .map(|&(old_start, old_count, new_start, new_count)| {
+                    let mut lines = Vec::new();
+                    for i in 0..old_count {
+                        lines.push(DiffLine {
+                            kind: LineKind::Remove,
+                            content: String::new(),
+                            old_no: Some(old_start + i),
+                            new_no: None,
+                        });
+                    }
+                    for i in 0..new_count {
+                        lines.push(DiffLine {
+                            kind: LineKind::Add,
+                            content: String::new(),
+                            old_no: None,
+                            new_no: Some(new_start + i),
+                        });
+                    }
+                    Hunk {
+                        old_start,
+                        old_count,
+                        new_start,
+                        new_count,
+                        section: String::new(),
+                        lines,
+                    }
                 })
                 .collect(),
+        }
+    }
+
+    /// Fabricates a single-hunk `FileDiff` with explicit changed lines (from
+    /// `changed`, each `(kind, old_no, new_no)`) plus context lines (each
+    /// `n` becomes a `Context` line with `old_no == new_no == n`), combined
+    /// and ordered by line number.
+    fn fd_with_lines(
+        path: &str,
+        old_start: u32,
+        old_count: u32,
+        new_start: u32,
+        new_count: u32,
+        changed: &[(LineKind, Option<u32>, Option<u32>)],
+        context_lines: &[u32],
+    ) -> FileDiff {
+        let mut lines: Vec<DiffLine> = changed
+            .iter()
+            .map(|&(kind, old_no, new_no)| DiffLine {
+                kind,
+                content: String::new(),
+                old_no,
+                new_no,
+            })
+            .collect();
+        for &n in context_lines {
+            lines.push(DiffLine {
+                kind: LineKind::Context,
+                content: String::new(),
+                old_no: Some(n),
+                new_no: Some(n),
+            });
+        }
+        lines.sort_by_key(|l| l.new_no.or(l.old_no).unwrap_or(u32::MAX));
+        FileDiff {
+            old_path: Some(path.to_string()),
+            new_path: Some(path.to_string()),
+            change_kind: ChangeKind::Modified,
+            content_kind: ContentKind::Text,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            old_size: None,
+            new_size: None,
+            hunks: vec![Hunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                section: String::new(),
+                lines,
+            }],
         }
     }
 
@@ -335,7 +527,10 @@ mod tests {
             }]
         );
         assert_eq!(mapping.warnings.len(), 1);
-        assert_eq!(mapping.warnings[0], "location matched no hunks: a.ts:20-");
+        assert_eq!(
+            mapping.warnings[0],
+            "location matched no changed lines: a.ts:20-"
+        );
     }
 
     #[test]
@@ -357,7 +552,15 @@ mod tests {
                 new_start: 0,
                 new_count: 0,
                 section: String::new(),
-                lines: Vec::new(),
+                // 5 removed lines, no added lines (pure deletion).
+                lines: (1..=5)
+                    .map(|n| DiffLine {
+                        kind: LineKind::Remove,
+                        content: String::new(),
+                        old_no: Some(n),
+                        new_no: None,
+                    })
+                    .collect(),
             }],
         }];
         let inp = input(vec![concern(
@@ -425,7 +628,7 @@ mod tests {
         assert_eq!(mapping.concerns[0].hunks, Vec::new());
         assert_eq!(
             mapping.warnings,
-            vec!["location matched no hunks: a.ts:5-10".to_string()]
+            vec!["location matched no changed lines: a.ts:5-10".to_string()]
         );
     }
 
@@ -487,7 +690,7 @@ mod tests {
         assert_eq!(mapping.concerns[0].hunks, Vec::new());
         assert_eq!(
             mapping.warnings,
-            vec!["location matched no hunks: a.ts:-30".to_string()]
+            vec!["location matched no changed lines: a.ts:-30".to_string()]
         );
     }
 
@@ -515,36 +718,186 @@ mod tests {
     }
 
     #[test]
-    fn zero_count_hunk_collapses_to_start_on_matched_side() {
-        // Deletion hunk: new side has new_start=5, new_count=0, so its new
-        // range collapses to [5, 5]. A side-new location 5-5 matches; 6-6
-        // does not (the collapse changes the outcome: without it the range
-        // would be empty or extend past 5).
+    fn zero_new_count_hunk_has_no_add_lines_to_claim() {
+        // Pure-deletion hunk: old side removes lines 5,6,7; new side has
+        // new_count=0, i.e. no added lines exist at all. Under whole-hunk
+        // range intersection this used to be tested via the *range's*
+        // start/end collapsing when a count is 0; under changed-line
+        // claiming that collapse no longer exists — there is simply nothing
+        // on the `new` side to claim, and everything on the `old` side is a
+        // real removed line (no boundary quirk to special-case).
         let files = vec![fd("a.ts", &[(5, 3, 5, 0)])];
 
-        let hit = input(vec![concern(
+        // side=New can never match: there are zero Add lines in this hunk.
+        let new_side = input(vec![concern(
             "c1",
-            vec![loc("a.ts", None, Some(5), Some(5))],
+            vec![loc("a.ts", Some(Side::New), Some(5), Some(5))],
         )]);
-        let mapping_hit = resolve_mapping(&files, &hit);
+        let mapping_new = resolve_mapping(&files, &new_side);
+        assert_eq!(mapping_new.concerns[0].hunks, Vec::new());
         assert_eq!(
-            mapping_hit.concerns[0].hunks,
+            mapping_new.warnings,
+            vec!["location matched no changed lines: a.ts:5-5".to_string()]
+        );
+
+        // side=Old over the full removed range claims all three lines.
+        let old_side = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", Some(Side::Old), Some(5), Some(7))],
+        )]);
+        let mapping_old = resolve_mapping(&files, &old_side);
+        assert_eq!(
+            mapping_old.concerns[0].hunks,
             vec![HunkRef {
                 file: 0,
                 hunk: Some(0)
             }]
         );
-        assert!(mapping_hit.warnings.is_empty());
+        assert!(mapping_old.warnings.is_empty());
+        assert!(mapping_old.unmapped.is_empty());
+        assert!(mapping_old.unmapped_lines.is_empty());
+    }
 
-        let miss = input(vec![concern(
+    #[test]
+    fn context_only_intersection_does_not_claim() {
+        // hunk: new 10..=16, but the only changed line is the Add at new
+        // 13 — everything else (10,11,12,14,15,16) is context. A location
+        // covering only the context (10-12) must claim nothing.
+        let files = vec![fd_with_lines(
+            "a.ts",
+            10,
+            7,
+            10,
+            7,
+            &[(LineKind::Add, None, Some(13))],
+            &[10, 11, 12, 14, 15, 16],
+        )];
+        let inp = input(vec![concern(
             "c1",
-            vec![loc("a.ts", None, Some(6), Some(6))],
+            vec![loc("a.ts", None, Some(10), Some(12))],
         )]);
-        let mapping_miss = resolve_mapping(&files, &miss);
-        assert_eq!(mapping_miss.concerns[0].hunks, Vec::new());
+        let mapping = resolve_mapping(&files, &inp);
+        assert!(mapping.concerns[0].hunks.is_empty());
+        assert_eq!(mapping.warnings.len(), 1);
+        assert!(mapping.warnings[0].contains("matched no changed lines"));
+        // The only changed line is unclaimed -> its hunk is unmapped, and
+        // the line itself shows up in unmapped_lines.
         assert_eq!(
-            mapping_miss.warnings,
-            vec!["location matched no hunks: a.ts:6-6".to_string()]
+            mapping.unmapped,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert_eq!(
+            mapping.unmapped_lines,
+            vec![UnmappedLine {
+                file: 0,
+                side: Side::New,
+                line: 13
+            }]
+        );
+    }
+
+    #[test]
+    fn partially_claimed_hunk_reports_remaining_lines_unmapped() {
+        // One hunk with two Add lines (new 13, new 15); the location only
+        // claims 13. The hunk still shows up under the concern (it claimed
+        // >=1 line), but 15 remains in unmapped_lines, and the hunk itself
+        // still lands in `unmapped` because an unexplained change remains.
+        let files = vec![fd_with_lines(
+            "a.ts",
+            13,
+            3,
+            13,
+            3,
+            &[
+                (LineKind::Add, None, Some(13)),
+                (LineKind::Add, None, Some(15)),
+            ],
+            &[14],
+        )];
+        let inp = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(13), Some(13))],
+        )]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert_eq!(
+            mapping.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert_eq!(
+            mapping.unmapped_lines,
+            vec![UnmappedLine {
+                file: 0,
+                side: Side::New,
+                line: 15
+            }]
+        );
+        assert_eq!(
+            mapping.unmapped,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn unspecified_side_claims_both_adds_and_removes() {
+        // A modification: old10 removed, new10 added. A side-unspecified
+        // location on 10-10 must claim both.
+        let files = vec![fd_with_lines(
+            "a.ts",
+            10,
+            1,
+            10,
+            1,
+            &[
+                (LineKind::Remove, Some(10), None),
+                (LineKind::Add, None, Some(10)),
+            ],
+            &[],
+        )];
+        let inp = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(10), Some(10))],
+        )]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert!(mapping.unmapped.is_empty());
+        assert!(mapping.unmapped_lines.is_empty());
+    }
+
+    #[test]
+    fn old_side_location_claims_only_removes() {
+        let files = vec![fd_with_lines(
+            "a.ts",
+            10,
+            1,
+            10,
+            1,
+            &[
+                (LineKind::Remove, Some(10), None),
+                (LineKind::Add, None, Some(10)),
+            ],
+            &[],
+        )];
+        let inp = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", Some(Side::Old), Some(10), Some(10))],
+        )]);
+        let mapping = resolve_mapping(&files, &inp);
+        // The add at new10 is left unclaimed.
+        assert_eq!(
+            mapping.unmapped_lines,
+            vec![UnmappedLine {
+                file: 0,
+                side: Side::New,
+                line: 10
+            }]
         );
     }
 
