@@ -144,6 +144,10 @@ pub async fn run(args: ReviewArgs) -> u8 {
     // 1. Resolve repo root.
     let root = match repo_root() {
         Ok(root) => root,
+        Err(GitError::GitFailed(msg)) => {
+            eprintln!("git failed: {}", msg.trim());
+            return exitcode::GIT_FAILED;
+        }
         Err(_) => {
             eprintln!("not a git repository (run ronten from inside a git worktree)");
             return exitcode::NOT_A_REPO;
@@ -185,6 +189,10 @@ pub async fn run(args: ReviewArgs) -> u8 {
             eprintln!("not a git repository");
             return exitcode::NOT_A_REPO;
         }
+        Err(GitError::BudgetExceeded(msg)) => {
+            eprintln!("review too large: {msg}");
+            return exitcode::REVIEW_TOO_LARGE;
+        }
     };
     let files = diff_output.files;
     let diff_warnings = diff_output.warnings;
@@ -216,7 +224,9 @@ pub async fn run(args: ReviewArgs) -> u8 {
                 let status = drop_exempt(status, &root, &exempt);
                 (!status.is_clean()).then_some(status)
             }
-            Err(GitError::BadBase(msg)) | Err(GitError::GitFailed(msg)) => {
+            Err(GitError::BadBase(msg))
+            | Err(GitError::GitFailed(msg))
+            | Err(GitError::BudgetExceeded(msg)) => {
                 // The gate cannot run at all. Under the (default) Error
                 // policy an unverifiable worktree must not silently pass;
                 // under Warn the review proceeds with a notice.
