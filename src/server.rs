@@ -136,7 +136,8 @@ async fn json_payload_too_large(req: Request, next: Next) -> Response {
 /// 16 random bytes, rendered as lowercase hex — used as the session's
 /// unguessable URL token.
 pub fn new_token() -> String {
-    let bytes: [u8; 16] = rand::rng().random();
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
