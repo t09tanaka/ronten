@@ -721,26 +721,33 @@ pub async fn serve_session(
     match outcome {
         Outcome::Submitted(result) => {
             let json = serde_json::to_string_pretty(&result).expect("result serializes to JSON");
-            println!("{json}");
             let decision_code = match result.decision {
                 Decision::Approve => exitcode::APPROVED,
                 Decision::RequestChanges => exitcode::REQUEST_CHANGES,
             };
+            // `--out` is written before stdout: it is the durable,
+            // machine-readable record, so it must be confirmed (or fail
+            // loudly with OUT_FAILED) before the process risks losing the
+            // result to a stdout error. stdout is still attempted
+            // afterwards regardless of how this turns out, so a caller
+            // piping stdout gets the JSON whenever the pipe is alive.
+            let mut exit_code = decision_code;
             if let Some(reservation) = out {
                 // The rename below replaces the reserved placeholder with
                 // the real output; only on success does the reservation get
-                // disarmed. On failure it stays armed, so returning here
-                // drops it and best-effort removes the placeholder rather
-                // than leaving an empty file behind.
+                // disarmed. On failure it stays armed, so it best-effort
+                // removes the placeholder on drop rather than leaving an
+                // empty file behind.
                 match write_out_atomic(&reservation.path, &json) {
                     Ok(()) => reservation.disarm(),
                     Err(e) => {
                         eprintln!("failed to write {}: {e}", reservation.path.display());
-                        return exitcode::OUT_FAILED;
+                        exit_code = exitcode::OUT_FAILED;
                     }
                 }
             }
-            decision_code
+            write_result_to_stdout(&json);
+            exit_code
         }
         // Aborted and Timeout fall straight through to the implicit drop of
         // `out` at the end of this function: an armed `OutReservation`
@@ -748,6 +755,27 @@ pub async fn serve_session(
         // need to touch `out` themselves.
         Outcome::Aborted => exitcode::ABORTED,
         Outcome::Timeout => exitcode::TIMEOUT,
+    }
+}
+
+/// Writes the result JSON to stdout followed by a trailing newline, mirroring
+/// `println!`'s framing without its panic-on-error behavior. A broken pipe
+/// (the reader went away, e.g. `| head`) is expected and silently ignored:
+/// the result is already durable in `--out` when that flag was given, and
+/// there is no reader left to notice a stderr note either way. Any other
+/// stdout error is unusual enough to surface on stderr. Either way this never
+/// changes the process exit code — it is set by the decision (or by an
+/// `--out` failure) before this runs.
+fn write_result_to_stdout(json: &str) {
+    let mut stdout = std::io::stdout();
+    let result = stdout
+        .write_all(json.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush());
+    if let Err(e) = result {
+        if e.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("failed to write result to stdout: {e}");
+        }
     }
 }
 

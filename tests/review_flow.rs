@@ -398,6 +398,89 @@ fn out_flag_writes_file() {
     );
 }
 
+/// The `--out` file must be written even when stdout is closed. This test
+/// closes the parent's read end of the child's stdout pipe right after
+/// spawning, so the child's later write to stdout hits a closed pipe
+/// (`EPIPE`, surfaced by the Rust runtime as `io::ErrorKind::BrokenPipe`
+/// rather than a `SIGPIPE` kill). `--out` is written first and does not
+/// depend on stdout succeeding, so the result must still land on disk, the
+/// process must still exit with the decision code, and it must not panic.
+///
+/// This test manages the child's stderr itself (rather than via
+/// `spawn_review`'s shared helper) because it needs the *complete* stderr
+/// output — including anything written after the banner — to assert the
+/// absence of a panic message; the shared helper's background drain thread
+/// discards that tail.
+#[cfg(unix)]
+#[test]
+fn out_written_even_if_stdout_closed() {
+    use std::io::BufRead;
+    use std::io::Read as _;
+
+    let td = fixture_repo();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+            "--out",
+            "result.json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Drop our end of the stdout pipe now, before the child ever writes to
+    // it: once this end is closed, the child's write hits a broken pipe.
+    drop(child.stdout.take());
+
+    let stderr = child.stderr.take().unwrap();
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = String::new();
+    let mut stderr_so_far = String::new();
+    let url = loop {
+        line.clear();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "process exited before printing URL"
+        );
+        stderr_so_far.push_str(&line);
+        if let Some(rest) = line.trim().strip_prefix("Review session: ") {
+            break rest.to_string();
+        }
+    };
+
+    let (status, _) = common::post_json(
+        &format!("{}/submit", api_base(&url)),
+        &full_draft("approve"),
+    );
+    assert_eq!(status, 200);
+
+    // Read the rest of stderr to EOF: this both captures any later output
+    // (e.g. a would-be panic message) and blocks until the child exits,
+    // since EOF on this pipe only happens when the child closes it.
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    stderr_so_far.push_str(&rest);
+
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(0), "stderr: {stderr_so_far}");
+
+    let file = std::fs::read_to_string(td.path().join("result.json")).unwrap();
+    let result: serde_json::Value = serde_json::from_str(&file).unwrap();
+    assert_eq!(result["decision"], "approve");
+
+    assert!(
+        !stderr_so_far.to_lowercase().contains("panic"),
+        "stdout being closed must not panic: {stderr_so_far}"
+    );
+}
+
 #[test]
 fn out_write_failure_exits_15_with_stdout_intact() {
     // The parent directory of `--out` doesn't exist. Since `--out` is now
