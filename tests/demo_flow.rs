@@ -5,6 +5,8 @@
 
 use std::process::{Child, Command, Stdio};
 
+mod common;
+
 /// Reads the child's stderr line by line until the `Review session: <url>`
 /// banner and returns the URL. Panics if the process exits first.
 fn read_review_url(child: &mut Child) -> String {
@@ -47,11 +49,8 @@ fn api_base(url: &str) -> String {
 fn session_has_four_concerns_including_unmapped() {
     let (child, url) = spawn_demo();
 
-    let resp = ureq::get(&format!("{}/session", api_base(&url)))
-        .call()
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.into_json().unwrap();
+    let (status, body) = common::get_json(&format!("{}/session", api_base(&url)));
+    assert_eq!(status, 200);
 
     assert_eq!(body["title"], "ronten demo");
     let concerns = body["concerns"].as_array().unwrap();
@@ -71,9 +70,7 @@ fn session_has_four_concerns_including_unmapped() {
     let files = body["files"].as_array().unwrap();
     assert_eq!(files.len(), 3);
 
-    ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
+    common::post_empty(&format!("{}/abort", api_base(&url)));
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
@@ -82,10 +79,8 @@ fn session_has_four_concerns_including_unmapped() {
 fn abort_exits_2() {
     let (child, url) = spawn_demo();
 
-    let resp = ureq::post(&format!("{}/abort", api_base(&url)))
-        .call()
-        .unwrap();
-    assert_eq!(resp.status(), 200);
+    let (status, _) = common::post_empty(&format!("{}/abort", api_base(&url)));
+    assert_eq!(status, 200);
 
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(2));
