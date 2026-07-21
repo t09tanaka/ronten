@@ -225,6 +225,11 @@ pub async fn serve_session(
     // and is already in flight on `rx` — HTTP 200 must never coexist with a
     // timeout/abort exit.
     let outcome = tokio::select! {
+        // `biased` pins `rx.recv()` first, so an outcome that already
+        // arrived on the channel always wins over a simultaneous server-task
+        // death instead of `select!`'s default random pick occasionally
+        // taking the server-death branch and misreporting SERVER_FAILED.
+        biased;
         o = rx.recv() => o.expect("outcome channel closed before an outcome was sent"),
         _ = tokio::signal::ctrl_c() => {
             if state.try_finish(Terminal::Aborted) {

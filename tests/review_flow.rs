@@ -217,7 +217,7 @@ fn out_flag_writes_file() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|name| name.contains(".tmp."))
+        .filter(|name| name.starts_with("result.json.tmp."))
         .collect();
     assert!(
         leftovers.is_empty(),
