@@ -12,17 +12,27 @@ use crate::server::Outcome;
 use crate::snapshot::ReviewSnapshot;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
-use tokio::sync::mpsc::Sender;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
-/// How a session ended. Exactly one terminal state is ever set, via
-/// `SessionState::try_finish`, so submit/abort/timeout races resolve to a
-/// single winner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Terminal {
-    Submitted,
-    Aborted,
-    TimedOut,
+/// Locks a mutex, recovering the guard if a previous holder panicked. The
+/// data behind every session mutex stays structurally valid even when a
+/// panicking handler unwound mid-update (worst case: a stale draft), and
+/// propagating the poison would instead turn one panicked request into a
+/// permanently wedged session — every later lock would panic too, including
+/// the one the outcome waiter needs to finish the process.
+pub(crate) fn lock_ignore_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Where a session is in its lifecycle. The terminal claim and the outcome
+/// it resolved to live in one value behind one mutex, so claiming the
+/// terminal state and publishing the outcome are a single atomic step —
+/// there is no window where the session is finished but its outcome is not
+/// yet readable.
+#[derive(Debug)]
+pub enum Phase {
+    Reviewing,
+    Finished(Outcome),
 }
 
 /// Maximum number of comments per concern (and of general comments).
@@ -93,8 +103,15 @@ pub struct SessionState {
     pub repo_root: Option<std::path::PathBuf>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub draft: Mutex<Draft>,
-    pub finished: Mutex<Option<Terminal>>,
-    pub outcome_tx: Sender<Outcome>,
+    /// Lifecycle phase; see [`Phase`]. Written only by [`try_finish`].
+    ///
+    /// [`try_finish`]: SessionState::try_finish
+    pub phase: Mutex<Phase>,
+    /// Pure wake-up signal fired after `phase` transitions to `Finished`.
+    /// Deliberately carries no data: the outcome is read back from `phase`,
+    /// so the channel cannot disagree with the state and a receiver that
+    /// missed a notification still finds the outcome by reading `phase`.
+    pub outcome_tx: tokio::sync::watch::Sender<()>,
 }
 
 impl SessionState {
@@ -108,17 +125,37 @@ impl SessionState {
         ids
     }
 
-    /// Atomically claims the session's single terminal state. Returns `true`
-    /// if `t` won (the caller owns the outcome) or `false` if another path
-    /// already finished the session.
-    pub fn try_finish(&self, t: Terminal) -> bool {
-        let mut finished = self.finished.lock().unwrap();
-        if finished.is_some() {
-            false
-        } else {
-            *finished = Some(t);
-            true
+    /// Atomically claims the session's single terminal state *and* publishes
+    /// its outcome, then wakes the outcome waiter. Returns `true` if
+    /// `outcome` won or `false` if another path already finished the session
+    /// — in which case the winner's outcome is already readable via
+    /// [`finished_outcome`](Self::finished_outcome), because the claim and
+    /// the publish happen under one lock.
+    pub fn try_finish(&self, outcome: Outcome) -> bool {
+        let mut phase = lock_ignore_poison(&self.phase);
+        if matches!(*phase, Phase::Finished(_)) {
+            return false;
         }
+        *phase = Phase::Finished(outcome);
+        drop(phase);
+        // `send_replace` succeeds regardless of receiver liveness; and even
+        // if the waiter misses this wake-up entirely, it reads the outcome
+        // from `phase`, never from the channel.
+        self.outcome_tx.send_replace(());
+        true
+    }
+
+    /// The session's outcome, if it has finished.
+    pub fn finished_outcome(&self) -> Option<Outcome> {
+        match &*lock_ignore_poison(&self.phase) {
+            Phase::Reviewing => None,
+            Phase::Finished(outcome) => Some(outcome.clone()),
+        }
+    }
+
+    /// Whether the session has reached a terminal state.
+    pub fn is_finished(&self) -> bool {
+        matches!(&*lock_ignore_poison(&self.phase), Phase::Finished(_))
     }
 
     /// The hunks assigned to a concern id (`_unmapped` maps to the

@@ -325,6 +325,35 @@ fn abort_exits_2() {
     assert!(out.stdout.is_empty(), "stdout must be empty on abort");
 }
 
+/// Ctrl-C (SIGINT) with no submitted outcome must abort with exit code 2 and
+/// an empty stdout, and must do so promptly — the shutdown path has a hard
+/// deadline, so a signal can never leave the process hanging.
+#[cfg(unix)]
+#[test]
+fn sigint_aborts_exits_2() {
+    let td = fixture_repo();
+    let (child, _url) = spawn_review(td.path(), &[]);
+
+    let st = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(st.success());
+
+    let start = std::time::Instant::now();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        out.stdout.is_empty(),
+        "stdout must be empty on ctrl-c abort"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(10),
+        "sigint shutdown took too long: {:?}",
+        start.elapsed()
+    );
+}
+
 #[test]
 fn timeout_exits_3() {
     let td = fixture_repo();

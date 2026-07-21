@@ -6,13 +6,13 @@ use crate::gitdiff::{compute_diff, current_branch, has_tracked_changes, repo_roo
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
-use crate::session::{Draft, SessionState, Terminal};
+use crate::session::{Draft, Phase, SessionState};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::watch;
 
 /// Parsed CLI arguments for `ronten review`.
 #[derive(clap::Args, Debug)]
@@ -176,7 +176,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let title = args.title.clone().unwrap_or_else(|| current_branch(&root));
     let token = new_token();
     let summary = input.summary.clone();
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = watch::channel(());
     let state = Arc::new(SessionState {
         title,
         summary,
@@ -189,7 +189,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
         repo_root: Some(root),
         started_at: chrono::Utc::now(),
         draft: Mutex::new(Draft::default()),
-        finished: Mutex::new(None),
+        phase: Mutex::new(Phase::Reviewing),
         outcome_tx: tx,
     });
 
@@ -222,12 +222,18 @@ pub async fn run(args: ReviewArgs) -> u8 {
     .await
 }
 
+/// How long graceful shutdown may take after the outcome is known before the
+/// server task is aborted outright. Bounds the tail of the process: a stalled
+/// in-flight response (e.g. a client that stopped reading) can delay exit by
+/// at most this long.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
 /// Serve a prepared session until it reaches an outcome, then print the result
 /// and return the exit code. Shared by `review::run` and the demo command so
 /// both drive an identical serve/select/report loop.
 pub async fn serve_session(
     state: Arc<SessionState>,
-    mut rx: Receiver<Outcome>,
+    mut rx: watch::Receiver<()>,
     listener: TcpListener,
     url: String,
     no_open: bool,
@@ -262,35 +268,47 @@ pub async fn serve_session(
     // branch winning the select is always unexpected.
     let mut server_handle = tokio::spawn(async move { server.await });
 
-    // Every exit path races through the same compare-and-set terminal state.
-    // If ctrl-c or the deadline loses the race (a submit/abort handler
-    // already claimed the terminal), the handler's outcome is authoritative
-    // and is already in flight on `rx` — HTTP 200 must never coexist with a
-    // timeout/abort exit.
+    // Every exit path races through the same atomic `try_finish`. If ctrl-c
+    // or the deadline loses the race (a submit/abort handler already claimed
+    // the terminal), the winner's outcome is authoritative and — because the
+    // claim and the outcome publish are one atomic step — it is immediately
+    // readable from the session phase. No path here can wait forever: the
+    // watch channel is a pure wake-up, never the storage.
     let outcome = tokio::select! {
-        // `biased` pins `rx.recv()` first, so an outcome that already
-        // arrived on the channel always wins over a simultaneous server-task
+        // `biased` pins the outcome wake-up first, so an outcome that has
+        // already been published always wins over a simultaneous server-task
         // death instead of `select!`'s default random pick occasionally
         // taking the server-death branch and misreporting SERVER_FAILED.
         biased;
-        o = rx.recv() => o.expect("outcome channel closed before an outcome was sent"),
+        changed = rx.changed() => {
+            match state.finished_outcome() {
+                Some(outcome) => outcome,
+                None => {
+                    // Only reachable if the sender was dropped without a
+                    // finish, which cannot happen while `state` is alive —
+                    // but degrade to SERVER_FAILED rather than panic.
+                    debug_assert!(changed.is_err());
+                    eprintln!("outcome signal ended before a review outcome was recorded");
+                    return exitcode::SERVER_FAILED;
+                }
+            }
+        }
         _ = tokio::signal::ctrl_c() => {
-            if state.try_finish(Terminal::Aborted) {
+            if state.try_finish(Outcome::Aborted) {
                 Outcome::Aborted
             } else {
-                // Lost the CAS race to a submit/abort handler; if that
-                // handler died after winning but before sending on `rx`
-                // this would hang forever, but handlers `send` synchronously
-                // right after `try_finish` succeeds, so that gap is accepted.
-                rx.recv().await.expect("outcome channel closed before an outcome was sent")
+                // Lost the race to a submit/abort handler; its outcome is
+                // already published (same lock as the claim), so this read
+                // cannot block or miss.
+                state.finished_outcome().unwrap_or(Outcome::Aborted)
             }
         }
         _ = async { tokio::time::sleep(timeout.unwrap()).await }, if timeout.is_some() => {
-            if state.try_finish(Terminal::TimedOut) {
+            if state.try_finish(Outcome::Timeout) {
                 Outcome::Timeout
             } else {
-                // Same losing-race acceptance as the ctrl-c branch above.
-                rx.recv().await.expect("outcome channel closed before an outcome was sent")
+                // Same losing-race read as the ctrl-c branch above.
+                state.finished_outcome().unwrap_or(Outcome::Timeout)
             }
         }
         joined = &mut server_handle => {
@@ -305,8 +323,20 @@ pub async fn serve_session(
         }
     };
 
+    // Graceful shutdown with a hard deadline: in-flight responses (e.g. the
+    // submit ack) get up to SHUTDOWN_GRACE to flush; after that — or on a
+    // second ctrl-c — the server task is aborted so a stalled connection can
+    // never hold the process open indefinitely.
     notify.notify_one();
-    let _ = server_handle.await;
+    let finished_cleanly = tokio::select! {
+        _ = &mut server_handle => true,
+        _ = tokio::time::sleep(SHUTDOWN_GRACE) => false,
+        _ = tokio::signal::ctrl_c() => false,
+    };
+    if !finished_cleanly {
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
 
     match outcome {
         Outcome::Submitted(result) => {
