@@ -376,6 +376,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_line_violation_detection() {
+        let tight = ResourceBudget {
+            max_file_lines: 3,
+            max_line_bytes: 8,
+            ..ResourceBudget::default()
+        };
+        // Too many lines wins first.
+        let w = line_budget_violation("f.txt", "1\n2\n3\n4\n", "", &tight).unwrap();
+        assert_eq!(w.code, "FILE_TOO_MANY_LINES");
+        // Line length violation on either side.
+        let w = line_budget_violation("f.txt", "short\n", "waaaaay too long\n", &tight).unwrap();
+        assert_eq!(w.code, "LINE_TOO_LONG");
+        // Within budget.
+        assert!(line_budget_violation("f.txt", "ok\n", "fine\n", &tight).is_none());
+    }
+
+    #[test]
     fn gitlink_requires_ack_only_when_pointer_moves() {
         let gitlink = |old_oid: &str, new_oid: &str| FileDiff {
             old_type: Some(FileType::Gitlink),
@@ -581,14 +598,87 @@ pub enum GitError {
     NotARepo,
     BadBase(String),
     GitFailed(String),
+    /// The diff exceeds a hard resource budget (file count / line totals)
+    /// and reviewing it in one session would be meaningless or unsafe.
+    BudgetExceeded(String),
+}
+
+/// Hard deadline for any single git subprocess this module spawns. Git on a
+/// local repository finishes in milliseconds; a command still running after
+/// this long is wedged (stalled filesystem, misbehaving fsmonitor, a
+/// tampered `git` on PATH) and is killed rather than allowed to hold the
+/// review process open.
+pub const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Waits for `child` (spawned with piped stdout/stderr) up to `timeout`,
+/// draining both pipes from helper threads so a chatty child can't deadlock
+/// against a full pipe. On deadline the child is killed and reaped — no git
+/// subprocess outlives the review process by more than the poll interval.
+fn wait_with_timeout(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let drain = |pipe: Option<std::process::ChildStdout>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let drain_err = |pipe: Option<std::process::ChildStderr>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_handle = drain(stdout_pipe);
+    let err_handle = drain_err(stderr_pipe);
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "git subprocess exceeded {}s and was killed",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: out_handle.join().unwrap_or_default(),
+        stderr: err_handle.join().unwrap_or_default(),
+    })
+}
+
+/// Runs `cmd` to completion under [`GIT_TIMEOUT`] with stdin closed.
+fn timed_output(mut cmd: std::process::Command) -> std::io::Result<std::process::Output> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    wait_with_timeout(cmd.spawn()?, GIT_TIMEOUT)
 }
 
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
 pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
-    let output = base_git()
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|_| GitError::NotARepo)?;
+    let mut cmd = base_git();
+    cmd.args(["rev-parse", "--show-toplevel"]);
+    let output = timed_output(cmd).map_err(|_| GitError::NotARepo)?;
     if !output.status.success() {
         return Err(GitError::NotARepo);
     }
@@ -631,18 +721,17 @@ impl WorktreeStatus {
 /// `-z` keeps paths verbatim (no quoting), and porcelain v2 is parsed
 /// structurally instead of by line prefix guessing.
 pub fn worktree_status(root: &std::path::Path) -> Result<WorktreeStatus, GitError> {
-    let output = git_cmd(root)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "status",
-            "--porcelain=v2",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ])
-        .output()
-        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let mut cmd = git_cmd(root);
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ]);
+    let output = timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -728,10 +817,9 @@ fn parse_status_v2_z(bytes: &[u8]) -> Result<WorktreeStatus, GitError> {
 /// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
 /// on any failure returns `"review"`.
 pub fn current_branch(root: &std::path::Path) -> String {
-    let output = git_cmd(root)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"])
-        .output();
-    match output {
+    let mut cmd = git_cmd(root);
+    cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
+    match timed_output(cmd) {
         Ok(output) if output.status.success() => {
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if branch.is_empty() {
@@ -752,6 +840,46 @@ pub const MAX_FILE_BYTES: usize = 1_048_576;
 /// are reported as `ContentKind::TooLarge` with a warning rather than being
 /// silently truncated.
 pub const MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024;
+
+/// Every hard resource limit the diff pipeline enforces, in one place. The
+/// posture is bounded-refuse, never unbounded-process: inputs inside the
+/// budget render fully; a file over a per-file limit degrades to an
+/// explicitly acknowledged `TooLarge` card with a structured warning; a diff
+/// over a whole-review limit refuses to start (`GitError::BudgetExceeded`).
+/// Nothing is ever silently truncated.
+#[derive(Debug, Clone)]
+pub struct ResourceBudget {
+    /// Maximum changed files in one review; beyond this the review refuses
+    /// to start (a human cannot meaningfully review it in one sitting, and
+    /// rendering it would melt the browser).
+    pub max_files: usize,
+    /// Largest single blob rendered inline; larger degrades to `TooLarge`.
+    pub max_file_bytes: usize,
+    /// Total blob budget; once exceeded remaining files degrade to `TooLarge`.
+    pub max_total_bytes: usize,
+    /// Maximum lines on either side of a file's text diff; more degrades to
+    /// `TooLarge` (bounds line-diff CPU as well as DOM size).
+    pub max_file_lines: usize,
+    /// Longest single line rendered; a file with a longer line degrades to
+    /// `TooLarge` (a multi-megabyte minified line would freeze the browser).
+    pub max_line_bytes: usize,
+    /// Total rendered diff lines across the whole review; files past the
+    /// budget degrade to `TooLarge` (bounds the session JSON and the DOM).
+    pub max_total_lines: usize,
+}
+
+impl Default for ResourceBudget {
+    fn default() -> Self {
+        ResourceBudget {
+            max_files: 2000,
+            max_file_bytes: MAX_FILE_BYTES,
+            max_total_bytes: MAX_TOTAL_BYTES,
+            max_file_lines: 50_000,
+            max_line_bytes: 64 * 1024,
+            max_total_lines: 200_000,
+        }
+    }
+}
 
 /// Result of [`compute_diff`]: the per-file diffs, non-fatal warnings (e.g.
 /// files skipped because they exceed size limits), and the resolved commit
@@ -860,10 +988,9 @@ fn git_cmd(root: &std::path::Path) -> std::process::Command {
 }
 
 fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output, GitError> {
-    git_cmd(root)
-        .args(args)
-        .output()
-        .map_err(|e| GitError::GitFailed(e.to_string()))
+    let mut cmd = git_cmd(root);
+    cmd.args(args);
+    timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))
 }
 
 /// Resolves `<rev>^{commit}` to a full oid.
@@ -874,15 +1001,14 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output
 /// doesn't resolve), that's `BadBase` here; callers resolving `HEAD` remap
 /// that to `GitFailed` since `HEAD` is never the user-supplied base.
 pub(crate) fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, GitError> {
-    let output = git_cmd(root)
-        .args([
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{rev}^{{commit}}"),
-        ])
-        .output()
-        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let mut cmd = git_cmd(root);
+    cmd.args([
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        &format!("{rev}^{{commit}}"),
+    ]);
+    let output = timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))?;
     if !output.status.success() {
         return Err(GitError::BadBase(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -1156,9 +1282,8 @@ fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec
     let input = input.to_string();
     let writer =
         std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(input.as_bytes()) });
-    let output = child
-        .wait_with_output()
-        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let output =
+        wait_with_timeout(child, GIT_TIMEOUT).map_err(|e| GitError::GitFailed(e.to_string()))?;
     let write_result = writer
         .join()
         .map_err(|_| GitError::GitFailed("cat-file stdin writer thread panicked".to_string()))?;
@@ -1262,6 +1387,54 @@ fn is_binary(bytes: &[u8]) -> bool {
 /// at a pointer, not the real data, and must be told so.
 fn is_lfs_pointer_text(text: &str) -> bool {
     text.starts_with("version https://git-lfs.github.com/spec/v1")
+}
+
+/// Checks a file's text sides against the per-file line budgets. Returns the
+/// structured warning to emit (and the file degrades to `TooLarge`, which
+/// requires an explicit acknowledgement) when a side has too many lines —
+/// which also bounds the line-diff CPU spent on it — or a single line too
+/// long to render safely.
+fn line_budget_violation(
+    path: &str,
+    old_text: &str,
+    new_text: &str,
+    budget: &ResourceBudget,
+) -> Option<Warning> {
+    let line_count = |t: &str| t.bytes().filter(|&b| b == b'\n').count() + 1;
+    let count = line_count(old_text).max(line_count(new_text));
+    if count > budget.max_file_lines {
+        return Some(
+            Warning::new(
+                "FILE_TOO_MANY_LINES",
+                Severity::Warning,
+                format!(
+                    "file has too many lines to display inline: {path} ({count} lines, limit {})",
+                    budget.max_file_lines
+                ),
+            )
+            .with_path(path),
+        );
+    }
+    let longest = old_text
+        .split('\n')
+        .chain(new_text.split('\n'))
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if longest > budget.max_line_bytes {
+        return Some(
+            Warning::new(
+                "LINE_TOO_LONG",
+                Severity::Warning,
+                format!(
+                    "file contains a line too long to display inline: {path} ({longest} bytes, limit {})",
+                    budget.max_line_bytes
+                ),
+            )
+            .with_path(path),
+        );
+    }
+    None
 }
 
 /// Lowercase wire name of a file type, matching its serde serialization.
@@ -1451,6 +1624,16 @@ fn text_hunks(old: &str, new: &str) -> Vec<Hunk> {
 /// None of these read `.gitattributes`, diff drivers, or diff config, so
 /// what the reviewer sees is derived from the actual committed blobs.
 pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, GitError> {
+    compute_diff_with_budget(root, base, &ResourceBudget::default())
+}
+
+/// [`compute_diff`] with an explicit [`ResourceBudget`] (the default budget
+/// in production; tests pass tighter ones to exercise the limits).
+pub fn compute_diff_with_budget(
+    root: &std::path::Path,
+    base: &str,
+    budget: &ResourceBudget,
+) -> Result<DiffOutput, GitError> {
     let base_oid = rev_parse_commit(root, base)?;
     // HEAD is never the user-supplied base, so a resolution failure here is
     // always an internal git problem, not a "bad base ref" report.
@@ -1499,6 +1682,13 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
         ));
     }
     let entries = parse_raw_z(&out.stdout)?;
+    if entries.len() > budget.max_files {
+        return Err(GitError::BudgetExceeded(format!(
+            "diff touches {} files (limit {}); review it in smaller pieces (narrower --base or split the change)",
+            entries.len(),
+            budget.max_files
+        )));
+    }
 
     // Sizes first (--batch-check), so oversized blobs are never ingested.
     // Gitlink sides are excluded: their oid is a commit in a submodule repo,
@@ -1559,7 +1749,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             file_bytes += size;
             max_blob = max_blob.max(size);
         }
-        if max_blob > MAX_FILE_BYTES {
+        if max_blob > budget.max_file_bytes {
             warnings.push(
                 Warning::new(
                     "FILE_TOO_LARGE",
@@ -1574,7 +1764,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             plans.push(Plan::TooLarge);
             continue;
         }
-        if total_bytes + file_bytes > MAX_TOTAL_BYTES {
+        if total_bytes + file_bytes > budget.max_total_bytes {
             warnings.push(
                 Warning::new(
                     "DIFF_TOO_LARGE",
@@ -1601,6 +1791,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     let contents = blob_contents(root, &need_oids)?;
 
     let mut files = Vec::with_capacity(entries.len());
+    let mut total_lines: usize = 0;
     for (entry, plan) in entries.iter().zip(&plans) {
         let (old_path, new_path) = entry_paths(entry);
         let mut lfs_pointer = false;
@@ -1617,7 +1808,17 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
                         (Ok(old_text), Ok(new_text)) => {
                             lfs_pointer =
                                 is_lfs_pointer_text(old_text) || is_lfs_pointer_text(new_text);
-                            (ContentKind::Text, text_hunks(old_text, new_text))
+                            if let Some(w) = line_budget_violation(
+                                display_path(entry),
+                                old_text,
+                                new_text,
+                                budget,
+                            ) {
+                                warnings.push(w);
+                                (ContentKind::TooLarge, Vec::new())
+                            } else {
+                                (ContentKind::Text, text_hunks(old_text, new_text))
+                            }
                         }
                         _ => {
                             // Different byte contents can lossy-decode to the
@@ -1638,6 +1839,29 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
                     }
                 }
             }
+        };
+        // Whole-review line budget: a file whose rendered lines would push
+        // the total past the cap degrades to an explicitly-acknowledged
+        // TooLarge card instead of being silently truncated (bounds the
+        // session JSON and the DOM the browser has to build).
+        let file_lines: usize = hunks.iter().map(|h| h.lines.len()).sum();
+        let (content_kind, hunks) = if total_lines + file_lines > budget.max_total_lines {
+            warnings.push(
+                Warning::new(
+                    "DIFF_TOO_LARGE",
+                    Severity::Warning,
+                    format!(
+                        "total diff line budget ({}) exceeded: {} not displayed",
+                        budget.max_total_lines,
+                        display_path(entry)
+                    ),
+                )
+                .with_path(display_path(entry)),
+            );
+            (ContentKind::TooLarge, Vec::new())
+        } else {
+            total_lines += file_lines;
+            (content_kind, hunks)
         };
         let old_type = file_type_of_mode(&entry.old_mode);
         let new_type = file_type_of_mode(&entry.new_mode);
@@ -2387,6 +2611,94 @@ mod git_tests {
             out.warnings.iter().any(|w| w.code == "LFS_POINTER"),
             "missing LFS_POINTER warning: {:?}",
             out.warnings
+        );
+    }
+
+    #[test]
+    fn too_many_files_refuses_with_budget_error() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("one.txt"), "1\n").unwrap();
+        std::fs::write(d.join("two.txt"), "2\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "two files"]);
+
+        let budget = ResourceBudget {
+            max_files: 1,
+            ..ResourceBudget::default()
+        };
+        match compute_diff_with_budget(d, "main", &budget) {
+            Err(GitError::BudgetExceeded(msg)) => {
+                assert!(msg.contains("2 files"), "unexpected message: {msg}");
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_file_line_budget_degrades_to_acknowledged_too_large() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("many.txt"), "1\n2\n3\n4\n5\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "many lines"]);
+
+        let budget = ResourceBudget {
+            max_file_lines: 3,
+            ..ResourceBudget::default()
+        };
+        let out = compute_diff_with_budget(d, "main", &budget).unwrap();
+        let f = find(&out.files, "many.txt");
+        assert_eq!(f.content_kind, ContentKind::TooLarge);
+        assert!(f.hunks.is_empty());
+        assert!(f.requires_ack(), "degraded file must require an ack");
+        assert!(out.warnings.iter().any(|w| w.code == "FILE_TOO_MANY_LINES"));
+    }
+
+    #[test]
+    fn total_line_budget_degrades_later_files_not_silently() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("a_first.txt"), "1\n2\n").unwrap();
+        std::fs::write(d.join("b_second.txt"), "1\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "two files"]);
+
+        let budget = ResourceBudget {
+            max_total_lines: 2,
+            ..ResourceBudget::default()
+        };
+        let out = compute_diff_with_budget(d, "main", &budget).unwrap();
+        let first = find(&out.files, "a_first.txt");
+        assert_eq!(first.content_kind, ContentKind::Text);
+        assert!(!first.hunks.is_empty());
+        let second = find(&out.files, "b_second.txt");
+        assert_eq!(second.content_kind, ContentKind::TooLarge);
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.code == "DIFF_TOO_LARGE" && w.path.as_deref() == Some("b_second.txt")),
+            "the dropped file must be named in a structured warning: {:?}",
+            out.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wedged_subprocess_is_killed_at_the_deadline() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("60")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+        let err = wait_with_timeout(cmd.spawn().unwrap(), std::time::Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "kill took too long: {:?}",
+            start.elapsed()
         );
     }
 

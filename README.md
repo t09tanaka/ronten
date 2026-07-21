@@ -122,6 +122,7 @@ visible instead of rendering as two identical-looking lines.
 | 15 | `--out` write failed (the review outcome still printed to stdout; only the file write failed) |
 | 16 | the server task terminated unexpectedly (e.g. a panic) before an outcome was reached |
 | 17 | worktree not clean under `--dirty-policy error` (the default); commit/stash first or pass `--dirty-policy warn` |
+| 18 | the diff exceeds a hard resource budget (e.g. more than 2000 changed files); review it in smaller pieces |
 
 ### `ronten schema`
 
@@ -300,14 +301,30 @@ printed to stderr, so that agent necessarily knows the token. The design assumes
 trusted-but-fallible agent — it keeps an honest agent from misrepresenting the diff, but
 it cannot stop a malicious (or prompt-injected) agent from forging the human's verdict.
 
+## Resource budgets
+
+The diff pipeline is bounded-refuse, never unbounded-process, and nothing is silently
+truncated:
+
+- Per file: blobs over 1 MiB, more than 50,000 lines on either side, or any single line
+  over 64 KiB degrade the file to an explicitly-acknowledged "too large" card with a
+  structured warning (`FILE_TOO_LARGE` / `FILE_TOO_MANY_LINES` / `LINE_TOO_LONG`).
+- Per review: 50 MiB of total blob content and 200,000 total rendered diff lines; files
+  past either budget degrade the same way (`DIFF_TOO_LARGE`), which also bounds the session
+  JSON and the DOM. More than 2000 changed files refuses to start (exit 18) — that cannot
+  be meaningfully reviewed in one sitting.
+- Every git subprocess runs under a hard 60-second deadline and is killed (and reaped) on
+  overrun, so a wedged git can neither stall the review nor outlive the process.
+
 ## Non-goals for v0.1
 
 - GitHub/GitLab comment publishing or PR integration (future `ronten publish`).
 - Review history persistence, multi-reviewer support, authentication.
 - Editing the diff — fixing issues remains the agent's job.
 - Native Windows (WSL is fine; targets are macOS/Linux).
-- Virtual scrolling in the diff view (only the selected concern's hunks render, with large
-  hunks collapsed by default).
+- Virtual scrolling in the diff view. Instead, hard resource budgets keep oversized content
+  from ever reaching the browser (see "Resource budgets" below); only the selected concern's
+  hunks render, with large hunks collapsed by default.
 - Agent self-reported metadata fields in concerns JSON — v1 rejects unknown fields outright
   (exit 10, via `deny_unknown_fields`) rather than ignoring them; such fields would be added
   in a future version 2 of the contract, never by loosening v1.

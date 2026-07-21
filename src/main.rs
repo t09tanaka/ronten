@@ -32,6 +32,9 @@ pub mod exitcode {
     /// is `error` (the default): part of the change would be reviewed
     /// nowhere, so the review refuses to start.
     pub const DIRTY_WORKTREE: u8 = 17;
+    /// The diff exceeds a hard resource budget (e.g. file count); review it
+    /// in smaller pieces.
+    pub const REVIEW_TOO_LARGE: u8 = 18;
 }
 
 #[derive(Parser, Debug)]

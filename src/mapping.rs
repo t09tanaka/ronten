@@ -242,6 +242,15 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
         }
     }
 
+    // The scans in step 3 range-query these by line number; sort so a
+    // location claims its range via binary search + bounded walk instead of
+    // a full scan (up to 200 concerns x 200 locations each would otherwise
+    // rescan every changed line of the file per location). Hunks emit lines
+    // in ascending order already, so this is usually a no-op.
+    for per_file in adds.iter_mut().chain(removes.iter_mut()) {
+        per_file.sort_unstable_by_key(|&(_, no)| no);
+    }
+
     // Step 2: claim sets.
     let mut warnings = Vec::new();
     let mut claimed_adds: HashSet<(usize, u32)> = HashSet::new();
@@ -274,21 +283,25 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
                     continue;
                 }
                 if want_adds {
-                    for &(hi, no) in &adds[fi] {
-                        if no >= start && no <= end {
-                            claimed_adds.insert((fi, no));
-                            covered_hunks.insert((fi, Some(hi)));
-                            matched = true;
+                    let lo = adds[fi].partition_point(|&(_, no)| no < start);
+                    for &(hi, no) in &adds[fi][lo..] {
+                        if no > end {
+                            break;
                         }
+                        claimed_adds.insert((fi, no));
+                        covered_hunks.insert((fi, Some(hi)));
+                        matched = true;
                     }
                 }
                 if want_removes {
-                    for &(hi, no) in &removes[fi] {
-                        if no >= start && no <= end {
-                            claimed_removes.insert((fi, no));
-                            covered_hunks.insert((fi, Some(hi)));
-                            matched = true;
+                    let lo = removes[fi].partition_point(|&(_, no)| no < start);
+                    for &(hi, no) in &removes[fi][lo..] {
+                        if no > end {
+                            break;
                         }
+                        claimed_removes.insert((fi, no));
+                        covered_hunks.insert((fi, Some(hi)));
+                        matched = true;
                     }
                 }
             }
