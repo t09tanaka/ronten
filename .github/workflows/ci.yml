@@ -8,6 +8,7 @@ on:
 jobs:
   rust:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -26,13 +27,73 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      # 1.85 is the actual floor: it's clap 4.6.2's declared MSRV (the
+      # highest among locked build-relevant dependencies — some dev-only
+      # deps used solely by integration tests declare higher, but those
+      # aren't compiled by a plain `cargo check`). Verified empirically by
+      # running this exact check under a 1.85 toolchain locally before
+      # adding this job.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.85"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check at MSRV
+        # `cargo check` still runs build.rs (which shells out to npm), hence
+        # setup-node here too — kept as a single straightforward step rather
+        # than pre-building the frontend separately to avoid the extra
+        # complexity of splitting a build.rs-driven install/build across jobs.
+        run: cargo check --locked
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build frontend dist
+        run: cargo build --locked
+      - name: Verify build didn't modify tracked files
+        # `cargo build` runs build.rs, which shells out to npm; this asserts
+        # that doing so left every tracked file exactly as committed (only
+        # gitignored output like frontend/dist should have changed).
+        run: git diff --exit-code HEAD --
+      - name: Drop node_modules (keeps dependency licenses out of the crate)
+        run: rm -rf frontend/node_modules
       - name: Package
-        # cargo auto-includes LICENSE/README files found anywhere in the
-        # package directory; drop node_modules (created by the Test step's
-        # frontend build) so dependency license files stay out of the crate.
+        # frontend/dist is a gitignored build artifact deliberately shipped in
+        # the crate (see Cargo.toml include), so the VCS dirty-check cannot
+        # pass; --allow-dirty is required and the content check below is the
+        # real gate.
+        run: cargo package --locked --allow-dirty
+      - name: Verify crate contents
         run: |
-          rm -rf frontend/node_modules
-          cargo package --locked
+          cargo package --locked --list --allow-dirty > /tmp/package-files.txt
+          grep -q '^frontend/dist/index\.html$' /tmp/package-files.txt
+          grep -q '^frontend/dist/assets/.*\.js$' /tmp/package-files.txt
+          grep -q '^frontend/dist/assets/.*\.css$' /tmp/package-files.txt
+          grep -q '^frontend/dist/shippori-mincho-OFL\.txt$' /tmp/package-files.txt
+          grep -q '^frontend/dist/highlight-js-BSD-3-Clause\.txt$' /tmp/package-files.txt
+          if grep -q 'node_modules' /tmp/package-files.txt; then
+            echo 'node_modules leaked into the crate' >&2; exit 1
+          fi
+      - name: Verify packaged artifact actually contains the frontend
+        # The listing check above only reflects what `cargo package --list`
+        # *intends* to include; this unpacks the real .crate tarball and
+        # checks the file is actually inside it. Entries are under a
+        # `ronten-<version>/` prefix, hence the end-anchor-only pattern.
+        run: |
+          tar -tzf target/package/ronten-*.crate | grep -q 'frontend/dist/index\.html$'
 
   frontend:
     runs-on: ubuntu-latest

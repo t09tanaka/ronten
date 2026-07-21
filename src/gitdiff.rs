@@ -496,6 +496,35 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     Ok(std::path::PathBuf::from(path))
 }
 
+/// True if any tracked file has uncommitted changes (staged or unstaged),
+/// via `git status --porcelain -uno` (`-uno` excludes untracked files: they
+/// were never committed, so they can't silently escape the `<base>...HEAD`
+/// diff the way an uncommitted edit to a tracked file can). `-c
+/// core.fsmonitor=false` disables a repo-local fsmonitor hook (which could
+/// otherwise short-circuit or lie about the working-tree scan) and
+/// `--ignore-submodules=none` overrides any repo-local `.gitmodules`/config
+/// setting that would hide dirty submodules from this check — same hardened,
+/// don't-trust-repo-local-config posture as [`base_git`]'s env scrubbing.
+/// This drives a display-only startup warning, so any git invocation failure
+/// here fails open (returns `false`, review proceeds) rather than blocking
+/// the review over a check that isn't load-bearing for correctness.
+pub fn has_tracked_changes(root: &std::path::Path) -> bool {
+    match git_cmd(root)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+            "-uno",
+            "--ignore-submodules=none",
+        ])
+        .output()
+    {
+        Ok(output) if output.status.success() => !output.stdout.is_empty(),
+        _ => false,
+    }
+}
+
 /// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
 /// on any failure returns `"review"`.
 pub fn current_branch(root: &std::path::Path) -> String {
@@ -629,9 +658,14 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output
         .map_err(|e| GitError::GitFailed(e.to_string()))
 }
 
-/// Resolves `<rev>^{commit}` to a full oid. On failure returns the stderr
-/// text (the caller decides whether that is `BadBase` or `GitFailed`).
-fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, String> {
+/// Resolves `<rev>^{commit}` to a full oid.
+///
+/// Distinguishes *why* it failed: if git itself couldn't be run at all (spawn
+/// error — e.g. the binary is missing), that's `GitFailed` regardless of
+/// which rev was being resolved. If git ran and exited non-zero (the rev
+/// doesn't resolve), that's `BadBase` here; callers resolving `HEAD` remap
+/// that to `GitFailed` since `HEAD` is never the user-supplied base.
+fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, GitError> {
     let output = git_cmd(root)
         .args([
             "rev-parse",
@@ -640,9 +674,11 @@ fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, String>
             &format!("{rev}^{{commit}}"),
         ])
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| GitError::GitFailed(e.to_string()))?;
     if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        return Err(GitError::BadBase(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -1115,8 +1151,13 @@ fn text_hunks(old: &str, new: &str) -> Vec<Hunk> {
 /// None of these read `.gitattributes`, diff drivers, or diff config, so
 /// what the reviewer sees is derived from the actual committed blobs.
 pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, GitError> {
-    let base_oid = rev_parse_commit(root, base).map_err(GitError::BadBase)?;
-    let head_oid = rev_parse_commit(root, "HEAD").map_err(GitError::GitFailed)?;
+    let base_oid = rev_parse_commit(root, base)?;
+    // HEAD is never the user-supplied base, so a resolution failure here is
+    // always an internal git problem, not a "bad base ref" report.
+    let head_oid = rev_parse_commit(root, "HEAD").map_err(|e| match e {
+        GitError::BadBase(msg) => GitError::GitFailed(msg),
+        other => other,
+    })?;
 
     let out = run_git(root, &["merge-base", &base_oid, &head_oid])?;
     if !out.status.success() {

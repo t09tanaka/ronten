@@ -21,6 +21,12 @@ pub mod exitcode {
     pub const NOT_A_REPO: u8 = 12;
     pub const EMPTY_DIFF: u8 = 13;
     pub const GIT_FAILED: u8 = 14;
+    /// A submit outcome was reached but writing `--out` failed. Takes
+    /// precedence over the approve/request-changes decision code.
+    pub const OUT_FAILED: u8 = 15;
+    /// The server task ended unexpectedly before any review outcome was
+    /// resolved (e.g. the accept loop errored out).
+    pub const SERVER_FAILED: u8 = 16;
 }
 
 #[derive(Parser, Debug)]

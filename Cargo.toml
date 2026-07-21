@@ -2,6 +2,7 @@
 name = "ronten"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Concern-based PR review viewer: agents propose concerns, humans review in the browser, agents get JSON back"
 license = "MIT"
 # The published crate ships the prebuilt frontend (frontend/dist) instead of
@@ -9,7 +10,9 @@ license = "MIT"
 # build.rs never modifies the package source tree during verification.
 # Note: cargo auto-includes LICENSE/README files it finds anywhere in the
 # package directory, so remove frontend/node_modules before `cargo package`
-# / `cargo publish` (CI does this) to keep dependency license files out.
+# / `cargo publish` to keep dependency license files out of the crate (the
+# CI `package` job does this; frontend/dist is gitignored but intentionally
+# included here, so packaging requires --allow-dirty — see .github/workflows/ci.yml).
 include = [
     "Cargo.toml",
     "build.rs",

@@ -49,27 +49,63 @@ fn fixture_repo() -> tempfile::TempDir {
 }
 
 /// Reads the child's stderr line by line until the `Review session: <url>`
-/// banner and returns the URL. Panics if the process exits first.
+/// banner and returns the URL. Panics if the process exits first. Delegates
+/// to [`read_review_url_with_prebanner`] and discards the pre-banner text;
+/// see that function for the draining behavior after the banner is found.
 fn read_review_url(child: &mut Child) -> String {
+    read_review_url_with_prebanner(child).0
+}
+
+/// Spawns `ronten review --base main --concerns concerns.json --no-open`
+/// (plus `extra`), waits for the session URL, and returns `(child, url)`.
+/// Delegates to [`spawn_review_with_prebanner`] and discards the pre-banner
+/// text.
+fn spawn_review(dir: &Path, extra: &[&str]) -> (Child, String) {
+    let (child, url, _prebanner) = spawn_review_with_prebanner(dir, extra);
+    (child, url)
+}
+
+/// Reads the child's stderr line by line until the `Review session: <url>`
+/// banner, returning the URL together with every stderr line seen before it
+/// (joined back together) — the dirty-worktree warning (if any) prints
+/// before the banner, so this is how tests observe it. Panics if the process
+/// exits first.
+///
+/// After the banner is found, a background thread keeps draining the pipe to
+/// EOF rather than dropping the read end here: the child may still write to
+/// stderr later (e.g. an `--out` write failure warning), and dropping our end
+/// of the pipe would make that write hit a broken pipe and panic the child.
+fn read_review_url_with_prebanner(child: &mut Child) -> (String, String) {
     use std::io::BufRead;
     let stderr = child.stderr.take().unwrap();
     let mut reader = std::io::BufReader::new(stderr);
     let mut line = String::new();
-    loop {
+    let mut prebanner = String::new();
+    let url = loop {
         line.clear();
         assert!(
             reader.read_line(&mut line).unwrap() > 0,
             "process exited before printing URL"
         );
         if let Some(rest) = line.trim().strip_prefix("Review session: ") {
-            return rest.to_string();
+            break rest.to_string();
         }
-    }
+        prebanner.push_str(&line);
+    };
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+    (url, prebanner)
 }
 
 /// Spawns `ronten review --base main --concerns concerns.json --no-open`
-/// (plus `extra`), waits for the session URL, and returns `(child, url)`.
-fn spawn_review(dir: &Path, extra: &[&str]) -> (Child, String) {
+/// (plus `extra`) and returns `(child, url, prebanner)`, where `prebanner` is
+/// every stderr line seen before the `Review session: ` banner (see
+/// [`read_review_url_with_prebanner`]).
+fn spawn_review_with_prebanner(dir: &Path, extra: &[&str]) -> (Child, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
         .current_dir(dir)
         .args([
@@ -85,8 +121,8 @@ fn spawn_review(dir: &Path, extra: &[&str]) -> (Child, String) {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let url = read_review_url(&mut child);
-    (child, url)
+    let (url, prebanner) = read_review_url_with_prebanner(&mut child);
+    (child, url, prebanner)
 }
 
 /// `http://127.0.0.1:PORT/r/TOKEN` → `http://127.0.0.1:PORT/api/TOKEN`.
@@ -197,6 +233,124 @@ fn out_flag_writes_file() {
     // stdout is pretty JSON + trailing newline from println!; file is the same
     // pretty JSON without the trailing newline.
     assert_eq!(file, stdout.trim_end_matches('\n'));
+
+    // Atomicity regression: the write goes through a same-directory temp
+    // file that is renamed into place, so no `.tmp.<pid>` sibling should
+    // ever survive a successful write.
+    let leftovers: Vec<_> = std::fs::read_dir(td.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with("result.json.tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp file(s) left behind after atomic write: {leftovers:?}"
+    );
+}
+
+#[test]
+fn out_write_failure_exits_15_with_stdout_intact() {
+    // The parent directory of `--out` doesn't exist, so the atomic
+    // write must fail — but the review outcome already happened, so
+    // stdout must still carry the correct result JSON, only the exit
+    // code changes (to the dedicated OUT_FAILED code), regardless of the
+    // approve/request-changes decision.
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--out", "no-such-dir/result.json"]);
+
+    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
+        .send_json(full_draft("approve"))
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(15));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["decision"], "approve");
+    assert!(
+        !td.path().join("no-such-dir").exists(),
+        "the missing parent directory must not have been created as a side effect"
+    );
+}
+
+#[test]
+fn dirty_tracked_file_prints_uncommitted_changes_warning() {
+    // `concerns.json` in the fixture is already untracked (excluded via
+    // -uno); modify a *tracked* file without committing so the warning must
+    // fire.
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+
+    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    assert!(
+        prebanner.contains(
+            "warning: tracked files have uncommitted changes; this review covers committed state only (main...HEAD)"
+        ),
+        "stderr missing dirty-worktree warning: {prebanner}"
+    );
+
+    ureq::post(&format!("{}/abort", api_base(&url)))
+        .call()
+        .unwrap();
+    let _ = child.wait_with_output().unwrap();
+}
+
+#[test]
+fn empty_diff_with_dirty_tracked_file_exits_13_with_warning() {
+    // Regression test: the empty-diff early return used to happen before the
+    // dirty-worktree check, so the single most important case — an agent
+    // that committed nothing at all, leaving every change uncommitted — never
+    // got the warning. `--base feature` against HEAD (also `feature`) is an
+    // empty diff by construction; then a tracked file is modified without
+    // committing.
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "feature",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(13));
+    assert!(out.stdout.is_empty(), "stdout must be empty on empty diff");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("nothing to review"),
+        "stderr missing empty-diff message: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "warning: tracked files have uncommitted changes; this review covers committed state only (feature...HEAD)"
+        ),
+        "stderr missing dirty-worktree warning: {stderr}"
+    );
+}
+
+#[test]
+fn clean_worktree_prints_no_uncommitted_changes_warning() {
+    let td = fixture_repo();
+    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    assert!(
+        !prebanner.contains("tracked files have uncommitted changes"),
+        "unexpected dirty-worktree warning on a clean worktree: {prebanner}"
+    );
+
+    ureq::post(&format!("{}/abort", api_base(&url)))
+        .call()
+        .unwrap();
+    let _ = child.wait_with_output().unwrap();
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! session state, bind a localhost server, and drive it to an outcome.
 
 use crate::exitcode;
-use crate::gitdiff::{compute_diff, current_branch, repo_root, GitError};
+use crate::gitdiff::{compute_diff, current_branch, has_tracked_changes, repo_root, GitError};
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
@@ -122,9 +122,35 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
     let files = diff_output.files;
     let diff_warnings = diff_output.warnings;
+
+    // The diff above only ever covers `<base>...HEAD` (committed state); if
+    // the agent forgot to commit some of its work, those changes are
+    // reviewed nowhere. Checked here (after the diff is computed, so there is
+    // something to compare against) and printed before *any* early return —
+    // including the empty-diff one below, which is exactly the case where an
+    // agent committed nothing at all and every change sits uncommitted. This
+    // must run and warn even though the process is about to exit, so the
+    // reviewer isn't left staring at "nothing to review" with no clue that
+    // uncommitted changes exist. Display-only, so a git failure here is not
+    // itself a reason to abort the review.
+    let dirty_warning = || {
+        eprintln!(
+            "warning: tracked files have uncommitted changes; this review covers committed state only ({}...HEAD)",
+            args.base
+        );
+    };
+    let dirty = has_tracked_changes(&root);
+
     if files.is_empty() {
         eprintln!("nothing to review: no diff between {} and HEAD", args.base);
+        if dirty {
+            dirty_warning();
+        }
         return exitcode::EMPTY_DIFF;
+    }
+
+    if dirty {
+        dirty_warning();
     }
 
     // 4. Build the session state.
@@ -210,9 +236,17 @@ pub async fn serve_session(
     let router = build_router(state.clone());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.notified().await });
-    let server_handle = tokio::spawn(async move {
-        let _ = server.await;
-    });
+    // Not fire-and-forget: this handle is also a `select!` branch below, so an
+    // early server death is noticed instead of leaving the process hanging on
+    // `rx.recv()` forever. axum 0.8's `serve` retries `accept()` errors
+    // internally rather than returning them, so in practice the only way this
+    // branch fires is the server task itself terminating unexpectedly (e.g. a
+    // panic inside a handler unwinding the task). It is only ever awaited to
+    // completion here or in the graceful-shutdown path after `outcome` is
+    // known — `with_graceful_shutdown` means the server future does not
+    // resolve on its own before `notify.notify_one()` is called, so this
+    // branch winning the select is always unexpected.
+    let mut server_handle = tokio::spawn(async move { server.await });
 
     // Every exit path races through the same compare-and-set terminal state.
     // If ctrl-c or the deadline loses the race (a submit/abort handler
@@ -220,11 +254,20 @@ pub async fn serve_session(
     // and is already in flight on `rx` — HTTP 200 must never coexist with a
     // timeout/abort exit.
     let outcome = tokio::select! {
+        // `biased` pins `rx.recv()` first, so an outcome that already
+        // arrived on the channel always wins over a simultaneous server-task
+        // death instead of `select!`'s default random pick occasionally
+        // taking the server-death branch and misreporting SERVER_FAILED.
+        biased;
         o = rx.recv() => o.expect("outcome channel closed before an outcome was sent"),
         _ = tokio::signal::ctrl_c() => {
             if state.try_finish(Terminal::Aborted) {
                 Outcome::Aborted
             } else {
+                // Lost the CAS race to a submit/abort handler; if that
+                // handler died after winning but before sending on `rx`
+                // this would hang forever, but handlers `send` synchronously
+                // right after `try_finish` succeeds, so that gap is accepted.
                 rx.recv().await.expect("outcome channel closed before an outcome was sent")
             }
         }
@@ -232,8 +275,19 @@ pub async fn serve_session(
             if state.try_finish(Terminal::TimedOut) {
                 Outcome::Timeout
             } else {
+                // Same losing-race acceptance as the ctrl-c branch above.
                 rx.recv().await.expect("outcome channel closed before an outcome was sent")
             }
+        }
+        joined = &mut server_handle => {
+            match joined {
+                Ok(Ok(())) => eprintln!(
+                    "server exited before a review outcome was recorded"
+                ),
+                Ok(Err(e)) => eprintln!("server error: {e}"),
+                Err(e) => eprintln!("server task panicked: {e}"),
+            }
+            return exitcode::SERVER_FAILED;
         }
     };
 
@@ -244,19 +298,85 @@ pub async fn serve_session(
         Outcome::Submitted(result) => {
             let json = serde_json::to_string_pretty(&result).expect("result serializes to JSON");
             println!("{json}");
-            if let Some(path) = out {
-                if let Err(e) = std::fs::write(&path, &json) {
-                    eprintln!("warning: failed to write {}: {e}", path.display());
-                }
-            }
-            match result.decision {
+            let decision_code = match result.decision {
                 Decision::Approve => exitcode::APPROVED,
                 Decision::RequestChanges => exitcode::REQUEST_CHANGES,
+            };
+            if let Some(path) = out {
+                if let Err(e) = write_out_atomic(&path, &json) {
+                    eprintln!("failed to write {}: {e}", path.display());
+                    return exitcode::OUT_FAILED;
+                }
             }
+            decision_code
         }
         Outcome::Aborted => exitcode::ABORTED,
         Outcome::Timeout => exitcode::TIMEOUT,
     }
+}
+
+/// Writes `contents` to `path` atomically: writes to a sibling temp file
+/// (`{filename}.tmp.{pid}.{n}`) in the same directory, flushes it to disk,
+/// then renames it over `path`. This closes a race where a poller reading
+/// `path` (e.g. an orchestrator watching for `--out` to appear) could
+/// otherwise observe a partially-written file. The temp file is removed on a
+/// best-effort basis if any step fails.
+fn write_out_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--out path has no file name",
+        )
+    })?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let pid = std::process::id();
+
+    // The temp name is predictable (pid + a small counter), so in a shared
+    // writable directory another actor could plant a symlink at that exact
+    // path ahead of time to redirect the write at some other file.
+    // `create_new` (O_EXCL) refuses to open a path that already exists —
+    // including a symlink — instead of following it the way `File::create`
+    // would, closing that TOCTOU. The counter only exists to step past a
+    // name collision with a leftover from a previous crash; a handful of
+    // attempts is plenty since collisions here are expected to be rare.
+    let mut attempt: u32 = 0;
+    let (tmp_path, mut file) = loop {
+        let tmp_name = format!("{}.tmp.{pid}.{attempt}", file_name.to_string_lossy());
+        let tmp_path = match dir {
+            Some(dir) => dir.join(&tmp_name),
+            None => PathBuf::from(&tmp_name),
+        };
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        match open_options.open(&tmp_path) {
+            Ok(f) => break (tmp_path, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -4,14 +4,69 @@ use crate::assets;
 use crate::model::ResultOutput;
 use crate::session::{Draft, SessionPayload, SessionState, Terminal};
 use axum::body::Body;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use rand::Rng;
 use serde_json::json;
 use std::sync::Arc;
+
+/// `Content-Security-Policy` applied to every non-asset response (index +
+/// API JSON). `style-src` allows `'unsafe-inline'` because Svelte's `style:`
+/// directive (and similar bound-style bindings) compiles down to inline
+/// `style="..."` attributes on elements — there is no build-time way to hash
+/// or nonce those, so a strict `style-src 'self'` would break the UI.
+/// `font-src` allows `data:` because `app.css` embeds the "論" seal glyph
+/// (unicode-range U+8AD6) as an inline `data:font/woff2;base64` subset — with
+/// only `default-src 'self'` this glyph's `document.fonts.load` fails with a
+/// network error (confirmed against a live build). Every other directive
+/// stays locked to `'self'`/`'none'`.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'";
+
+/// Sets response headers that matter because the session token lives in the
+/// URL path: caching or leaking it (via history, shared caches, referrers, or
+/// content sniffing) would leak session access.
+///
+/// - Every response gets `Referrer-Policy: no-referrer` and
+///   `X-Content-Type-Options: nosniff`.
+/// - `/assets/*` (Vite's content-hashed build output) is safe to cache
+///   forever.
+/// - Everything else (index / API) must never be cached and gets a strict CSP.
+async fn security_headers(req: Request, next: Next) -> Response {
+    // Prefix-based, so a 404 for a nonexistent file under `/assets/` (e.g. a
+    // typo'd hash) still gets the long-lived immutable cache header below
+    // instead of `no-store`. That's fine: unlike `/r/{token}` and
+    // `/api/{token}/*`, no session token ever appears anywhere in an assets
+    // path, so there is nothing sensitive to leak into a shared/browser
+    // cache by over-caching a miss.
+    let is_asset = req.uri().path().starts_with("/assets/");
+    let mut res = next.run(req).await;
+    let headers = res.headers_mut();
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if is_asset {
+        headers.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        );
+    } else {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+        );
+    }
+    res
+}
 
 /// What a session ended with; sent once over `outcome_tx` when the review
 /// finishes. `Timeout` is never produced by the HTTP handlers here — it's
@@ -184,6 +239,7 @@ pub fn build_router(state: Arc<SessionState>) -> Router {
         .route("/api/{token}/submit", post(post_submit))
         .route("/api/{token}/abort", post(post_abort))
         .with_state(state)
+        .layer(middleware::from_fn(security_headers))
 }
 
 #[cfg(test)]
@@ -854,7 +910,94 @@ index 1111111..2222222 100644
             .get(axum::http::header::CONTENT_TYPE)
             .expect("expected a Content-Type header");
         assert!(!content_type.is_empty());
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .unwrap(),
+            "public, max-age=31536000, immutable",
+            "hashed asset filenames from Vite are immutable, so assets get a long-lived cache"
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::REFERRER_POLICY)
+                .unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert!(!bytes.is_empty(), "expected non-empty asset body");
+    }
+
+    /// Every non-asset response (index / API) must never be cached, since the
+    /// session token lives in the URL path — a shared cache or history entry
+    /// leaking it would leak session access.
+    #[tokio::test]
+    async fn api_response_has_security_and_no_store_headers() {
+        let (state, _rx) = build_state();
+        let app = build_router(state);
+        let res = app
+            .oneshot(get(&format!("/api/{TOKEN}/session")))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let headers = res.headers();
+        assert_eq!(
+            headers.get(axum::http::header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            headers
+                .get(axum::http::header::X_CONTENT_TYPE_OPTIONS)
+                .unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+
+        let csp = headers
+            .get(axum::http::header::CONTENT_SECURITY_POLICY)
+            .expect("expected a Content-Security-Policy header")
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'self'"));
+        assert!(csp.contains("script-src 'self'"));
+        assert!(csp.contains("style-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("font-src 'self' data:"));
+        assert!(csp.contains("connect-src 'self'"));
+        assert!(csp.contains("img-src 'self' data:"));
+        assert!(csp.contains("frame-ancestors 'none'"));
+        assert!(csp.contains("base-uri 'none'"));
+    }
+
+    /// A path that matches no route at all (not `/r/*`, not `/assets/*`, not
+    /// `/api/*`) still goes through `security_headers`, since the middleware
+    /// wraps the whole router including its fallback 404 — this must not
+    /// regress into an uncached bare 404 with no security headers.
+    #[tokio::test]
+    async fn unmatched_path_404_has_no_store_and_csp() {
+        let (state, _rx) = build_state();
+        let app = build_router(state);
+        let res = app.oneshot(get("/totally/unknown/path")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let headers = res.headers();
+        assert_eq!(
+            headers.get(axum::http::header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert!(
+            headers
+                .get(axum::http::header::CONTENT_SECURITY_POLICY)
+                .is_some(),
+            "expected a Content-Security-Policy header on an unmatched 404"
+        );
     }
 }
