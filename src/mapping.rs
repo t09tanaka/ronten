@@ -199,11 +199,17 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
             for line in &h.lines {
                 match line.kind {
                     LineKind::Add => {
+                        // The parser guarantees every Add line carries
+                        // new_no; `unmapped`/`unmapped_lines` completeness
+                        // below depends on that invariant holding.
+                        debug_assert!(line.new_no.is_some(), "Add line missing new_no");
                         if let Some(no) = line.new_no {
                             adds[fi].push((hi, no));
                         }
                     }
                     LineKind::Remove => {
+                        // Same invariant as above, for old_no on Remove lines.
+                        debug_assert!(line.old_no.is_some(), "Remove line missing old_no");
                         if let Some(no) = line.old_no {
                             removes[fi].push((hi, no));
                         }
@@ -844,6 +850,46 @@ mod tests {
                 hunk: Some(0)
             }]
         );
+    }
+
+    #[test]
+    fn split_hunk_across_two_concerns() {
+        // One hunk with two Add lines (new 13, new 15). Concern A claims 13,
+        // concern B claims 15 — the hunk must show up under BOTH concerns'
+        // hunks, and every line is claimed so nothing is unmapped.
+        let files = vec![fd_with_lines(
+            "a.ts",
+            13,
+            3,
+            13,
+            3,
+            &[
+                (LineKind::Add, None, Some(13)),
+                (LineKind::Add, None, Some(15)),
+            ],
+            &[14],
+        )];
+        let inp = input(vec![
+            concern("a", vec![loc("a.ts", None, Some(13), Some(13))]),
+            concern("b", vec![loc("a.ts", None, Some(15), Some(15))]),
+        ]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert_eq!(
+            mapping.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert_eq!(
+            mapping.concerns[1].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert!(mapping.unmapped.is_empty());
+        assert!(mapping.unmapped_lines.is_empty());
     }
 
     #[test]

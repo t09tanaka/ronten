@@ -539,6 +539,42 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
+    async fn submit_request_changes_without_reason_422() {
+        let (state, _rx) = build_state();
+        let app = build_router(state);
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "request-changes", "comments": [] },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": []
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert!(body["details"]
+            .to_string()
+            .contains("request-changes requires a comment"));
+    }
+
+    #[tokio::test]
+    async fn submit_request_changes_with_general_comment_succeeds() {
+        let (state, mut rx) = build_state();
+        let app = build_router(state);
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "request-changes", "comments": [] },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": ["fix the auth check"]
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
+    }
+
+    #[tokio::test]
     async fn second_submit_409() {
         let (state, mut rx) = build_state();
         let app = build_router(state);

@@ -100,12 +100,15 @@ pub struct ResultOutput {
 }
 
 /// Overall decision derived from the per-concern verdicts.
+///
+/// Abort/timeout exits never emit stdout JSON, so an `Abort` decision was
+/// unreachable in the output contract; it is intentionally not a variant
+/// here (see `Terminal`/`Outcome` for how those exits are represented).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Decision {
     Approve,
     RequestChanges,
-    Abort,
 }
 
 /// The human's verdict on a single concern, plus any comments left on it.
