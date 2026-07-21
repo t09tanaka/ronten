@@ -2,7 +2,7 @@
 
 use crate::assets;
 use crate::model::ResultOutput;
-use crate::session::{Draft, SessionPayload, SessionState, Terminal};
+use crate::session::{Draft, SessionPayload, SessionState};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -68,15 +68,43 @@ async fn security_headers(req: Request, next: Next) -> Response {
     res
 }
 
-/// What a session ended with; sent once over `outcome_tx` when the review
-/// finishes. `Timeout` is never produced by the HTTP handlers here — it's
-/// emitted later by the review loop's `select!` arm when the deadline fires
-/// before a submit/abort arrives.
-#[derive(Debug)]
+/// What a session ended with; stored in `SessionState::phase` by the single
+/// `try_finish` winner. `Timeout` is never produced by the HTTP handlers
+/// here — it's claimed by the review loop's `select!` arm when the deadline
+/// fires before a submit/abort arrives. `Clone` so losers of the terminal
+/// race (and the outcome waiter) can read the winner's outcome back out of
+/// the shared phase.
+#[derive(Debug, Clone)]
 pub enum Outcome {
     Submitted(Box<ResultOutput>),
     Aborted,
     Timeout,
+}
+
+/// Hard ceiling on how long any single request may take end-to-end
+/// (extraction through handler). Generous compared to every real handler
+/// (the slowest does one local git `rev-parse`), so it only ever fires on a
+/// wedged handler or a client trickling its request body — either of which
+/// would otherwise hold a connection open indefinitely and, after an
+/// outcome, stall graceful shutdown until the shutdown deadline kills it.
+pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Middleware bounding each request by the timeout passed as state (the
+/// production router uses [`REQUEST_TIMEOUT`]). A request that overruns gets
+/// `408 Request Timeout` instead of hanging its connection.
+async fn request_timeout(
+    State(limit): State<std::time::Duration>,
+    req: Request,
+    next: Next,
+) -> Response {
+    match tokio::time::timeout(limit, next.run(req)).await {
+        Ok(res) => res,
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            Json(json!({"error": "request timed out"})),
+        )
+            .into_response(),
+    }
 }
 
 /// 16 random bytes, rendered as lowercase hex — used as the session's
@@ -140,8 +168,8 @@ async fn get_session(
         });
     }
 
-    let draft = state.draft.lock().unwrap().clone();
-    let submitted = state.finished.lock().unwrap().is_some();
+    let draft = crate::session::lock_ignore_poison(&state.draft).clone();
+    let submitted = state.is_finished();
     let payload = SessionPayload {
         title: &state.title,
         summary: state.summary.as_deref(),
@@ -163,7 +191,7 @@ async fn put_draft(
     if token != state.token {
         return not_found();
     }
-    *state.draft.lock().unwrap() = draft;
+    *crate::session::lock_ignore_poison(&state.draft) = draft;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -257,21 +285,19 @@ async fn post_submit(
             .into_response();
     }
 
-    // Claim the single terminal state only after full validation, so a
-    // rejected submit never consumes the session.
-    if !state.try_finish(Terminal::Submitted) {
+    // Build the result first, then claim the terminal state: `try_finish`
+    // stores the outcome and claims the terminal in one atomic step, so
+    // there is no window where the session is finished but its outcome is
+    // unreadable. Claimed only after full validation, so a rejected submit
+    // never consumes the session.
+    let result = state.build_result(&draft);
+    if !state.try_finish(Outcome::Submitted(Box::new(result))) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "already submitted"})),
         )
             .into_response();
     }
-
-    let result = state.build_result(&draft);
-    let _ = state
-        .outcome_tx
-        .send(Outcome::Submitted(Box::new(result)))
-        .await;
     Json(json!({"ok": true})).into_response()
 }
 
@@ -280,15 +306,13 @@ async fn post_abort(State(state): State<Arc<SessionState>>, Path(token): Path<St
         return not_found();
     }
 
-    if !state.try_finish(Terminal::Aborted) {
+    if !state.try_finish(Outcome::Aborted) {
         return (
             StatusCode::CONFLICT,
             Json(json!({"error": "already submitted"})),
         )
             .into_response();
     }
-
-    let _ = state.outcome_tx.send(Outcome::Aborted).await;
     Json(json!({"ok": true})).into_response()
 }
 
@@ -302,6 +326,10 @@ pub fn build_router(state: Arc<SessionState>) -> Router {
         .route("/api/{token}/abort", post(post_abort))
         .with_state(state)
         .layer(middleware::from_fn(security_headers))
+        .layer(middleware::from_fn_with_state(
+            REQUEST_TIMEOUT,
+            request_timeout,
+        ))
 }
 
 #[cfg(test)]
@@ -333,7 +361,7 @@ index 1111111..2222222 100644
 
     const TOKEN: &str = "sesstoken";
 
-    fn build_state() -> (Arc<SessionState>, tokio::sync::mpsc::Receiver<Outcome>) {
+    fn build_state() -> Arc<SessionState> {
         let files = parse_unified_diff(MODIFIED);
         let input = ConcernsInput {
             version: 1,
@@ -365,8 +393,8 @@ index 1111111..2222222 100644
         assert_eq!(mapping.unmapped.len(), 1);
 
         let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let state = Arc::new(SessionState {
+        let (tx, _rx) = tokio::sync::watch::channel(());
+        Arc::new(SessionState {
             title: "review title".to_string(),
             summary: Some("summary text".to_string()),
             files,
@@ -378,10 +406,9 @@ index 1111111..2222222 100644
             repo_root: None,
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
-            finished: std::sync::Mutex::new(None),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
             outcome_tx: tx,
-        });
-        (state, rx)
+        })
     }
 
     /// A rename+modify diff, so old-side anchors live on `old-name.ts` and
@@ -400,7 +427,7 @@ index 1111111..2222222 100644
 +beta
 ";
 
-    fn build_rename_state() -> (Arc<SessionState>, tokio::sync::mpsc::Receiver<Outcome>) {
+    fn build_rename_state() -> Arc<SessionState> {
         let files = parse_unified_diff(RENAMED);
         let input = ConcernsInput {
             version: 1,
@@ -422,8 +449,8 @@ index 1111111..2222222 100644
         assert!(mapping.unmapped.is_empty());
 
         let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let state = Arc::new(SessionState {
+        let (tx, _rx) = tokio::sync::watch::channel(());
+        Arc::new(SessionState {
             title: "rename review".to_string(),
             summary: None,
             files,
@@ -435,14 +462,13 @@ index 1111111..2222222 100644
             repo_root: None,
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
-            finished: std::sync::Mutex::new(None),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
             outcome_tx: tx,
-        });
-        (state, rx)
+        })
     }
 
     /// Binary ファイルを1つ含む state（c1 が whole-file location で claim）。
-    fn build_opaque_state() -> (Arc<SessionState>, tokio::sync::mpsc::Receiver<Outcome>) {
+    fn build_opaque_state() -> Arc<SessionState> {
         let mut files = parse_unified_diff(MODIFIED);
         files.push(FileDiff {
             old_path: Some("logo.png".to_string()),
@@ -485,8 +511,8 @@ index 1111111..2222222 100644
         assert!(mapping.unmapped.is_empty());
 
         let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        let state = Arc::new(SessionState {
+        let (tx, _rx) = tokio::sync::watch::channel(());
+        Arc::new(SessionState {
             title: "opaque review".to_string(),
             summary: None,
             files,
@@ -498,10 +524,9 @@ index 1111111..2222222 100644
             repo_root: None,
             started_at: chrono::Utc::now(),
             draft: std::sync::Mutex::new(Draft::default()),
-            finished: std::sync::Mutex::new(None),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
             outcome_tx: tx,
-        });
-        (state, rx)
+        })
     }
 
     async fn call(app: Router, req: http::Request<Body>) -> (StatusCode, serde_json::Value) {
@@ -552,8 +577,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn get_session_ok() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);
         let concerns = body["concerns"].as_array().unwrap();
@@ -567,8 +592,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn wrong_token_404() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let (status, body) = call(app, get("/api/deadbeef/session")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.is_null());
@@ -576,8 +601,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn draft_roundtrip() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
 
         let draft_body = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
@@ -597,8 +622,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn draft_roundtrip_acknowledged_opaque() {
-        let (state, _rx) = build_opaque_state();
-        let app = build_router(state);
+        let state = build_opaque_state();
+        let app = build_router(state.clone());
 
         let draft_body = json!({
             "concerns": {},
@@ -619,8 +644,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_incomplete_422() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
 
         let draft_body = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
@@ -641,8 +666,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_complete_emits_outcome() {
-        let (state, mut rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
 
         let draft_body = json!({
             "concerns": {
@@ -657,7 +682,7 @@ index 1111111..2222222 100644
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
 
-        let outcome = rx.recv().await.unwrap();
+        let outcome = state.finished_outcome().unwrap();
         match outcome {
             Outcome::Submitted(r) => {
                 assert_eq!(r.decision, Decision::RequestChanges);
@@ -670,8 +695,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_request_changes_without_reason_422() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let draft = json!({
             "concerns": {
                 "c1": { "verdict": "request-changes", "comments": [] },
@@ -689,8 +714,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_request_changes_with_general_comment_succeeds() {
-        let (state, mut rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let draft = json!({
             "concerns": {
                 "c1": { "verdict": "request-changes", "comments": [] },
@@ -701,13 +726,16 @@ index 1111111..2222222 100644
         });
         let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
+        assert!(matches!(
+            state.finished_outcome().unwrap(),
+            Outcome::Submitted(_)
+        ));
     }
 
     #[tokio::test]
     async fn second_submit_409() {
-        let (state, mut rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
 
         let draft_body = json!({
             "concerns": {
@@ -723,7 +751,7 @@ index 1111111..2222222 100644
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        rx.recv().await.unwrap();
+        state.finished_outcome().unwrap();
 
         let (status, body) =
             call(app, post_json(&format!("/api/{TOKEN}/submit"), draft_body)).await;
@@ -733,14 +761,14 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn abort_emits_outcome() {
-        let (state, mut rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
 
         let (status, body) = call(app, post_empty(&format!("/api/{TOKEN}/abort"))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["ok"], true);
 
-        let outcome = rx.recv().await.unwrap();
+        let outcome = state.finished_outcome().unwrap();
         assert!(matches!(outcome, Outcome::Aborted));
     }
 
@@ -759,8 +787,8 @@ index 1111111..2222222 100644
     /// Submits `draft` and asserts a 422 "invalid draft" whose details all
     /// mention every string in `expect_in_details`.
     async fn assert_invalid_draft(draft: serde_json::Value, expect_in_details: &[&str]) {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
         assert_eq!(body["error"], "invalid draft");
@@ -850,8 +878,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_valid_anchors_200() {
-        let (state, mut rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
 
         // Hunk 0 (c1): context line old side, removed line old side, added
         // line new side. Hunk 1 (_unmapped): added line new side.
@@ -872,7 +900,7 @@ index 1111111..2222222 100644
         let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
-        let outcome = rx.recv().await.unwrap();
+        let outcome = state.finished_outcome().unwrap();
         match outcome {
             Outcome::Submitted(r) => {
                 assert_eq!(r.version, 2);
@@ -886,8 +914,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_old_side_against_new_path_422_then_old_path_200() {
-        let (state, mut rx) = build_rename_state();
-        let app = build_router(state);
+        let state = build_rename_state();
+        let app = build_router(state.clone());
 
         // The old side of a renamed file anchors on old-name.ts, so the
         // same line addressed via new-name.ts on the old side must fail...
@@ -912,13 +940,16 @@ index 1111111..2222222 100644
         });
         let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), good)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
+        assert!(matches!(
+            state.finished_outcome().unwrap(),
+            Outcome::Submitted(_)
+        ));
     }
 
     #[tokio::test]
     async fn submit_without_opaque_ack_422() {
-        let (state, _rx) = build_opaque_state();
-        let app = build_router(state);
+        let state = build_opaque_state();
+        let app = build_router(state.clone());
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": []
@@ -930,8 +961,8 @@ index 1111111..2222222 100644
 
     #[tokio::test]
     async fn submit_with_opaque_ack_succeeds() {
-        let (state, mut rx) = build_opaque_state();
-        let app = build_router(state);
+        let state = build_opaque_state();
+        let app = build_router(state.clone());
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": [],
@@ -939,13 +970,16 @@ index 1111111..2222222 100644
         });
         let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), draft)).await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
-        assert!(matches!(rx.recv().await.unwrap(), Outcome::Submitted(_)));
+        assert!(matches!(
+            state.finished_outcome().unwrap(),
+            Outcome::Submitted(_)
+        ));
     }
 
     #[tokio::test]
     async fn submit_ack_on_non_opaque_file_422() {
-        let (state, _rx) = build_opaque_state();
-        let app = build_router(state);
+        let state = build_opaque_state();
+        let app = build_router(state.clone());
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": [],
@@ -973,8 +1007,8 @@ index 1111111..2222222 100644
             });
         let suffix = key.strip_prefix("assets/").unwrap();
 
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let res = app
             .oneshot(get(&format!("/assets/{suffix}")))
             .await
@@ -1014,8 +1048,8 @@ index 1111111..2222222 100644
     /// leaking it would leak session access.
     #[tokio::test]
     async fn api_response_has_security_and_no_store_headers() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let res = app
             .oneshot(get(&format!("/api/{TOKEN}/session")))
             .await
@@ -1059,8 +1093,8 @@ index 1111111..2222222 100644
     /// regress into an uncached bare 404 with no security headers.
     #[tokio::test]
     async fn unmatched_path_404_has_no_store_and_csp() {
-        let (state, _rx) = build_state();
-        let app = build_router(state);
+        let state = build_state();
+        let app = build_router(state.clone());
         let res = app.oneshot(get("/totally/unknown/path")).await.unwrap();
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
@@ -1075,5 +1109,83 @@ index 1111111..2222222 100644
                 .is_some(),
             "expected a Content-Security-Policy header on an unmatched 404"
         );
+    }
+
+    /// Complete draft with every required verdict approved.
+    fn complete_draft() -> serde_json::Value {
+        json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": [] },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": []
+        })
+    }
+
+    /// Race a submit against an abort many times: every round must resolve
+    /// to exactly one HTTP 200, one 409, and a published outcome matching
+    /// the 200 winner. This is the regression net for the old
+    /// terminal-claim/outcome-send gap, where a winner could claim the
+    /// terminal state and then fail to deliver the outcome.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_submit_abort_resolves_to_exactly_one_outcome() {
+        for round in 0..250 {
+            let state = build_state();
+            let app = build_router(state.clone());
+
+            let submit_app = app.clone();
+            let submit = tokio::spawn(async move {
+                call(
+                    submit_app,
+                    post_json(&format!("/api/{TOKEN}/submit"), complete_draft()),
+                )
+                .await
+            });
+            let abort_app = app.clone();
+            let abort = tokio::spawn(async move {
+                call(abort_app, post_empty(&format!("/api/{TOKEN}/abort"))).await
+            });
+
+            let (submit_res, abort_res) = (submit.await.unwrap(), abort.await.unwrap());
+            let winners = [submit_res.0, abort_res.0]
+                .iter()
+                .filter(|s| **s == StatusCode::OK)
+                .count();
+            assert_eq!(
+                winners, 1,
+                "round {round}: expected exactly one winner, got submit={} abort={}",
+                submit_res.0, abort_res.0
+            );
+
+            let outcome = state
+                .finished_outcome()
+                .expect("a winner must have published an outcome");
+            match (submit_res.0 == StatusCode::OK, &outcome) {
+                (true, Outcome::Submitted(_)) | (false, Outcome::Aborted) => {}
+                other => panic!("round {round}: HTTP winner and outcome disagree: {other:?}"),
+            }
+        }
+    }
+
+    /// A handler that overruns the request timeout gets a 408 instead of
+    /// holding its connection open forever.
+    #[tokio::test]
+    async fn overrunning_request_gets_408() {
+        let app = Router::new()
+            .route(
+                "/slow",
+                axum::routing::get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    "too late"
+                }),
+            )
+            .layer(middleware::from_fn_with_state(
+                std::time::Duration::from_millis(20),
+                request_timeout,
+            ));
+        let (status, body) = call(app, get("/slow")).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(body["error"], "request timed out");
     }
 }

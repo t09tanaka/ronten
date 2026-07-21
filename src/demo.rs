@@ -8,7 +8,7 @@ use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::ConcernsInput;
 use crate::review::serve_session;
 use crate::server::new_token;
-use crate::session::{Draft, SessionState};
+use crate::session::{Draft, Phase, SessionState};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
@@ -39,7 +39,7 @@ pub async fn run(args: DemoArgs) -> u8 {
     let snapshot = crate::snapshot::ReviewSnapshot::without_git("demo", &files, &input);
     let summary = input.summary.clone();
     let token = new_token();
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = tokio::sync::watch::channel(());
     let state = Arc::new(SessionState {
         title: "ronten demo".to_string(),
         summary,
@@ -52,7 +52,7 @@ pub async fn run(args: DemoArgs) -> u8 {
         repo_root: None,
         started_at: chrono::Utc::now(),
         draft: Mutex::new(Draft::default()),
-        finished: Mutex::new(None),
+        phase: Mutex::new(Phase::Reviewing),
         outcome_tx: tx,
     });
 

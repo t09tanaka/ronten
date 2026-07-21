@@ -154,7 +154,7 @@ pub enum Assurance {
 ///
 /// Abort/timeout exits never emit stdout JSON, so an `Abort` decision was
 /// unreachable in the output contract; it is intentionally not a variant
-/// here (see `Terminal`/`Outcome` for how those exits are represented).
+/// here (see `Phase`/`Outcome` for how those exits are represented).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum Decision {
