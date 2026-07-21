@@ -113,12 +113,53 @@ describe('requiresAck', () => {
     expect(requiresAck(makeFile({ content_kind: 'text' }))).toBe(false)
   })
 
-  it('requires an ack when either side is a gitlink', () => {
+  it('requires an ack when a gitlink pointer actually moves', () => {
     expect(
-      requiresAck(makeFile({ content_kind: 'text', old_type: 'gitlink', new_type: 'gitlink' })),
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          old_type: 'gitlink',
+          new_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      ),
     ).toBe(true)
-    expect(requiresAck(makeFile({ content_kind: 'text', old_type: 'gitlink' }))).toBe(true)
-    expect(requiresAck(makeFile({ content_kind: 'text', new_type: 'gitlink' }))).toBe(true)
+    // Added / deleted gitlink: one oid side is null, so the pointer moved.
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          old_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ),
+    ).toBe(true)
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          new_type: 'gitlink',
+          new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      ),
+    ).toBe(true)
+  })
+
+  it('does not require an ack for a same-oid pure rename of a gitlink', () => {
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          old_type: 'gitlink',
+          new_type: 'gitlink',
+          old_mode: '160000',
+          new_mode: '160000',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          new_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ),
+    ).toBe(false)
   })
 
   it('requires an ack for a mode change with both sides present', () => {
@@ -173,13 +214,28 @@ describe('fileNotices', () => {
     expect(fileNotices(makeFile())).toEqual([])
   })
 
-  it('flags a submodule pointer change when either side is a gitlink', () => {
-    expect(fileNotices(makeFile({ old_type: 'gitlink' }))).toEqual([
-      'Submodule pointer change — nested diff not shown',
-    ])
-    expect(fileNotices(makeFile({ new_type: 'gitlink' }))).toEqual([
-      'Submodule pointer change — nested diff not shown',
-    ])
+  it('flags a submodule pointer change only when the pointer moves', () => {
+    expect(
+      fileNotices(
+        makeFile({ old_type: 'gitlink', old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }),
+      ),
+    ).toEqual(['Submodule pointer change — nested diff not shown'])
+    expect(
+      fileNotices(
+        makeFile({ new_type: 'gitlink', new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }),
+      ),
+    ).toEqual(['Submodule pointer change — nested diff not shown'])
+    // Same-oid pure rename: nothing hidden, no notice.
+    expect(
+      fileNotices(
+        makeFile({
+          old_type: 'gitlink',
+          new_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          new_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ),
+    ).toEqual([])
   })
 
   it('flags an LFS pointer', () => {
@@ -189,7 +245,15 @@ describe('fileNotices', () => {
   })
 
   it('stacks both notices for an LFS-pointer gitlink combination', () => {
-    expect(fileNotices(makeFile({ old_type: 'gitlink', lfs_pointer: true }))).toEqual([
+    expect(
+      fileNotices(
+        makeFile({
+          old_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          lfs_pointer: true,
+        }),
+      ),
+    ).toEqual([
       'Submodule pointer change — nested diff not shown',
       'Git LFS pointer — actual content not shown',
     ])

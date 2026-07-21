@@ -5,12 +5,14 @@
 import type { ContentKind, FileDiff } from './types'
 
 /** Mirror of the server's `FileDiff::requires_ack()` (gitdiff.rs): opaque
- * content, a gitlink on either side, or a mode change with both sides
- * present. Submit validation rejects drafts missing these acks, so this
- * must stay in lockstep with the server condition. */
+ * content, a gitlink whose pointer actually moved (a same-oid pure rename
+ * moves nothing), or a mode change with both sides present. Submit
+ * validation rejects drafts missing these acks, so this must stay in
+ * lockstep with the server condition. */
 export function requiresAck(f: FileDiff): boolean {
   if (f.content_kind !== 'text') return true
-  if (f.old_type === 'gitlink' || f.new_type === 'gitlink') return true
+  const gitlinkInvolved = f.old_type === 'gitlink' || f.new_type === 'gitlink'
+  if (gitlinkInvolved && f.old_oid !== f.new_oid) return true
   return f.old_mode != null && f.new_mode != null && f.old_mode !== f.new_mode
 }
 
@@ -30,7 +32,8 @@ export function typeChangeBadge(f: FileDiff): string | null {
  * shown in the diff body (submodule pointers, LFS pointers). */
 export function fileNotices(f: FileDiff): string[] {
   const notices: string[] = []
-  if (f.old_type === 'gitlink' || f.new_type === 'gitlink') {
+  const gitlinkInvolved = f.old_type === 'gitlink' || f.new_type === 'gitlink'
+  if (gitlinkInvolved && f.old_oid !== f.new_oid) {
     notices.push('Submodule pointer change — nested diff not shown')
   }
   if (f.lfs_pointer) {

@@ -83,13 +83,16 @@ impl FileDiff {
 
     /// submit 時に明示 acknowledge が必要な変更。内容が描画されないもの
     /// （opaque）に加えて、レビュー画面の本文だけでは重大さが伝わらない
-    /// 変更 — gitlink（submodule pointer だけで中身の diff は表示されない）、
-    /// mode 変更（実行属性の付与・symlink 化など）— を含む。
+    /// 変更 — gitlink の pointer 変更（submodule pointer だけで中身の diff は
+    /// 表示されない）、mode 変更（実行属性の付与・symlink 化など）— を含む。
+    /// gitlink の同一 oid の pure rename は pointer が動いていないので対象外。
     pub fn requires_ack(&self) -> bool {
         if self.is_opaque() {
             return true;
         }
-        if self.old_type == Some(FileType::Gitlink) || self.new_type == Some(FileType::Gitlink) {
+        let gitlink_involved =
+            self.old_type == Some(FileType::Gitlink) || self.new_type == Some(FileType::Gitlink);
+        if gitlink_involved && self.old_oid != self.new_oid {
             return true;
         }
         // Mode change with both sides present (e.g. 100644 -> 100755, or a
@@ -370,6 +373,28 @@ mod tests {
             lfs_pointer: false,
             hunks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gitlink_requires_ack_only_when_pointer_moves() {
+        let gitlink = |old_oid: &str, new_oid: &str| FileDiff {
+            old_type: Some(FileType::Gitlink),
+            new_type: Some(FileType::Gitlink),
+            old_mode: Some("160000".to_string()),
+            new_mode: Some("160000".to_string()),
+            old_oid: Some(old_oid.to_string()),
+            new_oid: Some(new_oid.to_string()),
+            ..file_diff_with_content_kind(ContentKind::Text)
+        };
+        // Pointer moved -> ack; same-oid pure rename -> nothing hidden.
+        assert!(gitlink("aaaa", "bbbb").requires_ack());
+        assert!(!gitlink("aaaa", "aaaa").requires_ack());
+        // Added gitlink: one side absent counts as a pointer move.
+        let added = FileDiff {
+            old_oid: None,
+            ..gitlink("aaaa", "bbbb")
+        };
+        assert!(added.requires_ack());
     }
 
     #[test]
@@ -1257,24 +1282,29 @@ fn file_type_name(t: FileType) -> &'static str {
 /// acknowledgement for the same categories.
 fn push_shape_warnings(
     warnings: &mut Vec<Warning>,
-    path: &str,
-    old_mode: &str,
-    new_mode: &str,
+    entry: &RawEntry,
     old_type: Option<FileType>,
     new_type: Option<FileType>,
     lfs_pointer: bool,
 ) {
+    let path = display_path(entry);
+    let (old_mode, new_mode) = (&entry.old_mode, &entry.new_mode);
+    let oid_changed = entry.old_oid != entry.new_oid;
     if old_type == Some(FileType::Gitlink) || new_type == Some(FileType::Gitlink) {
-        warnings.push(
-            Warning::new(
-                "GITLINK_CHANGED",
-                Severity::Warning,
-                format!(
-                    "submodule pointer changed: {path} (only the commit pointer is shown; the submodule's own diff is NOT displayed here)"
-                ),
-            )
-            .with_path(path),
-        );
+        // A same-oid pure rename of a submodule path moves no pointer, so
+        // there is nothing hidden to warn about.
+        if oid_changed {
+            warnings.push(
+                Warning::new(
+                    "GITLINK_CHANGED",
+                    Severity::Warning,
+                    format!(
+                        "submodule pointer changed: {path} (only the commit pointer is shown; the submodule's own diff is NOT displayed here)"
+                    ),
+                )
+                .with_path(path),
+            );
+        }
     } else if let (Some(o), Some(n)) = (old_type, new_type) {
         if o != n {
             warnings.push(
@@ -1611,15 +1641,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
         };
         let old_type = file_type_of_mode(&entry.old_mode);
         let new_type = file_type_of_mode(&entry.new_mode);
-        push_shape_warnings(
-            &mut warnings,
-            display_path(entry),
-            &entry.old_mode,
-            &entry.new_mode,
-            old_type,
-            new_type,
-            lfs_pointer,
-        );
+        push_shape_warnings(&mut warnings, entry, old_type, new_type, lfs_pointer);
         files.push(FileDiff {
             old_path,
             new_path,

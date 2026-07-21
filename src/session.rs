@@ -47,8 +47,10 @@ pub struct Draft {
     pub concerns: HashMap<String, ConcernDraft>,
     #[serde(default)]
     pub general_comments: Vec<String>,
-    /// content が描画されない file（FileDiff::is_opaque）の明示 acknowledge。
-    /// 値は session payload の files[] における index。
+    /// 明示 acknowledge が必要な変更（FileDiff::requires_ack — opaque な
+    /// content に加えて gitlink pointer 変更・mode 変更）への acknowledge。
+    /// 値は session payload の files[] における index。フィールド名は当初の
+    /// opaque 専用時代のままだが、対象は requires_ack 全体。
     #[serde(default)]
     pub acknowledged_opaque: Vec<usize>,
 }
