@@ -308,10 +308,10 @@ pub async fn serve_session(
 }
 
 /// Writes `contents` to `path` atomically: writes to a sibling temp file
-/// (`{filename}.tmp.{pid}`) in the same directory, flushes it to disk, then
-/// renames it over `path`. This closes a race where a poller reading `path`
-/// (e.g. an orchestrator watching for `--out` to appear) could otherwise
-/// observe a partially-written file. The temp file is removed on a
+/// (`{filename}.tmp.{pid}.{n}`) in the same directory, flushes it to disk,
+/// then renames it over `path`. This closes a race where a poller reading
+/// `path` (e.g. an orchestrator watching for `--out` to appear) could
+/// otherwise observe a partially-written file. The temp file is removed on a
 /// best-effort basis if any step fails.
 fn write_out_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let file_name = path.file_name().ok_or_else(|| {
@@ -320,16 +320,43 @@ fn write_out_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<(
             "--out path has no file name",
         )
     })?;
-    let tmp_name = format!("{}.tmp.{}", file_name.to_string_lossy(), std::process::id());
-    let tmp_path = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        Some(dir) => dir.join(tmp_name),
-        None => PathBuf::from(tmp_name),
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let pid = std::process::id();
+
+    // The temp name is predictable (pid + a small counter), so in a shared
+    // writable directory another actor could plant a symlink at that exact
+    // path ahead of time to redirect the write at some other file.
+    // `create_new` (O_EXCL) refuses to open a path that already exists —
+    // including a symlink — instead of following it the way `File::create`
+    // would, closing that TOCTOU. The counter only exists to step past a
+    // name collision with a leftover from a previous crash; a handful of
+    // attempts is plenty since collisions here are expected to be rare.
+    let mut attempt: u32 = 0;
+    let (tmp_path, mut file) = loop {
+        let tmp_name = format!("{}.tmp.{pid}.{attempt}", file_name.to_string_lossy());
+        let tmp_path = match dir {
+            Some(dir) => dir.join(&tmp_name),
+            None => PathBuf::from(&tmp_name),
+        };
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        match open_options.open(&tmp_path) {
+            Ok(f) => break (tmp_path, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     let write_result = (|| -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp_path)?;
-        f.write_all(contents.as_bytes())?;
-        f.sync_all()?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
         Ok(())
     })();
     if let Err(e) = write_result {

@@ -2,7 +2,7 @@
 name = "ronten"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.82"
+rust-version = "1.85"
 description = "Concern-based PR review viewer: agents propose concerns, humans review in the browser, agents get JSON back"
 license = "MIT"
 # The published crate ships the prebuilt frontend (frontend/dist) instead of

@@ -499,13 +499,25 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
 /// True if any tracked file has uncommitted changes (staged or unstaged),
 /// via `git status --porcelain -uno` (`-uno` excludes untracked files: they
 /// were never committed, so they can't silently escape the `<base>...HEAD`
-/// diff the way an uncommitted edit to a tracked file can). This drives a
-/// display-only startup warning, so any git invocation failure here fails
-/// open (returns `false`, review proceeds) rather than blocking the review
-/// over a check that isn't load-bearing for correctness.
+/// diff the way an uncommitted edit to a tracked file can). `-c
+/// core.fsmonitor=false` disables a repo-local fsmonitor hook (which could
+/// otherwise short-circuit or lie about the working-tree scan) and
+/// `--ignore-submodules=none` overrides any repo-local `.gitmodules`/config
+/// setting that would hide dirty submodules from this check — same hardened,
+/// don't-trust-repo-local-config posture as [`base_git`]'s env scrubbing.
+/// This drives a display-only startup warning, so any git invocation failure
+/// here fails open (returns `false`, review proceeds) rather than blocking
+/// the review over a check that isn't load-bearing for correctness.
 pub fn has_tracked_changes(root: &std::path::Path) -> bool {
     match git_cmd(root)
-        .args(["status", "--porcelain", "-uno"])
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "status",
+            "--porcelain",
+            "-uno",
+            "--ignore-submodules=none",
+        ])
         .output()
     {
         Ok(output) if output.status.success() => !output.stdout.is_empty(),
