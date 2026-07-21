@@ -54,13 +54,23 @@ struct SchemaArgs {
 fn run(cli: Cli) -> u8 {
     match cli {
         Cli::Schema(a) => schema_cmd::run(a.input, a.output),
-        Cli::Review(a) => tokio::runtime::Runtime::new()
-            .expect("failed to start tokio runtime")
-            .block_on(review::run(a)),
-        Cli::Demo(a) => tokio::runtime::Runtime::new()
-            .expect("failed to start tokio runtime")
-            .block_on(demo::run(a)),
+        Cli::Review(a) => block_on_and_exit_promptly(review::run(a)),
+        Cli::Demo(a) => block_on_and_exit_promptly(demo::run(a)),
     }
+}
+
+/// Runs `fut` to completion, then shuts the runtime down WITHOUT waiting for
+/// leftover blocking tasks. Dropping the runtime normally blocks until every
+/// `spawn_blocking` task finishes — so a wedged git subprocess (stalled
+/// filesystem, misbehaving hook) inside the submit-time freshness check
+/// could hold the process open indefinitely even after the outcome was
+/// decided and printed. `shutdown_background` makes the bounded-exit
+/// guarantee hold; a truly wedged git child is left to the OS to reap.
+fn block_on_and_exit_promptly(fut: impl std::future::Future<Output = u8>) -> u8 {
+    let runtime = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
+    let code = runtime.block_on(fut);
+    runtime.shutdown_background();
+    code
 }
 
 fn main() {
