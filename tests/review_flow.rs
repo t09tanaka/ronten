@@ -752,6 +752,66 @@ fn symlink_alias_does_not_exempt_tracked_change() {
     );
 }
 
+/// Regression for a second canonicalize hole: resolving the concerns path's
+/// *own* final component (not just aliasing another status entry, as in
+/// `symlink_alias_does_not_exempt_tracked_change` above) let a gitignored
+/// symlink at the concerns path stand in for whatever it points at.
+///
+/// Construction: `.gitignore` (committed) ignores `concerns.json`.
+/// `forgotten.rs` is an untracked file containing valid concerns JSON.
+/// `concerns.json` is a symlink to `forgotten.rs` — itself gitignored, so
+/// `git status` reports neither an untracked nor a tracked entry for
+/// `concerns.json` at all, only `? forgotten.rs`. Passed as `--concerns
+/// concerns.json`, the old (fully-canonicalizing) resolution would follow
+/// the symlink and return "forgotten.rs" as the exempt repo-relative path —
+/// removing the one real untracked entry `git status` reported, even though
+/// `forgotten.rs` is an unrelated file the symlink merely happens to point
+/// at. The fixed resolution never canonicalizes the leaf, so it returns
+/// "concerns.json" (which never appears in `untracked`, since it's
+/// gitignored) — `forgotten.rs` must still block start.
+#[cfg(unix)]
+#[test]
+fn ignored_symlink_concerns_does_not_exempt_other_untracked() {
+    let td = fixture_repo();
+    // The fixture's default untracked concerns.json is irrelevant here
+    // (concerns.json is redefined below as a gitignored symlink) — remove it
+    // first so it doesn't shadow the construction.
+    std::fs::remove_file(td.path().join("concerns.json")).unwrap();
+    std::fs::write(td.path().join(".gitignore"), "concerns.json\n").unwrap();
+    git(td.path(), &["add", ".gitignore"]);
+    git(td.path(), &["commit", "-m", "ignore concerns.json"]);
+    std::fs::write(td.path().join("forgotten.rs"), CONCERNS).unwrap();
+    std::os::unix::fs::symlink(
+        td.path().join("forgotten.rs"),
+        td.path().join("concerns.json"),
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(17),
+        "the untracked file the gitignored symlink points at must still block start"
+    );
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("untracked file: forgotten.rs"),
+        "stderr must name forgotten.rs as untracked, not silently exempt it via the gitignored symlink leaf: {stderr}"
+    );
+}
+
 /// A concerns file that is tracked but has no uncommitted modifications must
 /// not be reported as dirty (no false positive from the new comparison).
 #[test]

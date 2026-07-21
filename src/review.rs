@@ -114,19 +114,36 @@ fn out_prospective_abs(out: &Path) -> Option<PathBuf> {
 /// compared against status output without reopening the symlink-alias hole
 /// described on [`drop_exempt`].
 ///
-/// Resolution: canonicalize the concerns path (it must exist to be read at
-/// all) and the repo root, then lexically `strip_prefix` the latter from the
-/// former. Returns `None` — meaning "no exemption is possible" — when
-/// concerns come from stdin (`concerns == "-"`, nothing on disk to compare),
-/// when canonicalization fails, or when the canonicalized concerns path
-/// falls outside the canonicalized repo root. All of these are fail-closed:
-/// no exemption is applied and the dirty gate is free to report the path
-/// dirty like any other.
+/// Deliberately never canonicalizes the concerns path's *final* component —
+/// only its parent directory is resolved (same pattern as
+/// [`out_prospective_abs`]), and the literal `file_name()` is re-appended.
+/// Canonicalizing the leaf too would resolve a concerns path that is itself
+/// a symlink to whatever it points at, so a gitignored `concerns.json ->
+/// forgotten.rs` symlink would make this function return `forgotten.rs` as
+/// the exempt path — hiding an unrelated untracked file that `git status`
+/// only ever reports under the symlink's own name, never the target's.
+/// Resolving only the parent still allows comparison against the
+/// canonicalized repo root while leaving the leaf name exactly as `git
+/// status` would report it.
+///
+/// Returns `None` — meaning "no exemption is possible" — when concerns come
+/// from stdin (`concerns == "-"`, nothing on disk to compare), when the
+/// concerns path has no file name, when the parent can't be canonicalized,
+/// or when the resulting path falls outside the canonicalized repo root.
+/// All of these are fail-closed: no exemption is applied and the dirty gate
+/// is free to report the path dirty like any other.
 fn concerns_repo_relative(concerns: &str, root: &Path) -> Option<String> {
     if concerns == "-" {
         return None;
     }
-    let concerns_abs = std::fs::canonicalize(concerns).ok()?;
+    let concerns_path = Path::new(concerns);
+    let name = concerns_path.file_name()?;
+    let parent = concerns_path.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_canon = match parent {
+        Some(parent) => std::fs::canonicalize(parent).ok()?,
+        None => std::fs::canonicalize(std::env::current_dir().ok()?).ok()?,
+    };
+    let concerns_abs = parent_canon.join(name);
     let root_abs = std::fs::canonicalize(root).ok()?;
     let rel = concerns_abs.strip_prefix(&root_abs).ok()?;
     let rel = rel.to_str()?;
@@ -406,11 +423,11 @@ pub async fn run(args: ReviewArgs) -> u8 {
     // is not exempt at all: Task 1.1's preflight-then-reserve ordering means
     // `--out` never exists (tracked or untracked) at dirty-gate time, so no
     // exemption for it is needed.
-    let concerns_rel = concerns_repo_relative(&args.concerns, &root);
     let dirty = match args.dirty_policy {
         DirtyPolicy::Ignore => None,
         DirtyPolicy::Error | DirtyPolicy::Warn => match worktree_status(&root) {
             Ok(status) => {
+                let concerns_rel = concerns_repo_relative(&args.concerns, &root);
                 let status = drop_exempt(status, concerns_rel.as_deref());
                 (!status.is_clean()).then_some(status)
             }
