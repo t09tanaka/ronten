@@ -50,21 +50,33 @@ fn fixture_repo() -> tempfile::TempDir {
 
 /// Reads the child's stderr line by line until the `Review session: <url>`
 /// banner and returns the URL. Panics if the process exits first.
+///
+/// After the banner is found, a background thread keeps draining the pipe to
+/// EOF rather than dropping the read end here: the child may still write to
+/// stderr later (e.g. an `--out` write failure warning), and dropping our end
+/// of the pipe would make that write hit a broken pipe and panic the child.
 fn read_review_url(child: &mut Child) -> String {
     use std::io::BufRead;
     let stderr = child.stderr.take().unwrap();
     let mut reader = std::io::BufReader::new(stderr);
     let mut line = String::new();
-    loop {
+    let url = loop {
         line.clear();
         assert!(
             reader.read_line(&mut line).unwrap() > 0,
             "process exited before printing URL"
         );
         if let Some(rest) = line.trim().strip_prefix("Review session: ") {
-            return rest.to_string();
+            break rest.to_string();
         }
-    }
+    };
+    std::thread::spawn(move || {
+        let mut sink = String::new();
+        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
+            sink.clear();
+        }
+    });
+    url
 }
 
 /// Spawns `ronten review --base main --concerns concerns.json --no-open`
@@ -197,6 +209,45 @@ fn out_flag_writes_file() {
     // stdout is pretty JSON + trailing newline from println!; file is the same
     // pretty JSON without the trailing newline.
     assert_eq!(file, stdout.trim_end_matches('\n'));
+
+    // Atomicity regression: the write goes through a same-directory temp
+    // file that is renamed into place, so no `.tmp.<pid>` sibling should
+    // ever survive a successful write.
+    let leftovers: Vec<_> = std::fs::read_dir(td.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|name| name.contains(".tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp file(s) left behind after atomic write: {leftovers:?}"
+    );
+}
+
+#[test]
+fn out_write_failure_exits_15_with_stdout_intact() {
+    // The parent directory of `--out` doesn't exist, so the atomic
+    // write must fail — but the review outcome already happened, so
+    // stdout must still carry the correct result JSON, only the exit
+    // code changes (to the dedicated OUT_FAILED code), regardless of the
+    // approve/request-changes decision.
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--out", "no-such-dir/result.json"]);
+
+    let resp = ureq::post(&format!("{}/submit", api_base(&url)))
+        .send_json(full_draft("approve"))
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(15));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["decision"], "approve");
+    assert!(
+        !td.path().join("no-such-dir").exists(),
+        "the missing parent directory must not have been created as a side effect"
+    );
 }
 
 #[test]

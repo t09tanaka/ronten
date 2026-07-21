@@ -210,9 +210,14 @@ pub async fn serve_session(
     let router = build_router(state.clone());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.notified().await });
-    let server_handle = tokio::spawn(async move {
-        let _ = server.await;
-    });
+    // Not fire-and-forget: this handle is also a `select!` branch below, so an
+    // early server death (e.g. the accept loop erroring out) is noticed
+    // instead of leaving the process hanging on `rx.recv()` forever. It is
+    // only ever awaited to completion here or in the graceful-shutdown path
+    // after `outcome` is known — `with_graceful_shutdown` means the server
+    // future does not resolve on its own before `notify.notify_one()` is
+    // called, so this branch winning the select is always unexpected.
+    let mut server_handle = tokio::spawn(async move { server.await });
 
     // Every exit path races through the same compare-and-set terminal state.
     // If ctrl-c or the deadline loses the race (a submit/abort handler
@@ -235,6 +240,16 @@ pub async fn serve_session(
                 rx.recv().await.expect("outcome channel closed before an outcome was sent")
             }
         }
+        joined = &mut server_handle => {
+            match joined {
+                Ok(Ok(())) => eprintln!(
+                    "server exited before a review outcome was recorded"
+                ),
+                Ok(Err(e)) => eprintln!("server error: {e}"),
+                Err(e) => eprintln!("server task panicked: {e}"),
+            }
+            return exitcode::SERVER_FAILED;
+        }
     };
 
     notify.notify_one();
@@ -244,19 +259,58 @@ pub async fn serve_session(
         Outcome::Submitted(result) => {
             let json = serde_json::to_string_pretty(&result).expect("result serializes to JSON");
             println!("{json}");
-            if let Some(path) = out {
-                if let Err(e) = std::fs::write(&path, &json) {
-                    eprintln!("warning: failed to write {}: {e}", path.display());
-                }
-            }
-            match result.decision {
+            let decision_code = match result.decision {
                 Decision::Approve => exitcode::APPROVED,
                 Decision::RequestChanges => exitcode::REQUEST_CHANGES,
+            };
+            if let Some(path) = out {
+                if let Err(e) = write_out_atomic(&path, &json) {
+                    eprintln!("failed to write {}: {e}", path.display());
+                    return exitcode::OUT_FAILED;
+                }
             }
+            decision_code
         }
         Outcome::Aborted => exitcode::ABORTED,
         Outcome::Timeout => exitcode::TIMEOUT,
     }
+}
+
+/// Writes `contents` to `path` atomically: writes to a sibling temp file
+/// (`{filename}.tmp.{pid}`) in the same directory, flushes it to disk, then
+/// renames it over `path`. This closes a race where a poller reading `path`
+/// (e.g. an orchestrator watching for `--out` to appear) could otherwise
+/// observe a partially-written file. The temp file is removed on a
+/// best-effort basis if any step fails.
+fn write_out_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--out path has no file name",
+        )
+    })?;
+    let tmp_name = format!("{}.tmp.{}", file_name.to_string_lossy(), std::process::id());
+    let tmp_path = match path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    };
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
