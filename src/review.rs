@@ -237,12 +237,15 @@ pub async fn serve_session(
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { shutdown.notified().await });
     // Not fire-and-forget: this handle is also a `select!` branch below, so an
-    // early server death (e.g. the accept loop erroring out) is noticed
-    // instead of leaving the process hanging on `rx.recv()` forever. It is
-    // only ever awaited to completion here or in the graceful-shutdown path
-    // after `outcome` is known — `with_graceful_shutdown` means the server
-    // future does not resolve on its own before `notify.notify_one()` is
-    // called, so this branch winning the select is always unexpected.
+    // early server death is noticed instead of leaving the process hanging on
+    // `rx.recv()` forever. axum 0.8's `serve` retries `accept()` errors
+    // internally rather than returning them, so in practice the only way this
+    // branch fires is the server task itself terminating unexpectedly (e.g. a
+    // panic inside a handler unwinding the task). It is only ever awaited to
+    // completion here or in the graceful-shutdown path after `outcome` is
+    // known — `with_graceful_shutdown` means the server future does not
+    // resolve on its own before `notify.notify_one()` is called, so this
+    // branch winning the select is always unexpected.
     let mut server_handle = tokio::spawn(async move { server.await });
 
     // Every exit path races through the same compare-and-set terminal state.
@@ -261,6 +264,10 @@ pub async fn serve_session(
             if state.try_finish(Terminal::Aborted) {
                 Outcome::Aborted
             } else {
+                // Lost the CAS race to a submit/abort handler; if that
+                // handler died after winning but before sending on `rx`
+                // this would hang forever, but handlers `send` synchronously
+                // right after `try_finish` succeeds, so that gap is accepted.
                 rx.recv().await.expect("outcome channel closed before an outcome was sent")
             }
         }
@@ -268,6 +275,7 @@ pub async fn serve_session(
             if state.try_finish(Terminal::TimedOut) {
                 Outcome::Timeout
             } else {
+                // Same losing-race acceptance as the ctrl-c branch above.
                 rx.recv().await.expect("outcome channel closed before an outcome was sent")
             }
         }

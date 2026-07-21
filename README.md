@@ -27,8 +27,11 @@ parallel worktrees can run simultaneous sessions on their own ports without conf
 ## Install
 
 ```sh
-cargo install ronten
+cargo install --locked ronten
 ```
+
+`--locked` installs exactly the dependency versions pinned in the shipped `Cargo.lock`
+rather than letting cargo re-resolve to newer semver-compatible versions at install time.
 
 The published crate ships the prebuilt frontend, so `cargo install ronten` needs only a
 Rust toolchain — no Node.js. Building from a **git checkout** requires **Node.js >= 20**
@@ -107,7 +110,7 @@ check.
 | 13 | empty diff (nothing to review) |
 | 14 | git invocation failed |
 | 15 | `--out` write failed (the review outcome still printed to stdout; only the file write failed) |
-| 16 | server failed before an outcome was reached |
+| 16 | the server task terminated unexpectedly (e.g. a panic) before an outcome was reached |
 
 ### `ronten schema`
 

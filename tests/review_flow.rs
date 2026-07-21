@@ -49,62 +49,32 @@ fn fixture_repo() -> tempfile::TempDir {
 }
 
 /// Reads the child's stderr line by line until the `Review session: <url>`
-/// banner and returns the URL. Panics if the process exits first.
+/// banner and returns the URL. Panics if the process exits first. Delegates
+/// to [`read_review_url_with_prebanner`] and discards the pre-banner text;
+/// see that function for the draining behavior after the banner is found.
+fn read_review_url(child: &mut Child) -> String {
+    read_review_url_with_prebanner(child).0
+}
+
+/// Spawns `ronten review --base main --concerns concerns.json --no-open`
+/// (plus `extra`), waits for the session URL, and returns `(child, url)`.
+/// Delegates to [`spawn_review_with_prebanner`] and discards the pre-banner
+/// text.
+fn spawn_review(dir: &Path, extra: &[&str]) -> (Child, String) {
+    let (child, url, _prebanner) = spawn_review_with_prebanner(dir, extra);
+    (child, url)
+}
+
+/// Reads the child's stderr line by line until the `Review session: <url>`
+/// banner, returning the URL together with every stderr line seen before it
+/// (joined back together) — the dirty-worktree warning (if any) prints
+/// before the banner, so this is how tests observe it. Panics if the process
+/// exits first.
 ///
 /// After the banner is found, a background thread keeps draining the pipe to
 /// EOF rather than dropping the read end here: the child may still write to
 /// stderr later (e.g. an `--out` write failure warning), and dropping our end
 /// of the pipe would make that write hit a broken pipe and panic the child.
-fn read_review_url(child: &mut Child) -> String {
-    use std::io::BufRead;
-    let stderr = child.stderr.take().unwrap();
-    let mut reader = std::io::BufReader::new(stderr);
-    let mut line = String::new();
-    let url = loop {
-        line.clear();
-        assert!(
-            reader.read_line(&mut line).unwrap() > 0,
-            "process exited before printing URL"
-        );
-        if let Some(rest) = line.trim().strip_prefix("Review session: ") {
-            break rest.to_string();
-        }
-    };
-    std::thread::spawn(move || {
-        let mut sink = String::new();
-        while reader.read_line(&mut sink).unwrap_or(0) > 0 {
-            sink.clear();
-        }
-    });
-    url
-}
-
-/// Spawns `ronten review --base main --concerns concerns.json --no-open`
-/// (plus `extra`), waits for the session URL, and returns `(child, url)`.
-fn spawn_review(dir: &Path, extra: &[&str]) -> (Child, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
-        .current_dir(dir)
-        .args([
-            "review",
-            "--base",
-            "main",
-            "--concerns",
-            "concerns.json",
-            "--no-open",
-        ])
-        .args(extra)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let url = read_review_url(&mut child);
-    (child, url)
-}
-
-/// Like [`read_review_url`], but also returns every stderr line seen before
-/// the `Review session: ` banner, joined back together. The dirty-worktree
-/// warning (if any) prints before the banner, so this is how tests observe
-/// it without disturbing `read_review_url`'s own banner-detection loop.
 fn read_review_url_with_prebanner(child: &mut Child) -> (String, String) {
     use std::io::BufRead;
     let stderr = child.stderr.take().unwrap();
@@ -131,7 +101,10 @@ fn read_review_url_with_prebanner(child: &mut Child) -> (String, String) {
     (url, prebanner)
 }
 
-/// Same as [`spawn_review`], but returns the pre-banner stderr text too.
+/// Spawns `ronten review --base main --concerns concerns.json --no-open`
+/// (plus `extra`) and returns `(child, url, prebanner)`, where `prebanner` is
+/// every stderr line seen before the `Review session: ` banner (see
+/// [`read_review_url_with_prebanner`]).
 fn spawn_review_with_prebanner(dir: &Path, extra: &[&str]) -> (Child, String, String) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
         .current_dir(dir)
