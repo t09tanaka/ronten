@@ -188,6 +188,16 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
     let mut removes: Vec<Vec<(usize, u32)>> = vec![Vec::new(); files.len()];
     let mut by_new_path: HashMap<&str, Vec<usize>> = HashMap::new();
     let mut by_old_path: HashMap<&str, Vec<usize>> = HashMap::new();
+    // (file, hunk) pairs containing a changed line with no line number
+    // (`Add { new_no: None }` / `Remove { old_no: None }`). The parser is
+    // expected to always supply a number for changed lines (checked by the
+    // debug_assert below in development builds), but that invariant must
+    // never be load-bearing in release builds: a line we can't place on
+    // either side can never be claimed (it isn't in `adds`/`removes`, so no
+    // location's range can ever match it), so its hunk is force-unioned into
+    // `unmapped` below rather than silently vanishing from both the claim
+    // set and the unmapped view.
+    let mut forced_unmapped: HashSet<(usize, usize)> = HashSet::new();
     for (fi, file) in files.iter().enumerate() {
         if let Some(p) = file.new_path.as_deref() {
             by_new_path.entry(p).or_default().push(fi);
@@ -201,17 +211,29 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
                     LineKind::Add => {
                         // The parser guarantees every Add line carries
                         // new_no; `unmapped`/`unmapped_lines` completeness
-                        // below depends on that invariant holding.
+                        // below depends on that invariant holding. Skipped
+                        // under `cfg(test)` so the regression test below can
+                        // exercise the `None` fallback directly, without the
+                        // fabricated invariant break aborting the test first
+                        // — normal (non-test) debug/dev builds still panic.
+                        #[cfg(not(test))]
                         debug_assert!(line.new_no.is_some(), "Add line missing new_no");
-                        if let Some(no) = line.new_no {
-                            adds[fi].push((hi, no));
+                        match line.new_no {
+                            Some(no) => adds[fi].push((hi, no)),
+                            None => {
+                                forced_unmapped.insert((fi, hi));
+                            }
                         }
                     }
                     LineKind::Remove => {
                         // Same invariant as above, for old_no on Remove lines.
+                        #[cfg(not(test))]
                         debug_assert!(line.old_no.is_some(), "Remove line missing old_no");
-                        if let Some(no) = line.old_no {
-                            removes[fi].push((hi, no));
+                        match line.old_no {
+                            Some(no) => removes[fi].push((hi, no)),
+                            None => {
+                                forced_unmapped.insert((fi, hi));
+                            }
                         }
                     }
                     LineKind::Context => {}
@@ -337,7 +359,7 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
             }
         } else {
             for hi in 0..file.hunks.len() {
-                if unmapped_hunks_set.contains(&(fi, hi)) {
+                if unmapped_hunks_set.contains(&(fi, hi)) || forced_unmapped.contains(&(fi, hi)) {
                     unmapped.push(HunkRef {
                         file: fi,
                         hunk: Some(hi),
@@ -1043,5 +1065,164 @@ mod tests {
 
         let locs = (0..201).map(|_| loc("a.ts", None, None, None)).collect();
         assert!(validate_concerns(&input(vec![concern("c1", locs)])).is_err());
+    }
+
+    #[test]
+    fn numberless_changed_line_forces_its_hunk_into_unmapped() {
+        // A hunk with an ordinary Add (new 13) plus a pathological changed
+        // line carrying no line number at all (`Add { new_no: None }` —
+        // should never happen past the parser, but must fail closed, not
+        // open, if it ever does). A whole-file location claims every
+        // *numbered* changed line in the file; the malformed line can never
+        // be claimed (it's in no claim set any location could match), so its
+        // hunk must still show up in `unmapped` even though the location
+        // claimed everything it could see.
+        let files = vec![fd_with_lines(
+            "a.ts",
+            13,
+            1,
+            13,
+            1,
+            &[(LineKind::Add, None, Some(13)), (LineKind::Add, None, None)],
+            &[],
+        )];
+        let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, None)])]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert_eq!(
+            mapping.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }],
+            "the location did claim the one numbered line in the hunk"
+        );
+        assert_eq!(
+            mapping.unmapped,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }],
+            "a hunk containing an unclaimable numberless line must stay in \
+             unmapped even though every claimable line in it was claimed"
+        );
+    }
+
+    #[test]
+    fn deleted_file_whole_file_old_side_claims_removes_unspecified_side_warns() {
+        // Fix 6 regression: a deleted file (old_path only, remove lines
+        // only). `side: "old"` whole-file location must claim every remove;
+        // an unspecified-side location resolves file identity via new_path,
+        // which doesn't exist for a deletion, so it must warn instead.
+        let files = vec![FileDiff {
+            old_path: Some("gone.txt".to_string()),
+            new_path: None,
+            change_kind: ChangeKind::Deleted,
+            content_kind: ContentKind::Text,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            old_size: None,
+            new_size: None,
+            hunks: vec![Hunk {
+                old_start: 1,
+                old_count: 3,
+                new_start: 0,
+                new_count: 0,
+                section: String::new(),
+                lines: (1..=3)
+                    .map(|n| DiffLine {
+                        kind: LineKind::Remove,
+                        content: String::new(),
+                        old_no: Some(n),
+                        new_no: None,
+                    })
+                    .collect(),
+            }],
+        }];
+
+        let old_side = input(vec![concern(
+            "c1",
+            vec![loc("gone.txt", Some(Side::Old), None, None)],
+        )]);
+        let mapping_old = resolve_mapping(&files, &old_side);
+        assert_eq!(
+            mapping_old.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert!(mapping_old.warnings.is_empty());
+        assert!(mapping_old.unmapped.is_empty());
+
+        let unspecified_side = input(vec![concern("c1", vec![loc("gone.txt", None, None, None)])]);
+        let mapping_unspecified = resolve_mapping(&files, &unspecified_side);
+        assert!(mapping_unspecified.concerns[0].hunks.is_empty());
+        assert_eq!(mapping_unspecified.warnings.len(), 1);
+        assert_eq!(
+            mapping_unspecified.unmapped,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn rename_new_path_location_with_unspecified_side_also_claims_old_side_removes() {
+        // Fix 6 regression: a rename with content changes (old_path !=
+        // new_path). A whole-file location naming the *new* path with no
+        // side resolves file identity via new_path, but still claims
+        // Remove lines (keyed by old_no) belonging to that same file index,
+        // since an unspecified side wants both adds and removes.
+        let files = vec![FileDiff {
+            old_path: Some("old.ts".to_string()),
+            new_path: Some("new.ts".to_string()),
+            change_kind: ChangeKind::Renamed,
+            content_kind: ContentKind::Text,
+            old_mode: None,
+            new_mode: None,
+            old_oid: None,
+            new_oid: None,
+            old_size: None,
+            new_size: None,
+            hunks: vec![Hunk {
+                old_start: 10,
+                old_count: 1,
+                new_start: 10,
+                new_count: 1,
+                section: String::new(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Remove,
+                        content: String::new(),
+                        old_no: Some(10),
+                        new_no: None,
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        content: String::new(),
+                        old_no: None,
+                        new_no: Some(10),
+                    },
+                ],
+            }],
+        }];
+        let inp = input(vec![concern("c1", vec![loc("new.ts", None, None, None)])]);
+        let mapping = resolve_mapping(&files, &inp);
+        assert_eq!(
+            mapping.concerns[0].hunks,
+            vec![HunkRef {
+                file: 0,
+                hunk: Some(0)
+            }]
+        );
+        assert!(mapping.warnings.is_empty());
+        assert!(
+            mapping.unmapped.is_empty(),
+            "the remove line (old_no-keyed) must have been claimed too, not just the add"
+        );
+        assert!(mapping.unmapped_lines.is_empty());
     }
 }

@@ -46,26 +46,31 @@ pub const MAX_CONCERNS_BYTES: usize = 8 * 1024 * 1024;
 
 /// Read concerns JSON from a file path or, when `spec` is `-`, from stdin.
 ///
-/// Rejects input exceeding [`MAX_CONCERNS_BYTES`]. The stdin path bounds the
-/// read itself (via `Read::take`) so an unbounded stream can't be read into
-/// memory in full before the size is checked.
-fn read_concerns_source(spec: &str) -> std::io::Result<String> {
-    let raw = if spec == "-" {
-        let mut buf = String::new();
-        std::io::stdin()
-            .take(MAX_CONCERNS_BYTES as u64 + 1)
-            .read_to_string(&mut buf)?;
-        buf
+/// Rejects input exceeding [`MAX_CONCERNS_BYTES`], regardless of source: both
+/// the file and stdin paths bound the read itself (via `Read::take`) so an
+/// unbounded stream or a huge file can't be read into memory in full before
+/// the size is checked, and both read raw bytes and check the size *before*
+/// attempting UTF-8 conversion — so an oversized input always reports as a
+/// size error, never a UTF-8 error from a multibyte character split at the
+/// `take` boundary.
+pub(crate) fn read_concerns_source(spec: &str) -> std::io::Result<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let limit = MAX_CONCERNS_BYTES as u64 + 1;
+    if spec == "-" {
+        std::io::stdin().take(limit).read_to_end(&mut buf)?;
     } else {
-        std::fs::read_to_string(spec)?
-    };
-    if raw.len() > MAX_CONCERNS_BYTES {
+        std::fs::File::open(spec)?
+            .take(limit)
+            .read_to_end(&mut buf)?;
+    }
+    if buf.len() > MAX_CONCERNS_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("concerns input exceeds {MAX_CONCERNS_BYTES} bytes"),
         ));
     }
-    Ok(raw)
+    String::from_utf8(buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
 /// Entry point for the `review` subcommand. Returns the process exit code.
@@ -246,10 +251,50 @@ pub async fn serve_session(
             }
             match result.decision {
                 Decision::Approve => exitcode::APPROVED,
-                _ => exitcode::REQUEST_CHANGES,
+                Decision::RequestChanges => exitcode::REQUEST_CHANGES,
             }
         }
         Outcome::Aborted => exitcode::ABORTED,
         Outcome::Timeout => exitcode::TIMEOUT,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file (not just stdin) exceeding `MAX_CONCERNS_BYTES` must be
+    /// rejected with the size-cap message, not read to completion first —
+    /// this exercises the `File::open(...).take(...)` bound directly rather
+    /// than through the CLI (see `oversized_concerns_input_is_rejected` in
+    /// `tests/review_flow.rs` for the end-to-end version).
+    #[test]
+    fn oversized_file_input_reports_size_error_not_utf8_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ronten-review-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.json");
+
+        // MAX_CONCERNS_BYTES + 1 bytes, all ASCII so a naive byte-count cap
+        // and a char-boundary-respecting one would agree; the point here is
+        // that the file path takes the same bytes-first-then-UTF-8 order as
+        // stdin, so the error is the size message, never a UTF-8 decode error.
+        let oversized = vec![b' '; MAX_CONCERNS_BYTES + 1];
+        std::fs::write(&path, &oversized).unwrap();
+
+        let err = read_concerns_source(path.to_str().unwrap()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("exceeds"),
+            "expected a size-exceeded message, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -208,6 +208,25 @@ mod tests {
     }
 
     #[test]
+    fn input_schema_denies_unknown_fields_on_every_object() {
+        // Fix 6 regression: `deny_unknown_fields` on ConcernsInput/Concern/
+        // Location must keep showing up as `"additionalProperties": false`
+        // in the generated JSON Schema. A schemars major bump could silently
+        // change how that constraint is rendered (or drop it) without any
+        // Rust-level compile error, quietly reopening the "unknown fields
+        // widen a location to whole-file" hole `deny_unknown_fields` closes
+        // — this pins the schema's *text* so that would fail here first.
+        let schema = serde_json::to_string(&schemars::schema_for!(ConcernsInput))
+            .expect("schema serializes to JSON");
+        let count = schema.matches("\"additionalProperties\":false").count();
+        assert!(
+            count >= 3,
+            "expected additionalProperties:false at least 3 times \
+             (ConcernsInput, Concern, Location), found {count} in schema: {schema}"
+        );
+    }
+
+    #[test]
     fn decision_derivation() {
         use Verdict::*;
         assert!(matches!(

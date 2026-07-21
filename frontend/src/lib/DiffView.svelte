@@ -72,8 +72,8 @@
 {:else if groups.length === 0}
   <p class="empty-diff">No changes mapped to this concern.</p>
 {:else if rs.session}
-  {#if rs.selected.unmapped}
-    <p class="unmapped-legend">Highlighted lines are changes no concern claimed.</p>
+  {#if rs.selected.unmapped && rs.session.unmapped_lines.length > 0}
+    <p class="unmapped-legend">Highlighted lines were not assigned to any concern.</p>
   {/if}
   {#each groups as group (group.fileIndex)}
     {@const file = rs.session.files[group.fileIndex]}
