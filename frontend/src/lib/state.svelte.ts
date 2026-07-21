@@ -8,6 +8,7 @@ import type {
   ConcernDraft,
   ConcernView,
   Draft,
+  FinishedKind,
   HunkRef,
   Session,
   Side,
@@ -18,6 +19,15 @@ import { buildUnmappedSet, isUnmappedInSet } from './unmappedLines'
 const SAVE_DEBOUNCE_MS = 500
 
 export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error'
+
+/** UI phase for a server-reported ending. A timeout renders as the aborted
+ * screen: from the reviewer's side both mean "this session ended without a
+ * decision". */
+export function phaseForFinished(finished: FinishedKind | null): Phase {
+  if (finished === 'submitted') return 'submitted'
+  if (finished === 'aborted' || finished === 'timeout') return 'aborted'
+  return 'review'
+}
 export type SaveState = 'idle' | 'saving' | 'saved' | 'error'
 
 export interface CommentTarget {
@@ -193,7 +203,7 @@ export class ReviewState {
       this.draft = { ...session.draft, acknowledged_opaque: acked }
       this.#revision = session.draft_revision
       this.selectedIdx = 0
-      this.phase = session.submitted ? 'submitted' : 'review'
+      this.phase = phaseForFinished(session.finished)
     } catch {
       this.phase = 'error'
     }
@@ -230,10 +240,11 @@ export class ReviewState {
         this.#saveQueued = false
         const result = await saveDraft(this.draft, this.#revision)
         if (!result.ok) {
-          if (result.error === 'already submitted') {
-            // The session finished elsewhere; join the submitted state
-            // rather than surfacing a save error.
-            this.phase = 'submitted'
+          if (result.error === 'session finished') {
+            // The session ended elsewhere; join the matching terminal
+            // state (an abort must not render as "submitted") rather than
+            // surfacing a save error.
+            this.phase = phaseForFinished(result.finished ?? 'submitted')
             this.saveState = 'idle'
           } else {
             // Draft conflict: another tab saved a newer revision. Retrying

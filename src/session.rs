@@ -24,14 +24,15 @@ pub(crate) fn lock_ignore_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Where a session is in its lifecycle. The terminal claim and the outcome
-/// it resolved to live in one value behind one mutex, so claiming the
-/// terminal state and publishing the outcome are a single atomic step —
-/// there is no window where the session is finished but its outcome is not
-/// yet readable.
+/// Where a session is in its lifecycle. The terminal claim, the outcome it
+/// resolved to, AND the editable draft all live in one value behind one
+/// mutex, so claiming the terminal state, publishing the outcome, and
+/// freezing the draft are a single atomic step — there is no window where
+/// the session is finished but its outcome is unreadable, and no window
+/// where a save can slip past a finished check and rewrite a frozen draft.
 #[derive(Debug)]
 pub enum Phase {
-    Reviewing,
+    Reviewing(DraftSlot),
     Finished(Outcome),
 }
 
@@ -96,7 +97,10 @@ pub struct SessionPayload<'a> {
     /// Current draft revision; `PUT /draft` must echo it back.
     pub draft_revision: u64,
     pub limits: Limits,
-    pub submitted: bool,
+    /// `null` while the review is open; otherwise how it ended
+    /// (`"submitted"` / `"aborted"` / `"timeout"`), so the UI can show the
+    /// right terminal screen instead of calling every ending "submitted".
+    pub finished: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -127,8 +131,8 @@ pub struct SessionState {
     /// check.
     pub repo_root: Option<std::path::PathBuf>,
     pub started_at: chrono::DateTime<chrono::Utc>,
-    pub draft: Mutex<DraftSlot>,
-    /// Lifecycle phase; see [`Phase`]. Written only by [`try_finish`].
+    /// Lifecycle phase; see [`Phase`]. Transitioned to `Finished` only by
+    /// [`try_finish`]; the in-progress draft lives inside `Reviewing`.
     ///
     /// [`try_finish`]: SessionState::try_finish
     pub phase: Mutex<Phase>,
@@ -161,6 +165,9 @@ impl SessionState {
         if matches!(*phase, Phase::Finished(_)) {
             return false;
         }
+        // Dropping the DraftSlot here freezes the draft: with slot and
+        // terminal state behind the same lock, no save can interleave
+        // between a finished check and a write.
         *phase = Phase::Finished(outcome);
         drop(phase);
         // `send_replace` succeeds regardless of receiver liveness; and even
@@ -173,7 +180,7 @@ impl SessionState {
     /// The session's outcome, if it has finished.
     pub fn finished_outcome(&self) -> Option<Outcome> {
         match &*lock_ignore_poison(&self.phase) {
-            Phase::Reviewing => None,
+            Phase::Reviewing(_) => None,
             Phase::Finished(outcome) => Some(outcome.clone()),
         }
     }
@@ -181,6 +188,14 @@ impl SessionState {
     /// Whether the session has reached a terminal state.
     pub fn is_finished(&self) -> bool {
         matches!(&*lock_ignore_poison(&self.phase), Phase::Finished(_))
+    }
+
+    /// Wire name of the terminal state, if any.
+    pub fn finished_kind(&self) -> Option<&'static str> {
+        match &*lock_ignore_poison(&self.phase) {
+            Phase::Reviewing(_) => None,
+            Phase::Finished(outcome) => Some(outcome_kind(outcome)),
+        }
     }
 
     /// The hunks assigned to a concern id (`_unmapped` maps to the
@@ -373,6 +388,16 @@ impl SessionState {
             started_at: self.started_at.to_rfc3339(),
             submitted_at: chrono::Utc::now().to_rfc3339(),
         }
+    }
+}
+
+/// Wire name of an outcome, used in the session payload's `finished` field
+/// and in "session finished" conflict responses.
+pub fn outcome_kind(outcome: &Outcome) -> &'static str {
+    match outcome {
+        Outcome::Submitted(_) => "submitted",
+        Outcome::Aborted => "aborted",
+        Outcome::Timeout => "timeout",
     }
 }
 

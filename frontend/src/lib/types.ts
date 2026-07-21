@@ -125,14 +125,27 @@ export interface Session {
   /** Current draft revision — PUT /draft must echo it back. */
   draft_revision: number
   limits: Limits
-  submitted: boolean
+  /** Null while the review is open; otherwise how it ended, so the UI can
+   * show the right terminal screen instead of calling every ending
+   * "submitted". */
+  finished: FinishedKind | null
   unmapped_lines: UnmappedLine[]
 }
+
+/** How a finished session ended. */
+export type FinishedKind = 'submitted' | 'aborted' | 'timeout'
 
 /** Result of `PUT /draft`. Success carries the new revision to echo on the
  * next save. A 409 is returned (not thrown) so callers can tell "another
  * tab saved" (`error: 'draft conflict'`, with the server's revision) apart
- * from "session already finished" (`error: 'already submitted'`). */
+ * from "the session already ended" (`error: 'session finished'`, with how
+ * it ended). */
 export type SaveDraftResult =
   | { ok: true; revision: number }
-  | { ok: false; error: string; current_revision?: number; details?: string[] }
+  | {
+      ok: false
+      error: string
+      current_revision?: number
+      finished?: FinishedKind
+      details?: string[]
+    }

@@ -194,11 +194,19 @@ async fn get_session(
         });
     }
 
-    let (draft, draft_revision) = {
-        let slot = crate::session::lock_ignore_poison(&state.draft);
-        (slot.draft.clone(), slot.revision)
+    // One phase read yields draft, revision, and terminal state together,
+    // so the payload can never pair a live draft with a finished flag.
+    let (draft, draft_revision, finished) = {
+        let phase = crate::session::lock_ignore_poison(&state.phase);
+        match &*phase {
+            crate::session::Phase::Reviewing(slot) => (slot.draft.clone(), slot.revision, None),
+            crate::session::Phase::Finished(outcome) => (
+                Draft::default(),
+                0,
+                Some(crate::session::outcome_kind(outcome)),
+            ),
+        }
     };
-    let submitted = state.is_finished();
     let payload = SessionPayload {
         title: &state.title,
         summary: state.summary.as_deref(),
@@ -213,7 +221,7 @@ async fn get_session(
             max_comment_chars: crate::session::MAX_COMMENT_CHARS,
             max_draft_bytes: MAX_BODY_BYTES,
         },
-        submitted,
+        finished,
     };
     Json(payload).into_response()
 }
@@ -236,32 +244,42 @@ async fn put_draft(
     if token != state.token {
         return not_found();
     }
-    // A finished session's draft is frozen: its submitted content is what
-    // the outcome was built from, and a late autosave must not rewrite it.
-    if state.is_finished() {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "already submitted"})),
-        )
-            .into_response();
+    // Draft and terminal state live behind the same lock, so "finished?"
+    // and "write the draft" are one atomic step: a submit/abort landing
+    // concurrently either happens before this lock (we see Finished and
+    // refuse) or after it (it sees our completed write). A finished
+    // session's draft is frozen — a late autosave must not rewrite it.
+    let mut phase = crate::session::lock_ignore_poison(&state.phase);
+    match &mut *phase {
+        crate::session::Phase::Finished(outcome) => {
+            let kind = crate::session::outcome_kind(outcome);
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "session finished",
+                    "finished": kind,
+                    "details": [format!("this review already ended ({kind}); nothing further can be saved")],
+                })),
+            )
+                .into_response()
+        }
+        crate::session::Phase::Reviewing(slot) => {
+            if body.revision != slot.revision {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "draft conflict",
+                        "current_revision": slot.revision,
+                        "details": ["the draft was changed elsewhere (another tab?); reload the review before editing further"],
+                    })),
+                )
+                    .into_response();
+            }
+            slot.draft = body.draft;
+            slot.revision += 1;
+            Json(json!({"revision": slot.revision})).into_response()
+        }
     }
-    let mut slot = crate::session::lock_ignore_poison(&state.draft);
-    if body.revision != slot.revision {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "draft conflict",
-                "current_revision": slot.revision,
-                "details": ["the draft was changed elsewhere (another tab?); reload the review before editing further"],
-            })),
-        )
-            .into_response();
-    }
-    slot.draft = body.draft;
-    slot.revision += 1;
-    let revision = slot.revision;
-    drop(slot);
-    Json(json!({"revision": revision})).into_response()
 }
 
 /// Re-resolves `HEAD` and refuses the submit if it no longer matches the
@@ -361,13 +379,24 @@ async fn post_submit(
     // never consumes the session.
     let result = state.build_result(&draft);
     if !state.try_finish(Outcome::Submitted(Box::new(result))) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "already submitted"})),
-        )
-            .into_response();
+        return finished_conflict(&state);
     }
     Json(json!({"ok": true})).into_response()
+}
+
+/// 409 for an action against a session that already ended, naming how it
+/// ended — an aborted session must not be reported as "submitted".
+fn finished_conflict(state: &SessionState) -> Response {
+    let kind = state.finished_kind().unwrap_or("submitted");
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "session finished",
+            "finished": kind,
+            "details": [format!("this review already ended ({kind})")],
+        })),
+    )
+        .into_response()
 }
 
 async fn post_abort(State(state): State<Arc<SessionState>>, Path(token): Path<String>) -> Response {
@@ -376,11 +405,7 @@ async fn post_abort(State(state): State<Arc<SessionState>>, Path(token): Path<St
     }
 
     if !state.try_finish(Outcome::Aborted) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({"error": "already submitted"})),
-        )
-            .into_response();
+        return finished_conflict(&state);
     }
     Json(json!({"ok": true})).into_response()
 }
@@ -485,8 +510,9 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
-            draft: std::sync::Mutex::new(crate::session::DraftSlot::default()),
-            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
+                crate::session::DraftSlot::default(),
+            )),
             outcome_tx: tx,
         })
     }
@@ -541,8 +567,9 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
-            draft: std::sync::Mutex::new(crate::session::DraftSlot::default()),
-            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
+                crate::session::DraftSlot::default(),
+            )),
             outcome_tx: tx,
         })
     }
@@ -606,8 +633,9 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
-            draft: std::sync::Mutex::new(crate::session::DraftSlot::default()),
-            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
+                crate::session::DraftSlot::default(),
+            )),
             outcome_tx: tx,
         })
     }
@@ -670,7 +698,7 @@ index 1111111..2222222 100644
         assert_eq!(concerns[1]["id"], "c2");
         assert_eq!(concerns[2]["id"], "_unmapped");
         assert_eq!(concerns[2]["unmapped"], true);
-        assert_eq!(body["submitted"], false);
+        assert_eq!(body["finished"], serde_json::Value::Null);
     }
 
     #[tokio::test]
@@ -766,7 +794,34 @@ index 1111111..2222222 100644
             json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
         let (status, body) = call(app, put_json(&format!("/api/{TOKEN}/draft"), draft_body)).await;
         assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
-        assert_eq!(body["error"], "already submitted");
+        assert_eq!(body["error"], "session finished");
+        assert_eq!(body["finished"], "submitted");
+    }
+
+    /// A save landing after an abort must say the session was aborted, not
+    /// "submitted" — the tab autosaving during an abort would otherwise
+    /// switch to the submitted screen.
+    #[tokio::test]
+    async fn draft_save_after_abort_names_the_abort() {
+        let state = build_state();
+        let app = build_router(state.clone());
+        let (status, _) = call(app.clone(), post_empty(&format!("/api/{TOKEN}/abort"))).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let draft_body =
+            json!({ "revision": 0, "draft": { "concerns": {}, "general_comments": [] } });
+        let (status, body) = call(
+            app.clone(),
+            put_json(&format!("/api/{TOKEN}/draft"), draft_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(body["error"], "session finished");
+        assert_eq!(body["finished"], "aborted");
+
+        // The session payload names the ending too.
+        let (_, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(body["finished"], "aborted");
     }
 
     /// An oversized body gets the same JSON error shape as every other
@@ -924,7 +979,8 @@ index 1111111..2222222 100644
         let (status, body) =
             call(app, post_json(&format!("/api/{TOKEN}/submit"), draft_body)).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body["error"], "already submitted");
+        assert_eq!(body["error"], "session finished");
+        assert_eq!(body["finished"], "submitted");
     }
 
     #[tokio::test]

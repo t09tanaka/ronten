@@ -24,7 +24,7 @@ function makeSession(): Session {
     draft: { concerns: {}, general_comments: [], acknowledged_opaque: [] },
     draft_revision: 3,
     limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
-    submitted: false,
+    finished: null,
     unmapped_lines: [],
   }
 }
@@ -84,13 +84,32 @@ describe('draft conflict handling', () => {
     expect(saveDraftMock).toHaveBeenCalledTimes(1)
   })
 
-  it('joins the submitted state on an already-submitted conflict', async () => {
+  it('joins the submitted state on a finished(submitted) conflict', async () => {
     const rs = await loadedState()
 
-    saveDraftMock.mockResolvedValueOnce({ ok: false, error: 'already submitted' })
+    saveDraftMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'session finished',
+      finished: 'submitted',
+    })
     rs.addGeneralComment('late')
     await vi.runAllTimersAsync()
     expect(rs.phase).toBe('submitted')
+    expect(rs.saveState).toBe('idle')
+    expect(rs.draftConflict).toBe(false)
+  })
+
+  it('joins the aborted state on a finished(aborted) conflict', async () => {
+    const rs = await loadedState()
+
+    saveDraftMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'session finished',
+      finished: 'aborted',
+    })
+    rs.addGeneralComment('late')
+    await vi.runAllTimersAsync()
+    expect(rs.phase).toBe('aborted')
     expect(rs.saveState).toBe('idle')
     expect(rs.draftConflict).toBe(false)
   })
