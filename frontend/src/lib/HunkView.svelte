@@ -4,7 +4,7 @@
   import { newTarget, oldTarget, type CommentLineInfo } from './anchors'
   import { highlightLine, langForPath } from './highlight'
   import { revealInvisibles } from './invisibles'
-  import type { Comment, ConcernView, FileDiff, Hunk, HunkRef } from './types'
+  import type { Comment, ConcernView, DiffLine, FileDiff, Hunk, HunkRef } from './types'
 
   const COLLAPSE_THRESHOLD = 200
 
@@ -39,6 +39,15 @@
     if (!all) return
     const idx = all.indexOf(comment)
     if (idx >= 0) rs.removeComment(concernId, idx)
+  }
+
+  // Add lines only exist on the new side, remove lines only on the old
+  // side — context lines are never unclaimed, since only add/remove lines
+  // are changes a concern could have claimed.
+  function isLineUnmapped(line: DiffLine): boolean {
+    if (line.kind === 'add') return rs.isUnmappedLine(hunkRef.file, 'new', line.new_no)
+    if (line.kind === 'remove') return rs.isUnmappedLine(hunkRef.file, 'old', line.old_no)
+    return false
   }
 
   // Deliberately captures only the initial value: each hunk gets its own
@@ -100,7 +109,7 @@
             {@const oldT = oldTarget(file, line)}
             {@const newT = newTarget(file, line)}
             {@const pendingT = isPending(oldT) ? oldT : isPending(newT) ? newT : null}
-            <tr class="line line-{line.kind}">
+            <tr class="line line-{line.kind}" class:line-unmapped={isLineUnmapped(line)}>
               <td class="gutter old-gutter">
                 {#if oldT}
                   <button
@@ -336,6 +345,26 @@
 
   .line-remove .gutter {
     background: var(--c-shu-tint-2);
+  }
+
+  /* A changed line no concern claimed — flagged for extra care while
+     viewing the synthetic `_unmapped` concern. Overrides the add/remove
+     tint (higher-specificity compound selectors) with the ōdo warning
+     family, so it reads as a distinct signal rather than a shade of the
+     usual add/remove coloring. The left border lives on .content (a
+     regular, non-sticky td) rather than the row itself, matching the
+     .new-gutter separator's box-shadow pattern below — box-shadow on a
+     table row does not render reliably across browsers. */
+  .line.line-unmapped {
+    background: var(--c-odo-tint);
+  }
+
+  .line.line-unmapped .gutter {
+    background: var(--c-odo-tint-2);
+  }
+
+  .line.line-unmapped .content {
+    box-shadow: inset 3px 0 0 var(--c-odo);
   }
 
   .comment-row td {

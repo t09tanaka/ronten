@@ -13,6 +13,7 @@ import type {
   Side,
   Verdict,
 } from './types'
+import { buildUnmappedSet, isUnmappedInSet } from './unmappedLines'
 
 const SAVE_DEBOUNCE_MS = 500
 
@@ -41,6 +42,21 @@ class ReviewState {
 
   get selected(): ConcernView | null {
     return this.session?.concerns[this.selectedIdx] ?? null
+  }
+
+  // Only built while the `_unmapped` concern is selected — everywhere else
+  // isUnmappedLine short-circuits to false without touching the session's
+  // (possibly large) unmapped_lines list.
+  #unmappedSet = $derived.by((): Set<string> | null => {
+    if (!this.session || !this.selected?.unmapped) return null
+    return buildUnmappedSet(this.session.unmapped_lines)
+  })
+
+  /** Whether (file, side, line) is one of the changed lines no concern
+   * claimed — only ever true while the `_unmapped` concern is selected. */
+  isUnmappedLine(file: number, side: Side, line: number | null): boolean {
+    if (!this.#unmappedSet) return false
+    return isUnmappedInSet(this.#unmappedSet, file, side, line)
   }
 
   /** A concern counts as reviewed only once its verdict is confirmed —
