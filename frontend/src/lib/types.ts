@@ -61,6 +61,15 @@ export interface Comment {
   body: string
 }
 
+/** A changed line no concern claimed — surfaced via the synthetic
+ * `_unmapped` concern. `side`/`line` follow the same old/new convention as
+ * DiffLine: 'old' with old_no for removes, 'new' with new_no for adds. */
+export interface UnmappedLine {
+  file: number
+  side: Side
+  line: number
+}
+
 export interface ConcernDraft {
   verdict: Verdict | null
   comments: Comment[]
@@ -80,4 +89,5 @@ export interface Session {
   warnings: string[]
   draft: Draft
   submitted: boolean
+  unmapped_lines: UnmappedLine[]
 }

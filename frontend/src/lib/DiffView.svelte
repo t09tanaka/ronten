@@ -72,6 +72,9 @@
 {:else if groups.length === 0}
   <p class="empty-diff">No changes mapped to this concern.</p>
 {:else if rs.session}
+  {#if rs.selected.unmapped && rs.session.unmapped_lines.length > 0}
+    <p class="unmapped-legend">Highlighted lines were not assigned to any concern.</p>
+  {/if}
   {#each groups as group (group.fileIndex)}
     {@const file = rs.session.files[group.fileIndex]}
     <section class="file-group">
@@ -227,5 +230,15 @@
   .empty-diff {
     color: var(--c-ink-2);
     font-size: 14px;
+  }
+
+  .unmapped-legend {
+    margin: 0 0 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--c-odo);
+    border-radius: 4px;
+    background: var(--c-odo-tint);
+    color: var(--c-odo);
+    font-size: 12.5px;
   }
 </style>

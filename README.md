@@ -12,11 +12,12 @@ diff itself is never agent-supplied — ronten reads the changed files and their
 directly via git plumbing (`rev-parse`, `merge-base`, `diff-tree --raw`, `cat-file`) and
 computes the text diff with its own diff engine. Nothing in `.gitattributes` (`-diff`,
 diff drivers, textconv), `diff.*` config, or `GIT_EXTERNAL_DIFF` can alter or hide what
-is displayed. Any hunk that
-doesn't map to a concern the agent proposed is never silently dropped; it is placed into an
-auto-generated, warning-styled `_unmapped` concern that still requires a verdict from the
-human before submission. The agent then reads the result JSON — including line-anchored
-comments — straight into its fix loop.
+is displayed. A concern claims individual changed lines, not whole hunks by range overlap;
+any changed line that ends up claimed by no concern the agent proposed is never silently
+dropped — it (and any hunk still containing such a line) is placed into an auto-generated,
+warning-styled `_unmapped` concern that still requires a verdict from the human before
+submission. The agent then reads the result JSON — including line-anchored comments —
+straight into its fix loop.
 
 ronten is daemonless: one review session is one process. It starts an HTTP server bound to
 `127.0.0.1`, serves the review UI, waits for a submission (or abort, or timeout), prints the
@@ -156,6 +157,14 @@ of the review — nothing is left running once a result exists.
 }
 ```
 
+A location's `path` selects a file: an explicit `side: "old"` matches against the file's old
+path (required for a deleted file, which has no new path); `side: "new"` or an omitted `side`
+matches against the new path. Within the matched file, a location claims the individual
+`Add`/`Remove` lines whose own line number (`new_no` for `Add`, `old_no` for `Remove`) falls
+in `[start, end]` (defaulting to the whole file when omitted) — never a hunk's full range, and
+never a context line. An omitted `side` claims on *both* numbering schemes at once (`Add` by
+`new_no`, `Remove` by `old_no`) within whichever file the path resolved to.
+
 ### Result JSON (output)
 
 ```jsonc
@@ -178,15 +187,16 @@ of the review — nothing is left running once a result exists.
     { "id": "_unmapped", "verdict": "approve", "comments": [] }
   ],
   "general_comments": ["Overall, …"],
-  "warnings": ["location out of range: src/routes/index.ts:120-140"],
+  "warnings": ["location matched no changed lines: src/routes/index.ts:120-140"],
   "started_at": "…", "submitted_at": "…"
 }
 ```
 
-`decision` is derived from the per-concern verdicts: any `request-changes` verdict makes
-the overall decision `request-changes`. Agents can feed `concerns[].comments` directly into
-a fix loop. On abort or timeout, no result JSON is produced at all — the exit code (2 or 3)
-is the only signal; the `abort` decision value is reserved and not currently emitted.
+`decision` is one of exactly two values, `approve` or `request-changes` — there is no `abort`
+decision — derived from the per-concern verdicts: any `request-changes` verdict makes the
+overall decision `request-changes`. Agents can feed `concerns[].comments` directly into a fix
+loop. On abort or timeout, no result JSON is produced at all; the exit code (2 or 3) is the
+only signal.
 
 ## Keyboard shortcuts
 
@@ -224,8 +234,9 @@ it cannot stop a malicious (or prompt-injected) agent from forging the human's v
 - Native Windows (WSL is fine; targets are macOS/Linux).
 - Virtual scrolling in the diff view (only the selected concern's hunks render, with large
   hunks collapsed by default).
-- Agent self-reported metadata fields in concerns JSON (unknown fields are ignored today,
-  leaving room to add them later).
+- Agent self-reported metadata fields in concerns JSON — v1 rejects unknown fields outright
+  (exit 10, via `deny_unknown_fields`) rather than ignoring them; such fields would be added
+  in a future version 2 of the contract, never by loosening v1.
 
 ## Development
 
@@ -236,7 +247,7 @@ src/
   main.rs        — CLI parsing, dispatch, exit-code mapping
   model.rs       — serde types for concerns/result + schemars derives
   gitdiff.rs     — git invocation + unified diff parsing
-  mapping.rs     — hunk × location intersection, _unmapped synthesis, warnings
+  mapping.rs     — changed-line claiming, _unmapped synthesis, warnings
   session.rs     — session state (diff + concerns + draft)
   server.rs      — axum routes, token check, static assets
   review.rs      — orchestration for `ronten review`

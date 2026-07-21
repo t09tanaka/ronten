@@ -3,7 +3,7 @@
 //! turn a submitted draft into a `ResultOutput`.
 
 use crate::gitdiff::FileDiff;
-use crate::mapping::{HunkRef, Mapping, UNMAPPED_ID};
+use crate::mapping::{HunkRef, Mapping, UnmappedLine, UNMAPPED_ID};
 use crate::model::{
     derive_decision, Comment, ConcernResult, ConcernsInput, ResultOutput, Risk, Side, Verdict,
     SUPPORTED_VERSION,
@@ -57,6 +57,7 @@ pub struct SessionPayload<'a> {
     pub summary: Option<&'a str>,
     pub files: &'a [FileDiff],
     pub concerns: Vec<ConcernView<'a>>,
+    pub unmapped_lines: &'a [UnmappedLine],
     pub warnings: &'a [String],
     pub draft: Draft,
     pub submitted: bool,
@@ -154,6 +155,10 @@ impl SessionState {
     pub fn validate_draft(&self, draft: &Draft) -> Vec<String> {
         let mut violations = Vec::new();
         let required: HashSet<String> = self.required_ids().into_iter().collect();
+        // Mirrors the frontend's `isVerdictConfirmed` (frontend/src/lib/confirmation.ts):
+        // a request-changes verdict needs a reason, either a comment on the
+        // concern itself or at least one general comment on the review.
+        let has_general_comment = !draft.general_comments.is_empty();
 
         let mut ids: Vec<&String> = draft.concerns.keys().collect();
         ids.sort();
@@ -162,6 +167,14 @@ impl SessionState {
             if !required.contains(id.as_str()) {
                 violations.push(format!("unknown concern id {id:?}"));
                 continue;
+            }
+            if matches!(cd.verdict, Some(Verdict::RequestChanges))
+                && cd.comments.is_empty()
+                && !has_general_comment
+            {
+                violations.push(format!(
+                    "concern {id:?}: request-changes requires a comment explaining the reason"
+                ));
             }
             if cd.comments.len() > MAX_COMMENTS {
                 violations.push(format!(

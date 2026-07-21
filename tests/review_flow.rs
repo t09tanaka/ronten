@@ -334,6 +334,40 @@ fn invalid_concerns_exits_10() {
 }
 
 #[test]
+fn oversized_concerns_input_is_rejected() {
+    // 8MiB 超の concerns JSON は読み込み段階で拒否される（メモリ保護）。
+    let td = fixture_repo();
+    // Leading whitespace pads the byte count past the 8MiB cap without
+    // touching any field-level length limit (summary/title/etc.), so this
+    // exercises the raw-size cap specifically, not per-field validation.
+    let padding = " ".repeat(9 * 1024 * 1024);
+    let huge = format!(
+        r#"{padding}{{"version":1,"concerns":[
+      {{"id":"edit","title":"Edit a.txt","risk":"low","locations":[{{"path":"a.txt"}}]}}]}}"#
+    );
+    std::fs::write(td.path().join("huge.json"), &huge).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "huge.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    assert_eq!(out.status.code(), Some(10));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("exceeds") || stderr.to_lowercase().contains("size"),
+        "stderr missing size-exceeded message: {stderr}"
+    );
+}
+
+#[test]
 fn unsupported_version_exits_10() {
     let td = fixture_repo();
     let v2 = r#"{"version":2,"concerns":[
