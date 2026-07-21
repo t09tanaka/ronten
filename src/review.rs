@@ -2,13 +2,15 @@
 //! session state, bind a localhost server, and drive it to an outcome.
 
 use crate::exitcode;
-use crate::gitdiff::{compute_diff, current_branch, repo_root, worktree_status, GitError};
+use crate::gitdiff::{
+    compute_diff, current_branch, git_dirs, is_tracked, repo_root, worktree_status, GitError,
+};
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
 use crate::session::{DraftSlot, Phase, SessionState};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -91,6 +93,22 @@ pub(crate) fn read_concerns_source(spec: &str) -> std::io::Result<String> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
 }
 
+/// The absolute path `out` would resolve to once it exists, computed without
+/// requiring `out` itself to exist: canonicalizes `out`'s parent directory
+/// (falling back to the current directory when `out` is a bare file name)
+/// and re-appends the file name. Returns `None` if the file name is missing
+/// (e.g. `out` is `.` or `/`) or the parent can't be canonicalized (most
+/// commonly: the parent directory doesn't exist).
+fn out_prospective_abs(out: &Path) -> Option<PathBuf> {
+    let name = out.file_name()?;
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent_canon = match parent {
+        Some(parent) => std::fs::canonicalize(parent).ok()?,
+        None => std::fs::canonicalize(std::env::current_dir().ok()?).ok()?,
+    };
+    Some(parent_canon.join(name))
+}
+
 /// Absolute, symlink-resolved forms of the paths ronten itself expects to
 /// see in the worktree — the concerns file (unless read from stdin) and the
 /// `--out` destination — so the dirty gate doesn't flag ronten's own inputs.
@@ -102,23 +120,169 @@ fn exempt_paths(concerns: &str, out: Option<&std::path::Path>) -> Vec<PathBuf> {
         }
     }
     if let Some(out) = out {
-        // `--out` usually doesn't exist yet, so canonicalize its parent and
-        // re-append the file name (covers a leftover result from a previous
-        // run sitting untracked in the worktree).
-        if let (Some(parent), Some(name)) = (
-            out.parent().filter(|p| !p.as_os_str().is_empty()),
-            out.file_name(),
-        ) {
-            if let Ok(parent) = std::fs::canonicalize(parent) {
-                exempt.push(parent.join(name));
-            }
-        } else if let (Ok(cwd), Some(name)) = (std::env::current_dir(), out.file_name()) {
-            if let Ok(cwd) = std::fs::canonicalize(cwd) {
-                exempt.push(cwd.join(name));
-            }
+        // `--out` usually doesn't exist yet (the whole point of the preflight
+        // no-clobber check below), so this covers a leftover result from a
+        // previous run sitting untracked in the worktree.
+        if let Some(abs) = out_prospective_abs(out) {
+            exempt.push(abs);
         }
     }
     exempt
+}
+
+/// Checks-only preflight for `--out`, run before the dirty gate so a
+/// rejection never depends on (or reports) worktree cleanliness. Does not
+/// touch the filesystem beyond metadata reads — the actual reservation
+/// happens later, after the dirty gate, via [`OutReservation::reserve`].
+///
+/// Rejects, in order:
+/// 1. `out` resolves to the same file as `concerns` (skipped when concerns
+///    comes from stdin, i.e. `concerns == "-"`).
+/// 2. `out` resolves inside the repository's git directory (or, for a
+///    worktree checkout, the shared common git directory).
+/// 3. `out` resolves to a path that is tracked in the index (checked only
+///    when `out` lexically falls under the repo root; a target outside the
+///    repo can't be tracked by it, so the check is simply skipped there).
+/// 4. `out` already exists — as a regular file, a directory, or a symlink.
+///
+/// A git-dir or tracked-file check that can't be answered (e.g. `git`
+/// itself failed) is treated as a rejection: the safe default is not to
+/// reserve a path whose safety can't be confirmed. A target whose
+/// prospective absolute path can't be computed at all (most commonly: its
+/// parent directory doesn't exist) is *not* rejected here — that surfaces
+/// later, as an ordinary I/O error, when [`OutReservation::reserve`] tries to
+/// create it.
+fn preflight_out_checks(out: &Path, concerns_spec: &str, root: &Path) -> Result<(), String> {
+    let out_abs = out_prospective_abs(out);
+
+    // 1. Same file as --concerns.
+    if concerns_spec != "-" {
+        if let (Some(out_abs), Ok(concerns_abs)) =
+            (out_abs.as_ref(), std::fs::canonicalize(concerns_spec))
+        {
+            if *out_abs == concerns_abs {
+                return Err(format!(
+                    "--out target {} is the same file as --concerns {concerns_spec}",
+                    out.display()
+                ));
+            }
+        }
+    }
+
+    if let Some(out_abs) = out_abs.as_ref() {
+        // 2. Inside git's own directory.
+        match git_dirs(root) {
+            Ok(dirs) => {
+                if dirs.iter().any(|d| out_abs.starts_with(d)) {
+                    return Err(format!(
+                        "--out target {} is inside the repository's git directory; choose a path outside .git",
+                        out.display()
+                    ));
+                }
+            }
+            Err(GitError::GitFailed(msg)) => {
+                return Err(format!(
+                    "could not determine the repository's git directory: {}",
+                    msg.trim()
+                ));
+            }
+            Err(_) => {}
+        }
+
+        // 3. Tracked in the index (only meaningful if out lexically falls
+        // under the repo root).
+        if let Ok(root_abs) = std::fs::canonicalize(root) {
+            if let Ok(rel) = out_abs.strip_prefix(&root_abs) {
+                if let Some(rel) = rel.to_str() {
+                    let rel = rel.replace(std::path::MAIN_SEPARATOR, "/");
+                    match is_tracked(root, &rel) {
+                        Ok(true) => {
+                            return Err(format!(
+                                "--out target {} is a tracked file in this repository; choose an untracked path",
+                                out.display()
+                            ));
+                        }
+                        Ok(false) => {}
+                        Err(GitError::GitFailed(msg)) => {
+                            return Err(format!(
+                                "could not check whether --out is tracked: {}",
+                                msg.trim()
+                            ));
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Already exists (file, directory, or symlink — checked without
+    // following the symlink, so a dangling symlink is still rejected).
+    match std::fs::symlink_metadata(out) {
+        Ok(meta) if meta.is_dir() => {
+            return Err(format!("--out target {} is a directory", out.display()));
+        }
+        Ok(_) => {
+            return Err(format!(
+                "--out target {} already exists; move or delete the previous result before re-running",
+                out.display()
+            ));
+        }
+        Err(_) => {}
+    }
+
+    Ok(())
+}
+
+/// An atomic no-clobber reservation on a `--out` target: an empty placeholder
+/// file created with `O_CREAT|O_EXCL` (`create_new`), which is what actually
+/// guarantees no-clobber — the preflight checks above narrow *why* a target
+/// is unsafe, but only `create_new` closes the TOCTOU between "checked" and
+/// "written".
+///
+/// Cleanup is RAII: unless [`disarm`](Self::disarm) is called (only on a
+/// successful final write), dropping the reservation best-effort removes the
+/// placeholder. Because `serve_session` owns the reservation for its entire
+/// body, this covers every non-submit termination — abort, timeout, a
+/// SIGINT, or an early-return error path — without each of those call sites
+/// needing to know about `--out` at all.
+pub(crate) struct OutReservation {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl OutReservation {
+    /// Creates the empty placeholder at `path`. The caller is expected to
+    /// have already run [`preflight_out_checks`]; this only re-attempts the
+    /// existence check atomically (via `create_new`) and surfaces any other
+    /// I/O failure (e.g. a missing parent directory) as-is.
+    fn reserve(path: PathBuf) -> std::io::Result<Self> {
+        let mut open_options = std::fs::OpenOptions::new();
+        open_options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_options.mode(0o600);
+        }
+        open_options.open(&path)?;
+        Ok(Self { path, armed: true })
+    }
+
+    /// Marks the reservation as fulfilled: the placeholder has just been
+    /// replaced (via `rename`) with the real output, so `Drop` must not
+    /// delete it. Takes `self` by value so the disarmed drop happens right
+    /// here rather than depending on a caller remembering to check a flag.
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutReservation {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Drops status entries whose absolute path is in `exempt`. Entries that
@@ -208,6 +372,18 @@ pub async fn run(args: ReviewArgs) -> u8 {
         concerns_sha256: crate::snapshot::concerns_digest(&input),
     };
 
+    // 3.5. `--out` preflight: checks only, no filesystem writes. Runs before
+    // the dirty gate so a rejection is never entangled with (or shadowed by)
+    // a dirty-worktree report. The actual reservation happens further below,
+    // after the dirty gate, so the placeholder it creates never shows up as
+    // an untracked file in that gate.
+    if let Some(out) = &args.out {
+        if let Err(e) = preflight_out_checks(out, &args.concerns, &root) {
+            eprintln!("{e}");
+            return exitcode::OUT_FAILED;
+        }
+    }
+
     // The diff above only ever covers `<base>...HEAD` (committed state); if
     // the agent forgot to commit some of its work — most dangerously a
     // brand-new file it never `git add`ed — those changes are reviewed
@@ -288,6 +464,23 @@ pub async fn run(args: ReviewArgs) -> u8 {
         dirty_warning(status);
     }
 
+    // 3.6. Reserve `--out` now that the review is definitely starting: an
+    // empty placeholder created with `create_new` (O_EXCL), the atomic
+    // no-clobber guarantee the checks above only prepared for. Deliberately
+    // after the dirty gate above (so the placeholder itself is never flagged
+    // as an untracked file) and after the empty-diff check below would have
+    // returned (so a review that never starts doesn't leave one behind).
+    let out_reservation = match &args.out {
+        Some(path) => match OutReservation::reserve(path.clone()) {
+            Ok(reservation) => Some(reservation),
+            Err(e) => {
+                eprintln!("failed to reserve --out target {}: {e}", path.display());
+                return exitcode::OUT_FAILED;
+            }
+        },
+        None => None,
+    };
+
     // 4. Build the session state.
     let mut mapping = resolve_mapping(&files, &input);
     // Surface diff-level warnings (e.g. files too large to display) ahead
@@ -340,7 +533,7 @@ pub async fn run(args: ReviewArgs) -> u8 {
         url,
         args.no_open,
         args.timeout,
-        args.out,
+        out_reservation,
     )
     .await
 }
@@ -374,7 +567,7 @@ pub async fn serve_session(
     url: String,
     no_open: bool,
     timeout: Option<Duration>,
-    out: Option<PathBuf>,
+    out: Option<OutReservation>,
 ) -> u8 {
     // Install the SIGINT handler BEFORE the banner: once the session URL is
     // visible, a ctrl-c must produce the clean abort exit (2). Without eager
@@ -501,14 +694,26 @@ pub async fn serve_session(
                 Decision::Approve => exitcode::APPROVED,
                 Decision::RequestChanges => exitcode::REQUEST_CHANGES,
             };
-            if let Some(path) = out {
-                if let Err(e) = write_out_atomic(&path, &json) {
-                    eprintln!("failed to write {}: {e}", path.display());
-                    return exitcode::OUT_FAILED;
+            if let Some(reservation) = out {
+                // The rename below replaces the reserved placeholder with
+                // the real output; only on success does the reservation get
+                // disarmed. On failure it stays armed, so returning here
+                // drops it and best-effort removes the placeholder rather
+                // than leaving an empty file behind.
+                match write_out_atomic(&reservation.path, &json) {
+                    Ok(()) => reservation.disarm(),
+                    Err(e) => {
+                        eprintln!("failed to write {}: {e}", reservation.path.display());
+                        return exitcode::OUT_FAILED;
+                    }
                 }
             }
             decision_code
         }
+        // Aborted and Timeout fall straight through to the implicit drop of
+        // `out` at the end of this function: an armed `OutReservation`
+        // best-effort removes its placeholder there, so these arms don't
+        // need to touch `out` themselves.
         Outcome::Aborted => exitcode::ABORTED,
         Outcome::Timeout => exitcode::TIMEOUT,
     }

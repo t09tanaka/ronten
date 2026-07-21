@@ -400,27 +400,200 @@ fn out_flag_writes_file() {
 
 #[test]
 fn out_write_failure_exits_15_with_stdout_intact() {
-    // The parent directory of `--out` doesn't exist, so the atomic
-    // write must fail — but the review outcome already happened, so
-    // stdout must still carry the correct result JSON, only the exit
-    // code changes (to the dedicated OUT_FAILED code), regardless of the
-    // approve/request-changes decision.
+    // The parent directory of `--out` doesn't exist. Since `--out` is now
+    // reserved (atomically, via `create_new`) before the server ever starts,
+    // this failure surfaces at that reservation step rather than at the
+    // final write: the process exits with OUT_FAILED before printing the
+    // session URL or accepting a submission at all, so stdout stays empty
+    // (there is no review outcome to carry) — unlike the pre-reservation
+    // design, where the outcome was already decided and only the final
+    // write failed.
     let td = fixture_repo();
-    let (child, url) = spawn_review(td.path(), &["--out", "no-such-dir/result.json"]);
-
-    let (status, _) = common::post_json(
-        &format!("{}/submit", api_base(&url)),
-        &full_draft("approve"),
+    let code = expect_exit(
+        td.path(),
+        &[
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+            "--out",
+            "no-such-dir/result.json",
+        ],
     );
-    assert_eq!(status, 200);
-
-    let out = child.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(15));
-    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(result["decision"], "approve");
+    assert_eq!(code, 15);
     assert!(
         !td.path().join("no-such-dir").exists(),
         "the missing parent directory must not have been created as a side effect"
+    );
+}
+
+/// Spawns `ronten review` (with `--base main --concerns concerns.json
+/// --no-open` plus `extra`) expecting an immediate exit — no session, no
+/// stdout — and returns `(exit code, stderr)`. Companion to `expect_exit`
+/// for the `--out` preflight-rejection tests below, which also need to
+/// assert on the rejection message.
+fn expect_exit_with_stderr(dir: &Path, extra: &[&str]) -> (i32, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(dir)
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    (
+        out.status.code().unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// A pre-existing file at the `--out` target must be refused (exit 15)
+/// before the server ever starts: overwriting it would silently discard
+/// whatever is there, most plausibly a result from a previous run.
+#[test]
+fn out_refuses_existing_target() {
+    let td = fixture_repo();
+    std::fs::write(
+        td.path().join("result.json"),
+        "leftover from a previous run\n",
+    )
+    .unwrap();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "result.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("already exists"),
+        "stderr missing existing-target message: {stderr}"
+    );
+    assert!(
+        stderr.contains("move or delete"),
+        "stderr must tell the user to move/delete the stale result: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("result.json")).unwrap(),
+        "leftover from a previous run\n",
+        "the pre-existing file must not have been touched"
+    );
+}
+
+/// A `--out` target that is tracked by git must be refused: overwriting it
+/// would blow away part of the reviewed repository, not just a scratch file.
+#[test]
+fn out_refuses_tracked_file() {
+    let td = fixture_repo();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "a.txt"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("tracked"),
+        "stderr missing tracked-file message: {stderr}"
+    );
+}
+
+/// A `--out` target inside `.git` must be refused: writing there could
+/// corrupt the repository's own bookkeeping.
+#[test]
+fn out_refuses_git_dir() {
+    let td = fixture_repo();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", ".git/result.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("git directory"),
+        "stderr missing git-dir message: {stderr}"
+    );
+    assert!(
+        !td.path().join(".git/result.json").exists(),
+        "nothing should have been written inside .git"
+    );
+}
+
+/// `--out` pointed at the same file as `--concerns` must be refused: ronten
+/// would be reading and clobbering the same path in one run.
+#[test]
+fn out_refuses_concerns_path() {
+    let td = fixture_repo();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "concerns.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        stderr.contains("same file") && stderr.contains("--concerns"),
+        "stderr missing same-as-concerns message: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(td.path().join("concerns.json")).unwrap(),
+        CONCERNS,
+        "the concerns file must not have been touched"
+    );
+}
+
+/// A `--out` target that is already a symlink must be refused, even a
+/// dangling one — following it to write would escape the intended location.
+#[cfg(unix)]
+#[test]
+fn out_refuses_symlink() {
+    let td = fixture_repo();
+    std::os::unix::fs::symlink("nowhere", td.path().join("result.json")).unwrap();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "result.json"]);
+    assert_eq!(code, 15, "stderr: {stderr}");
+    assert!(
+        std::fs::symlink_metadata(td.path().join("result.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the symlink itself must be left alone, not replaced or removed"
+    );
+}
+
+/// Aborting a session started with `--out` must remove the placeholder
+/// reserved for it — otherwise a later run would see it as a stale existing
+/// target and refuse to start (see `out_refuses_existing_target`).
+#[test]
+fn out_placeholder_removed_on_abort() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--out", "result.json"]);
+    assert!(
+        td.path().join("result.json").exists(),
+        "the placeholder must be reserved before the session is reachable over HTTP"
+    );
+
+    let (status, _) = common::post_empty(&format!("{}/abort", api_base(&url)));
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        !td.path().join("result.json").exists(),
+        "the placeholder must be removed once the session aborts without a submission"
+    );
+}
+
+/// A stale `result.json` left over from a previous run must block the
+/// review from starting at all (exit 15, before the server binds), not just
+/// fail once a decision is finally reached.
+#[test]
+fn out_stale_result_blocks_start() {
+    let td = fixture_repo();
+    std::fs::write(
+        td.path().join("result.json"),
+        r#"{"version":2,"decision":"approve"}"#,
+    )
+    .unwrap();
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &["--out", "result.json"]);
+    assert_eq!(code, 15);
+    assert!(
+        stderr.contains("result.json"),
+        "stderr must name the stale target: {stderr}"
     );
 }
 
