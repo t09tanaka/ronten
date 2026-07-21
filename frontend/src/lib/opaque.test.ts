@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { contentNote, opaqueDetails } from './opaque'
+import { contentNote, fileNotices, modeChangeBadge, opaqueDetails, requiresAck, typeChangeBadge } from './opaque'
 import type { FileDiff } from './types'
 
 function makeFile(overrides: Partial<FileDiff> = {}): FileDiff {
@@ -10,10 +10,13 @@ function makeFile(overrides: Partial<FileDiff> = {}): FileDiff {
     content_kind: 'binary',
     old_mode: null,
     new_mode: null,
+    old_type: null,
+    new_type: null,
     old_oid: null,
     new_oid: null,
     old_size: null,
     new_size: null,
+    lfs_pointer: false,
     hunks: [],
     ...overrides,
   }
@@ -94,5 +97,165 @@ describe('opaqueDetails', () => {
       new_size: null,
     })
     expect(opaqueDetails(file)).toEqual([{ label: 'size', value: '1,234,567 B → —' }])
+  })
+})
+
+// Must mirror the server's FileDiff::requires_ack() (gitdiff.rs) exactly —
+// validate_draft rejects submissions with missing acks under this condition.
+describe('requiresAck', () => {
+  it('requires an ack for opaque content kinds', () => {
+    expect(requiresAck(makeFile({ content_kind: 'binary' }))).toBe(true)
+    expect(requiresAck(makeFile({ content_kind: 'non-utf8' }))).toBe(true)
+    expect(requiresAck(makeFile({ content_kind: 'too-large' }))).toBe(true)
+  })
+
+  it('does not require an ack for a plain text change', () => {
+    expect(requiresAck(makeFile({ content_kind: 'text' }))).toBe(false)
+  })
+
+  it('requires an ack when a gitlink pointer actually moves', () => {
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          old_type: 'gitlink',
+          new_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      ),
+    ).toBe(true)
+    // Added / deleted gitlink: one oid side is null, so the pointer moved.
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          old_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ),
+    ).toBe(true)
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          new_type: 'gitlink',
+          new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+        }),
+      ),
+    ).toBe(true)
+  })
+
+  it('does not require an ack for a same-oid pure rename of a gitlink', () => {
+    expect(
+      requiresAck(
+        makeFile({
+          content_kind: 'text',
+          old_type: 'gitlink',
+          new_type: 'gitlink',
+          old_mode: '160000',
+          new_mode: '160000',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          new_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ),
+    ).toBe(false)
+  })
+
+  it('requires an ack for a mode change with both sides present', () => {
+    expect(
+      requiresAck(makeFile({ content_kind: 'text', old_mode: '100644', new_mode: '100755' })),
+    ).toBe(true)
+    expect(
+      requiresAck(makeFile({ content_kind: 'text', old_mode: '100644', new_mode: '120000' })),
+    ).toBe(true)
+  })
+
+  it('does not require an ack when the mode is unchanged or one-sided', () => {
+    expect(
+      requiresAck(makeFile({ content_kind: 'text', old_mode: '100644', new_mode: '100644' })),
+    ).toBe(false)
+    // Added/deleted files have only one side; their kind is already the
+    // headline of the change.
+    expect(requiresAck(makeFile({ content_kind: 'text', new_mode: '100755' }))).toBe(false)
+    expect(requiresAck(makeFile({ content_kind: 'text', old_mode: '100755' }))).toBe(false)
+  })
+})
+
+describe('modeChangeBadge', () => {
+  it('renders "mode old → new" when both sides differ', () => {
+    expect(modeChangeBadge(makeFile({ old_mode: '100644', new_mode: '100755' }))).toBe(
+      'mode 100644 → 100755',
+    )
+  })
+
+  it('is null for an unchanged or one-sided mode', () => {
+    expect(modeChangeBadge(makeFile({ old_mode: '100644', new_mode: '100644' }))).toBeNull()
+    expect(modeChangeBadge(makeFile({ new_mode: '100644' }))).toBeNull()
+    expect(modeChangeBadge(makeFile())).toBeNull()
+  })
+})
+
+describe('typeChangeBadge', () => {
+  it('renders "old → new" when both sides differ', () => {
+    expect(typeChangeBadge(makeFile({ old_type: 'regular', new_type: 'symlink' }))).toBe(
+      'regular → symlink',
+    )
+  })
+
+  it('is null for an unchanged or one-sided type', () => {
+    expect(typeChangeBadge(makeFile({ old_type: 'regular', new_type: 'regular' }))).toBeNull()
+    expect(typeChangeBadge(makeFile({ new_type: 'symlink' }))).toBeNull()
+  })
+})
+
+describe('fileNotices', () => {
+  it('is empty for an ordinary file', () => {
+    expect(fileNotices(makeFile())).toEqual([])
+  })
+
+  it('flags a submodule pointer change only when the pointer moves', () => {
+    expect(
+      fileNotices(
+        makeFile({ old_type: 'gitlink', old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }),
+      ),
+    ).toEqual(['Submodule pointer change — nested diff not shown'])
+    expect(
+      fileNotices(
+        makeFile({ new_type: 'gitlink', new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }),
+      ),
+    ).toEqual(['Submodule pointer change — nested diff not shown'])
+    // Same-oid pure rename: nothing hidden, no notice.
+    expect(
+      fileNotices(
+        makeFile({
+          old_type: 'gitlink',
+          new_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          new_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      ),
+    ).toEqual([])
+  })
+
+  it('flags an LFS pointer', () => {
+    expect(fileNotices(makeFile({ lfs_pointer: true }))).toEqual([
+      'Git LFS pointer — actual content not shown',
+    ])
+  })
+
+  it('stacks both notices for an LFS-pointer gitlink combination', () => {
+    expect(
+      fileNotices(
+        makeFile({
+          old_type: 'gitlink',
+          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          lfs_pointer: true,
+        }),
+      ),
+    ).toEqual([
+      'Submodule pointer change — nested diff not shown',
+      'Git LFS pointer — actual content not shown',
+    ])
   })
 })

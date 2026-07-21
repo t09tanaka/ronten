@@ -28,6 +28,10 @@ pub mod exitcode {
     /// The server task ended unexpectedly before any review outcome was
     /// resolved (e.g. the accept loop errored out).
     pub const SERVER_FAILED: u8 = 16;
+    /// The worktree has uncommitted/untracked changes and `--dirty-policy`
+    /// is `error` (the default): part of the change would be reviewed
+    /// nowhere, so the review refuses to start.
+    pub const DIRTY_WORKTREE: u8 = 17;
 }
 
 #[derive(Parser, Debug)]

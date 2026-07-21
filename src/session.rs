@@ -6,7 +6,7 @@ use crate::gitdiff::FileDiff;
 use crate::mapping::{HunkRef, Mapping, UnmappedLine, UNMAPPED_ID};
 use crate::model::{
     derive_decision, Assurance, Comment, ConcernResult, ConcernsInput, ResultOutput, ReviewInfo,
-    Risk, Side, Verdict, OUTPUT_VERSION,
+    Risk, Side, Verdict, Warning, OUTPUT_VERSION,
 };
 use crate::server::Outcome;
 use crate::snapshot::ReviewSnapshot;
@@ -47,8 +47,10 @@ pub struct Draft {
     pub concerns: HashMap<String, ConcernDraft>,
     #[serde(default)]
     pub general_comments: Vec<String>,
-    /// content が描画されない file（FileDiff::is_opaque）の明示 acknowledge。
-    /// 値は session payload の files[] における index。
+    /// 明示 acknowledge が必要な変更（FileDiff::requires_ack — opaque な
+    /// content に加えて gitlink pointer 変更・mode 変更）への acknowledge。
+    /// 値は session payload の files[] における index。フィールド名は当初の
+    /// opaque 専用時代のままだが、対象は requires_ack 全体。
     #[serde(default)]
     pub acknowledged_opaque: Vec<usize>,
 }
@@ -69,7 +71,7 @@ pub struct SessionPayload<'a> {
     pub files: &'a [FileDiff],
     pub concerns: Vec<ConcernView<'a>>,
     pub unmapped_lines: &'a [UnmappedLine],
-    pub warnings: &'a [String],
+    pub warnings: &'a [Warning],
     pub draft: Draft,
     pub submitted: bool,
 }
@@ -266,11 +268,11 @@ impl SessionState {
             }
         }
 
-        let opaque_indices: HashSet<usize> = self
+        let ack_required_indices: HashSet<usize> = self
             .files
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.is_opaque())
+            .filter(|(_, f)| f.requires_ack())
             .map(|(i, _)| i)
             .collect();
         let acknowledged: HashSet<usize> = draft.acknowledged_opaque.iter().copied().collect();
@@ -281,17 +283,21 @@ impl SessionState {
                 violations.push(format!("acknowledged_opaque: unknown file index {i}"));
                 continue;
             };
-            if !opaque_indices.contains(&i) {
+            if !ack_required_indices.contains(&i) {
                 let path = file
                     .new_path
                     .as_deref()
                     .or(file.old_path.as_deref())
                     .unwrap_or("");
-                violations.push(format!("acknowledged_opaque: file {path} is not opaque"));
+                violations.push(format!(
+                    "acknowledged_opaque: file {path} does not require acknowledgement"
+                ));
             }
         }
-        let mut missing_ack: Vec<usize> =
-            opaque_indices.difference(&acknowledged).copied().collect();
+        let mut missing_ack: Vec<usize> = ack_required_indices
+            .difference(&acknowledged)
+            .copied()
+            .collect();
         missing_ack.sort_unstable();
         for i in missing_ack {
             let file = &self.files[i];
@@ -300,7 +306,7 @@ impl SessionState {
                 .as_deref()
                 .or(file.old_path.as_deref())
                 .unwrap_or("");
-            violations.push(format!("opaque change not acknowledged: {path}"));
+            violations.push(format!("change not acknowledged: {path}"));
         }
 
         violations

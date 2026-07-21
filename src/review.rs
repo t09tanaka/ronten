@@ -2,7 +2,7 @@
 //! session state, bind a localhost server, and drive it to an outcome.
 
 use crate::exitcode;
-use crate::gitdiff::{compute_diff, current_branch, has_tracked_changes, repo_root, GitError};
+use crate::gitdiff::{compute_diff, current_branch, repo_root, worktree_status, GitError};
 use crate::mapping::{resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
@@ -38,6 +38,24 @@ pub struct ReviewArgs {
     /// Exit 3 if nothing is submitted within this duration (e.g. "30m")
     #[arg(long, value_parser = humantime::parse_duration)]
     pub timeout: Option<Duration>,
+    /// What to do when the worktree is not clean (tracked changes, untracked
+    /// files, or dirty submodules — none of which this review can show)
+    #[arg(long, value_enum, default_value_t = DirtyPolicy::Error)]
+    pub dirty_policy: DirtyPolicy,
+}
+
+/// Policy for a dirty worktree at review start. The default is `Error`: a
+/// review that silently excludes uncommitted work — most dangerously a
+/// brand-new file the agent forgot to `git add` — looks complete while part
+/// of the change is reviewed nowhere.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
+pub enum DirtyPolicy {
+    /// Refuse to start (exit 17) until the worktree is clean.
+    Error,
+    /// Print what is excluded and start anyway.
+    Warn,
+    /// Start silently.
+    Ignore,
 }
 
 /// Hard cap on the size of the concerns JSON input, to bound memory use
@@ -71,6 +89,54 @@ pub(crate) fn read_concerns_source(spec: &str) -> std::io::Result<String> {
     }
     String::from_utf8(buf)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+}
+
+/// Absolute, symlink-resolved forms of the paths ronten itself expects to
+/// see in the worktree — the concerns file (unless read from stdin) and the
+/// `--out` destination — so the dirty gate doesn't flag ronten's own inputs.
+fn exempt_paths(concerns: &str, out: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let mut exempt = Vec::new();
+    if concerns != "-" {
+        if let Ok(p) = std::fs::canonicalize(concerns) {
+            exempt.push(p);
+        }
+    }
+    if let Some(out) = out {
+        // `--out` usually doesn't exist yet, so canonicalize its parent and
+        // re-append the file name (covers a leftover result from a previous
+        // run sitting untracked in the worktree).
+        if let (Some(parent), Some(name)) = (
+            out.parent().filter(|p| !p.as_os_str().is_empty()),
+            out.file_name(),
+        ) {
+            if let Ok(parent) = std::fs::canonicalize(parent) {
+                exempt.push(parent.join(name));
+            }
+        } else if let (Ok(cwd), Some(name)) = (std::env::current_dir(), out.file_name()) {
+            if let Ok(cwd) = std::fs::canonicalize(cwd) {
+                exempt.push(cwd.join(name));
+            }
+        }
+    }
+    exempt
+}
+
+/// Drops status entries whose absolute path is in `exempt`. Entries that
+/// cannot be resolved (e.g. a deleted tracked file) are kept: an
+/// unresolvable path is a reason to show the entry, not to hide it.
+fn drop_exempt(
+    mut status: crate::gitdiff::WorktreeStatus,
+    root: &std::path::Path,
+    exempt: &[PathBuf],
+) -> crate::gitdiff::WorktreeStatus {
+    let keep = |path: &String| match std::fs::canonicalize(root.join(path)) {
+        Ok(abs) => !exempt.iter().any(|e| e == &abs),
+        Err(_) => true,
+    };
+    status.tracked_changes.retain(keep);
+    status.untracked.retain(keep);
+    status.submodules_dirty.retain(keep);
+    status
 }
 
 /// Entry point for the `review` subcommand. Returns the process exit code.
@@ -135,33 +201,81 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
 
     // The diff above only ever covers `<base>...HEAD` (committed state); if
-    // the agent forgot to commit some of its work, those changes are
-    // reviewed nowhere. Checked here (after the diff is computed, so there is
-    // something to compare against) and printed before *any* early return —
-    // including the empty-diff one below, which is exactly the case where an
-    // agent committed nothing at all and every change sits uncommitted. This
-    // must run and warn even though the process is about to exit, so the
-    // reviewer isn't left staring at "nothing to review" with no clue that
-    // uncommitted changes exist. Display-only, so a git failure here is not
-    // itself a reason to abort the review.
-    let dirty_warning = || {
+    // the agent forgot to commit some of its work — most dangerously a
+    // brand-new file it never `git add`ed — those changes are reviewed
+    // nowhere while the review looks complete. The dirty gate therefore
+    // runs before *any* early return, including the empty-diff one below
+    // (exactly the case where an agent committed nothing at all). The
+    // concerns file and the `--out` destination are exempt: ronten itself
+    // asks for them to exist untracked in the worktree.
+    let dirty = match args.dirty_policy {
+        DirtyPolicy::Ignore => None,
+        DirtyPolicy::Error | DirtyPolicy::Warn => match worktree_status(&root) {
+            Ok(status) => {
+                let exempt = exempt_paths(&args.concerns, args.out.as_deref());
+                let status = drop_exempt(status, &root, &exempt);
+                (!status.is_clean()).then_some(status)
+            }
+            Err(GitError::BadBase(msg)) | Err(GitError::GitFailed(msg)) => {
+                // The gate cannot run at all. Under the (default) Error
+                // policy an unverifiable worktree must not silently pass;
+                // under Warn the review proceeds with a notice.
+                if args.dirty_policy == DirtyPolicy::Error {
+                    eprintln!(
+                        "git status failed, cannot verify the worktree is clean: {}",
+                        msg.trim()
+                    );
+                    return exitcode::GIT_FAILED;
+                }
+                eprintln!(
+                    "warning: git status failed ({}); could not verify the worktree is clean",
+                    msg.trim()
+                );
+                None
+            }
+            Err(GitError::NotARepo) => None,
+        },
+    };
+    let print_dirty = |status: &crate::gitdiff::WorktreeStatus| {
+        for path in &status.tracked_changes {
+            eprintln!("  uncommitted change (tracked): {path}");
+        }
+        for path in &status.untracked {
+            eprintln!("  untracked file: {path}");
+        }
+        for path in &status.submodules_dirty {
+            eprintln!("  dirty submodule: {path}");
+        }
+    };
+    if let Some(status) = &dirty {
+        if args.dirty_policy == DirtyPolicy::Error {
+            eprintln!(
+                "worktree is not clean; this review would cover committed state only ({}...HEAD) and the following would be reviewed nowhere:",
+                args.base
+            );
+            print_dirty(status);
+            eprintln!("commit or stash them, or rerun with --dirty-policy warn to proceed anyway");
+            return exitcode::DIRTY_WORKTREE;
+        }
+    }
+    let dirty_warning = |status: &crate::gitdiff::WorktreeStatus| {
         eprintln!(
-            "warning: tracked files have uncommitted changes; this review covers committed state only ({}...HEAD)",
+            "warning: worktree is not clean; this review covers committed state only ({}...HEAD) and the following are NOT included:",
             args.base
         );
+        print_dirty(status);
     };
-    let dirty = has_tracked_changes(&root);
 
     if files.is_empty() {
         eprintln!("nothing to review: no diff between {} and HEAD", args.base);
-        if dirty {
-            dirty_warning();
+        if let Some(status) = &dirty {
+            dirty_warning(status);
         }
         return exitcode::EMPTY_DIFF;
     }
 
-    if dirty {
-        dirty_warning();
+    if let Some(status) = &dirty {
+        dirty_warning(status);
     }
 
     // 4. Build the session state.

@@ -74,6 +74,7 @@ ronten review --base <ref> --concerns <file|-> [options]
 | `--no-open` | false | Do not auto-open the browser; print URL only |
 | `--title <s>` | branch name | Session display name |
 | `--timeout <dur>` | none | Exit 3 if no submission within the duration (e.g. `30m`) |
+| `--dirty-policy <p>` | `error` | What to do when the worktree is not clean: `error` (exit 17), `warn` (print and proceed), `ignore` |
 
 **Output separation is strict**: human-facing logs (e.g.
 `Review session: http://127.0.0.1:PORT/r/TOKEN`) go to stderr. Machine-readable data — the
@@ -81,20 +82,29 @@ result JSON — goes to stdout only, and only stdout. An agent can always do
 `result=$(ronten review ...)` and safely `jq` the output.
 
 **The diff is `<base>...HEAD` only** (merge-base semantics): it covers committed state, not
-the working tree. If the agent forgot to commit some of its changes before starting the
-review, those changes are reviewed nowhere — they're invisible to both the diff and the
-reviewer. To catch this, `ronten review` checks `git status --porcelain -uno` right after
-computing the diff (before serving) and, if any tracked file has uncommitted changes, prints
-one line to stderr:
+the working tree. If the agent forgot to commit some of its work before starting the review,
+those changes are reviewed nowhere — most dangerously a brand-new file it never `git add`ed,
+which makes the review look complete while the new file is invisible to both the diff and
+the reviewer. To catch this, `ronten review` runs a structured
+`git status --porcelain=v2 -z --untracked-files=all` check right after computing the diff
+and classifies the results: uncommitted changes to tracked files, untracked files, and
+submodules whose worktree is dirty inside.
 
-```
-warning: tracked files have uncommitted changes; this review covers committed state only (<base>...HEAD)
-```
+By default (`--dirty-policy error`) any of these refuses to start the review with exit
+code 17 and a per-file listing on stderr. `--dirty-policy warn` prints the same listing and
+proceeds; `--dirty-policy ignore` skips the check. The concerns file and the `--out`
+destination are exempt — ronten itself expects them in the worktree. Under the default
+`error` policy a failing `git status` also refuses to start (exit 14): an unverifiable
+worktree must not silently pass the gate.
 
-Untracked files don't trigger it (they were never committed either way, so they aren't a
-regression from some prior committed state). The check fails open: if `git status` itself
-can't run, the review proceeds without the warning rather than blocking on a display-only
-check.
+**Changes the diff body under-communicates require explicit acknowledgement** before
+submit: content that isn't rendered (binary / non-UTF-8 / too-large files), submodule
+pointer changes (only the commit pointer is shown — the submodule's own diff is not),
+and file mode/type changes (the executable bit appearing, a file becoming a symlink).
+Each is also surfaced as a structured warning, file headers always show `mode`/type
+transitions, and Git LFS pointers are flagged (the pointer is shown, not the real data).
+Line endings are preserved per line, so an LF→CRLF change or a removed final newline is
+visible instead of rendering as two identical-looking lines.
 
 ### Exit codes
 
@@ -111,6 +121,7 @@ check.
 | 14 | git invocation failed |
 | 15 | `--out` write failed (the review outcome still printed to stdout; only the file write failed) |
 | 16 | the server task terminated unexpectedly (e.g. a panic) before an outcome was reached |
+| 17 | worktree not clean under `--dirty-policy error` (the default); commit/stash first or pass `--dirty-policy warn` |
 
 ### `ronten schema`
 
@@ -226,7 +237,15 @@ never a context line. An omitted `side` claims on *both* numbering schemes at on
     { "id": "_unmapped", "verdict": "approve", "comments": [] }
   ],
   "general_comments": ["Overall, …"],
-  "warnings": ["location matched no changed lines: src/routes/index.ts:120-140"],
+  "warnings": [
+    {
+      "code": "LOCATION_MATCHED_NOTHING",
+      "severity": "warning",
+      "message": "location matched no changed lines: src/routes/index.ts:120-140",
+      "path": "src/routes/index.ts",
+      "concern_id": "auth-core"
+    }
+  ],
   "started_at": "…", "submitted_at": "…"
 }
 ```

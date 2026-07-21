@@ -7,9 +7,15 @@ export type Risk = 'high' | 'medium' | 'low'
 export type Verdict = 'approve' | 'request-changes'
 export type LineKind = 'context' | 'add' | 'remove'
 
+/** Line-ending form of one diff line — the display content has its newline
+ * stripped, so this is the only way to tell an LF line from a CRLF one (or
+ * from a final line with no trailing newline at all). */
+export type Eol = 'lf' | 'crlf' | 'none'
+
 export interface DiffLine {
   kind: LineKind
   content: string
+  eol: Eol
   old_no: number | null
   new_no: number | null
 }
@@ -26,6 +32,11 @@ export interface Hunk {
 export type ChangeKind = 'added' | 'deleted' | 'modified' | 'renamed' | 'copied'
 export type ContentKind = 'text' | 'binary' | 'non-utf8' | 'too-large'
 
+/** What kind of filesystem object a diff side is, derived from its git
+ * mode. Separate from ContentKind because a symlink or gitlink can render
+ * "text" content while being a different kind of object entirely. */
+export type FileType = 'regular' | 'executable' | 'symlink' | 'gitlink'
+
 export interface FileDiff {
   old_path: string | null
   new_path: string | null
@@ -33,10 +44,15 @@ export interface FileDiff {
   content_kind: ContentKind
   old_mode: string | null
   new_mode: string | null
+  old_type: FileType | null
+  new_type: FileType | null
   old_oid: string | null
   new_oid: string | null
   old_size: number | null
   new_size: number | null
+  /** Either side is a Git LFS pointer blob — the diff shows the pointer,
+   * not the actual content. */
+  lfs_pointer: boolean
   hunks: Hunk[]
 }
 
@@ -81,12 +97,22 @@ export interface Draft {
   acknowledged_opaque: number[]
 }
 
+/** A structured warning surfaced to the reviewer (see model.rs). `path` /
+ * `concern_id` are present only when the warning is scoped to one. */
+export interface Warning {
+  code: string
+  severity: 'info' | 'warning'
+  message: string
+  path?: string
+  concern_id?: string
+}
+
 export interface Session {
   title: string
   summary: string | null
   files: FileDiff[]
   concerns: ConcernView[]
-  warnings: string[]
+  warnings: Warning[]
   draft: Draft
   submitted: boolean
   unmapped_lines: UnmappedLine[]

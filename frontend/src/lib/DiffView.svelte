@@ -3,7 +3,7 @@
   import HunkView from './HunkView.svelte'
   import type { CommentLineInfo } from './anchors'
   import { hasInvisibles, reveal } from './invisibles'
-  import { contentNote, opaqueDetails } from './opaque'
+  import { contentNote, fileNotices, modeChangeBadge, opaqueDetails, requiresAck, typeChangeBadge } from './opaque'
   import type { ChangeKind, FileDiff, HunkRef } from './types'
 
   interface FileGroup {
@@ -88,6 +88,12 @@
         {#if file.content_kind !== 'text'}
           <span class="file-status kind-{file.content_kind}">{file.content_kind}</span>
         {/if}
+        {#if modeChangeBadge(file)}
+          <span class="file-status kind-meta">{modeChangeBadge(file)}</span>
+        {/if}
+        {#if typeChangeBadge(file)}
+          <span class="file-status kind-meta">{typeChangeBadge(file)}</span>
+        {/if}
         {#if fileHasInvisibles(file, group.refs)}
           <span
             class="file-status kind-invisible"
@@ -96,6 +102,9 @@
           >
         {/if}
       </header>
+      {#each fileNotices(file) as notice (notice)}
+        <p class="file-notice">{notice}</p>
+      {/each}
       {#each group.refs as hunkRef (hunkRef.hunk ?? -1)}
         {#if hunkRef.hunk === null}
           {#if file.content_kind === 'text'}
@@ -132,6 +141,23 @@
           />
         {/if}
       {/each}
+      <!-- Text files can still require an ack (gitlink, mode change — see
+           requiresAck): the header badges above explain why, and the same
+           ack checkbox as the opaque card gates submission. Opaque files
+           already carry theirs inside the opaque card. -->
+      {#if file.content_kind === 'text' && requiresAck(file)}
+        <div class="opaque-card">
+          <label class="opaque-ack">
+            <input
+              type="checkbox"
+              checked={rs.isAcked(group.fileIndex)}
+              disabled={rs.phase !== 'review'}
+              onchange={() => rs.toggleAck(group.fileIndex)}
+            />
+            I acknowledge this change
+          </label>
+        </div>
+      {/if}
     </section>
   {/each}
 {/if}
@@ -175,6 +201,23 @@
   .kind-invisible {
     color: var(--c-odo);
     background: var(--c-odo-tint);
+  }
+
+  /* mode/type transition badges carry literal values (git modes, type
+     names) — keep their original casing. */
+  .kind-meta {
+    text-transform: none;
+  }
+
+  .file-notice {
+    margin: 0;
+    padding: 6px 10px;
+    border: 1px solid var(--c-rule);
+    border-top: none;
+    border-bottom: none;
+    background: var(--c-odo-tint);
+    color: var(--c-odo);
+    font-size: 12px;
   }
 
   .status-card {

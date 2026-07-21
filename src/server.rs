@@ -486,10 +486,13 @@ index 1111111..2222222 100644
             content_kind: ContentKind::Binary,
             old_mode: Some("100644".to_string()),
             new_mode: Some("100644".to_string()),
+            old_type: Some(crate::gitdiff::FileType::Regular),
+            new_type: Some(crate::gitdiff::FileType::Regular),
             old_oid: Some("1111111111111111111111111111111111111111".to_string()),
             new_oid: Some("2222222222222222222222222222222222222222".to_string()),
             old_size: Some(10),
             new_size: Some(20),
+            lfs_pointer: false,
             hunks: Vec::new(),
         });
         let input = ConcernsInput {

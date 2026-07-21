@@ -423,20 +423,83 @@ fn out_write_failure_exits_15_with_stdout_intact() {
     );
 }
 
+/// The default dirty policy is `error`: an uncommitted change to a tracked
+/// file refuses to start the review with the dedicated exit code 17.
 #[test]
-fn dirty_tracked_file_prints_uncommitted_changes_warning() {
-    // `concerns.json` in the fixture is already untracked (excluded via
-    // -uno); modify a *tracked* file without committing so the warning must
-    // fire.
+fn dirty_tracked_file_blocks_start_by_default() {
     let td = fixture_repo();
     std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
 
-    let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(
-        prebanner.contains(
-            "warning: tracked files have uncommitted changes; this review covers committed state only (main...HEAD)"
-        ),
+        stderr.contains("worktree is not clean"),
+        "stderr missing dirty-worktree error: {stderr}"
+    );
+    assert!(
+        stderr.contains("uncommitted change (tracked): a.txt"),
+        "stderr must name the dirty file: {stderr}"
+    );
+}
+
+/// A brand-new file the agent forgot to `git add` is exactly the change a
+/// review must not silently exclude: untracked files block by default.
+#[test]
+fn untracked_file_blocks_start_by_default() {
+    let td = fixture_repo();
+    std::fs::write(td.path().join("forgotten.rs"), "fn main() {}\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("untracked file: forgotten.rs"),
+        "stderr must name the untracked file: {stderr}"
+    );
+    assert!(
+        !stderr.contains("concerns.json"),
+        "the concerns file itself is exempt from the dirty gate: {stderr}"
+    );
+}
+
+#[test]
+fn dirty_tracked_file_with_warn_policy_prints_warning_and_starts() {
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+
+    let (child, url, prebanner) =
+        spawn_review_with_prebanner(td.path(), &["--dirty-policy", "warn"]);
+    assert!(
+        prebanner.contains("warning: worktree is not clean"),
         "stderr missing dirty-worktree warning: {prebanner}"
+    );
+    assert!(
+        prebanner.contains("uncommitted change (tracked): a.txt"),
+        "warning must name the dirty file: {prebanner}"
     );
 
     ureq::post(&format!("{}/abort", api_base(&url)))
@@ -446,17 +509,15 @@ fn dirty_tracked_file_prints_uncommitted_changes_warning() {
 }
 
 #[test]
-fn empty_diff_with_dirty_tracked_file_exits_13_with_warning() {
-    // Regression test: the empty-diff early return used to happen before the
-    // dirty-worktree check, so the single most important case — an agent
-    // that committed nothing at all, leaving every change uncommitted — never
-    // got the warning. `--base feature` against HEAD (also `feature`) is an
-    // empty diff by construction; then a tracked file is modified without
-    // committing.
+fn empty_diff_with_dirty_worktree_errors_before_empty_diff_report() {
+    // An agent that committed nothing at all — every change uncommitted,
+    // `--base feature` against HEAD (also `feature`) an empty diff by
+    // construction — is the single most dangerous case. The dirty gate must
+    // fire (exit 17) before the empty-diff report would.
     let td = fixture_repo();
     std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ronten"))
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
         .current_dir(td.path())
         .args([
             "review",
@@ -466,12 +527,39 @@ fn empty_diff_with_dirty_tracked_file_exits_13_with_warning() {
             "concerns.json",
             "--no-open",
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
+    assert_eq!(out.status.code(), Some(17));
+    assert!(out.stdout.is_empty(), "stdout must be empty on dirty error");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("worktree is not clean"),
+        "stderr missing dirty-worktree error: {stderr}"
+    );
+}
 
-    let out = child.wait_with_output().unwrap();
+#[test]
+fn empty_diff_with_dirty_worktree_and_warn_policy_exits_13_with_warning() {
+    // With `--dirty-policy warn` the old behavior holds: the empty-diff
+    // report still carries the dirty-worktree warning so the reviewer isn't
+    // left staring at "nothing to review" with no clue.
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "feature",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+            "--dirty-policy",
+            "warn",
+        ])
+        .output()
+        .unwrap();
     assert_eq!(out.status.code(), Some(13));
     assert!(out.stdout.is_empty(), "stdout must be empty on empty diff");
     let stderr = String::from_utf8(out.stderr).unwrap();
@@ -480,19 +568,19 @@ fn empty_diff_with_dirty_tracked_file_exits_13_with_warning() {
         "stderr missing empty-diff message: {stderr}"
     );
     assert!(
-        stderr.contains(
-            "warning: tracked files have uncommitted changes; this review covers committed state only (feature...HEAD)"
-        ),
+        stderr.contains("warning: worktree is not clean"),
         "stderr missing dirty-worktree warning: {stderr}"
     );
 }
 
 #[test]
 fn clean_worktree_prints_no_uncommitted_changes_warning() {
+    // The fixture's untracked `concerns.json` is exempt (it is ronten's own
+    // input), so the default error policy still lets the session start.
     let td = fixture_repo();
     let (child, url, prebanner) = spawn_review_with_prebanner(td.path(), &[]);
     assert!(
-        !prebanner.contains("tracked files have uncommitted changes"),
+        !prebanner.contains("worktree is not clean"),
         "unexpected dirty-worktree warning on a clean worktree: {prebanner}"
     );
 
@@ -505,6 +593,9 @@ fn clean_worktree_prints_no_uncommitted_changes_warning() {
 #[test]
 fn concerns_from_stdin() {
     let td = fixture_repo();
+    // Concerns come from stdin here, so the on-disk concerns.json is not
+    // exempt from the dirty gate — remove it to keep the worktree clean.
+    std::fs::remove_file(td.path().join("concerns.json")).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_ronten"))
         .current_dir(td.path())
         .args(["review", "--base", "main", "--concerns", "-", "--no-open"])

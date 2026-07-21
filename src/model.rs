@@ -102,9 +102,63 @@ pub struct ResultOutput {
     pub decision: Decision,
     pub concerns: Vec<ConcernResult>,
     pub general_comments: Vec<String>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
     pub started_at: String,
     pub submitted_at: String,
+}
+
+/// A structured warning surfaced to the reviewer and preserved in the
+/// result, so a later audit can tell programmatically what the review
+/// session flagged (not just as prose).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Warning {
+    /// Stable machine-readable code, e.g. `FILE_TOO_LARGE`,
+    /// `LOCATION_MATCHED_NOTHING`, `MODE_CHANGED`, `GITLINK_CHANGED`,
+    /// `LFS_POINTER`, `NON_UTF8_CONTENT`.
+    pub code: String,
+    pub severity: Severity,
+    /// Human-readable description (what the UI displays).
+    pub message: String,
+    /// File path the warning is about, when file-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Concern id the warning is about, when concern-scoped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concern_id: Option<String>,
+}
+
+impl Warning {
+    pub fn new(code: &str, severity: Severity, message: String) -> Self {
+        Warning {
+            code: code.to_string(),
+            severity,
+            message,
+            path: None,
+            concern_id: None,
+        }
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_concern(mut self, id: impl Into<String>) -> Self {
+        self.concern_id = Some(id.into());
+        self
+    }
+}
+
+/// How seriously a warning should be taken.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    /// Notable but expected (e.g. a file type change the reviewer should
+    /// glance at).
+    Info,
+    /// Something was not fully rendered or matched; the reviewer may be
+    /// seeing less than the whole change.
+    Warning,
 }
 
 /// Identifies exactly what a result applies to. Consumers deciding whether

@@ -1,3 +1,4 @@
+use crate::model::{Severity, Warning};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -22,6 +23,33 @@ pub enum ContentKind {
     TooLarge,
 }
 
+/// What kind of filesystem object a diff side is, derived from its git mode.
+/// Surfaced separately from `ContentKind` because a symlink or gitlink can
+/// render "text" content (the target path / `Subproject commit` line) while
+/// being a fundamentally different kind of object than a regular file.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileType {
+    Regular,
+    Executable,
+    Symlink,
+    Gitlink,
+}
+
+/// File type for a git mode string; `None` for an absent side ("000000" or
+/// empty). Unknown modes conservatively map to `Regular`.
+fn file_type_of_mode(mode: &str) -> Option<FileType> {
+    if mode.is_empty() || mode.bytes().all(|b| b == b'0') {
+        return None;
+    }
+    Some(match mode {
+        "100755" => FileType::Executable,
+        "120000" => FileType::Symlink,
+        "160000" => FileType::Gitlink,
+        _ => FileType::Regular,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileDiff {
     pub old_path: Option<String>,
@@ -32,20 +60,45 @@ pub struct FileDiff {
     /// 存在しない側（added の old / deleted の new、mode "000000"）は None。
     pub old_mode: Option<String>,
     pub new_mode: Option<String>,
+    /// mode から導出したファイル種別。存在しない側は None。
+    pub old_type: Option<FileType>,
+    pub new_type: Option<FileType>,
     /// フル OID。zero-oid の側は None。`parse_unified_diff` 経由（demo）は常に None。
     pub old_oid: Option<String>,
     pub new_oid: Option<String>,
     /// blob サイズ（bytes）。gitlink・存在しない側・不明（demo 経由）は None。
     pub old_size: Option<u64>,
     pub new_size: Option<u64>,
+    /// いずれかの側が Git LFS pointer blob（実データではなく pointer だけを
+    /// レビューしていることを UI に明示するためのフラグ）。
+    pub lfs_pointer: bool,
     pub hunks: Vec<Hunk>,
 }
 
 impl FileDiff {
     /// 内容が描画されない変更（binary / non-utf8 / too-large）。
-    /// submit 時に明示 acknowledge が必要（`SessionState::validate_draft`）。
     pub fn is_opaque(&self) -> bool {
         self.content_kind != ContentKind::Text
+    }
+
+    /// submit 時に明示 acknowledge が必要な変更。内容が描画されないもの
+    /// （opaque）に加えて、レビュー画面の本文だけでは重大さが伝わらない
+    /// 変更 — gitlink の pointer 変更（submodule pointer だけで中身の diff は
+    /// 表示されない）、mode 変更（実行属性の付与・symlink 化など）— を含む。
+    /// gitlink の同一 oid の pure rename は pointer が動いていないので対象外。
+    pub fn requires_ack(&self) -> bool {
+        if self.is_opaque() {
+            return true;
+        }
+        let gitlink_involved =
+            self.old_type == Some(FileType::Gitlink) || self.new_type == Some(FileType::Gitlink);
+        if gitlink_involved && self.old_oid != self.new_oid {
+            return true;
+        }
+        // Mode change with both sides present (e.g. 100644 -> 100755, or a
+        // regular file becoming a symlink). Added/deleted files have only
+        // one side and their kind is already the headline of the change.
+        matches!((&self.old_mode, &self.new_mode), (Some(o), Some(n)) if o != n)
     }
 }
 
@@ -67,10 +120,26 @@ pub enum LineKind {
     Remove,
 }
 
+/// Line-ending form of one diff line, preserved so the UI can make an
+/// LF→CRLF (or newline-at-EOF) change visible instead of showing two
+/// identical-looking strings.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum Eol {
+    Lf,
+    Crlf,
+    /// No trailing newline (the last line of a file without a final newline).
+    None,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub content: String,
+    /// 表示 content からは改行が取り除かれているため、元の行末形式を別途
+    /// 保持する。demo の unified-diff parse 経由では常に `Lf`（原文の行末
+    /// 形式が diff テキストからは分からないため）。
+    pub eol: Eol,
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
 }
@@ -154,10 +223,13 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
                 content_kind: ContentKind::Text,
                 old_mode: None,
                 new_mode: None,
+                old_type: None,
+                new_type: None,
                 old_oid: None,
                 new_oid: None,
                 old_size: None,
                 new_size: None,
+                lfs_pointer: false,
                 hunks: Vec::new(),
             });
             continue;
@@ -243,6 +315,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Context,
                     content,
+                    eol: Eol::Lf,
                     old_no: Some(old_no),
                     new_no: Some(new_no),
                 });
@@ -253,6 +326,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Remove,
                     content,
+                    eol: Eol::Lf,
                     old_no: Some(old_no),
                     new_no: None,
                 });
@@ -262,6 +336,7 @@ pub fn parse_unified_diff(input: &str) -> Vec<FileDiff> {
                 hunk.lines.push(DiffLine {
                     kind: LineKind::Add,
                     content,
+                    eol: Eol::Lf,
                     old_no: None,
                     new_no: Some(new_no),
                 });
@@ -289,12 +364,37 @@ mod tests {
             content_kind,
             old_mode: None,
             new_mode: None,
+            old_type: None,
+            new_type: None,
             old_oid: None,
             new_oid: None,
             old_size: None,
             new_size: None,
+            lfs_pointer: false,
             hunks: Vec::new(),
         }
+    }
+
+    #[test]
+    fn gitlink_requires_ack_only_when_pointer_moves() {
+        let gitlink = |old_oid: &str, new_oid: &str| FileDiff {
+            old_type: Some(FileType::Gitlink),
+            new_type: Some(FileType::Gitlink),
+            old_mode: Some("160000".to_string()),
+            new_mode: Some("160000".to_string()),
+            old_oid: Some(old_oid.to_string()),
+            new_oid: Some(new_oid.to_string()),
+            ..file_diff_with_content_kind(ContentKind::Text)
+        };
+        // Pointer moved -> ack; same-oid pure rename -> nothing hidden.
+        assert!(gitlink("aaaa", "bbbb").requires_ack());
+        assert!(!gitlink("aaaa", "aaaa").requires_ack());
+        // Added gitlink: one side absent counts as a pointer move.
+        let added = FileDiff {
+            old_oid: None,
+            ..gitlink("aaaa", "bbbb")
+        };
+        assert!(added.requires_ack());
     }
 
     #[test]
@@ -496,33 +596,133 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     Ok(std::path::PathBuf::from(path))
 }
 
-/// True if any tracked file has uncommitted changes (staged or unstaged),
-/// via `git status --porcelain -uno` (`-uno` excludes untracked files: they
-/// were never committed, so they can't silently escape the `<base>...HEAD`
-/// diff the way an uncommitted edit to a tracked file can). `-c
+/// Structured worktree cleanliness report, from `git status --porcelain=v2
+/// -z --untracked-files=all`. Every path is repo-root-relative.
+///
+/// The categories matter differently for review completeness:
+/// - `tracked_changes`: staged or unstaged edits to tracked files — the
+///   committed diff under review does not include them.
+/// - `untracked`: files git has never seen. The classic miss is a brand-new
+///   file the agent forgot to `git add`: the review looks complete while the
+///   new file is reviewed nowhere.
+/// - `submodules_dirty`: submodules whose worktree differs from the recorded
+///   pointer; the parent diff can't show what changed inside.
+#[derive(Debug, Default)]
+pub struct WorktreeStatus {
+    pub tracked_changes: Vec<String>,
+    pub untracked: Vec<String>,
+    pub submodules_dirty: Vec<String>,
+}
+
+impl WorktreeStatus {
+    pub fn is_clean(&self) -> bool {
+        self.tracked_changes.is_empty()
+            && self.untracked.is_empty()
+            && self.submodules_dirty.is_empty()
+    }
+}
+
+/// Reports the worktree's cleanliness, untracked files included. `-c
 /// core.fsmonitor=false` disables a repo-local fsmonitor hook (which could
 /// otherwise short-circuit or lie about the working-tree scan) and
 /// `--ignore-submodules=none` overrides any repo-local `.gitmodules`/config
-/// setting that would hide dirty submodules from this check — same hardened,
+/// setting that would hide dirty submodules — same hardened,
 /// don't-trust-repo-local-config posture as [`base_git`]'s env scrubbing.
-/// This drives a display-only startup warning, so any git invocation failure
-/// here fails open (returns `false`, review proceeds) rather than blocking
-/// the review over a check that isn't load-bearing for correctness.
-pub fn has_tracked_changes(root: &std::path::Path) -> bool {
-    match git_cmd(root)
+/// `-z` keeps paths verbatim (no quoting), and porcelain v2 is parsed
+/// structurally instead of by line prefix guessing.
+pub fn worktree_status(root: &std::path::Path) -> Result<WorktreeStatus, GitError> {
+    let output = git_cmd(root)
         .args([
             "-c",
             "core.fsmonitor=false",
             "status",
-            "--porcelain",
-            "-uno",
+            "--porcelain=v2",
+            "-z",
+            "--untracked-files=all",
             "--ignore-submodules=none",
         ])
         .output()
-    {
-        Ok(output) if output.status.success() => !output.stdout.is_empty(),
-        _ => false,
+        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::GitFailed(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
     }
+    parse_status_v2_z(&output.stdout)
+}
+
+/// Parses `git status --porcelain=v2 -z` output. Entry types:
+/// - `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>` — ordinary change
+/// - `2 <XY> <sub> ... <X><score> <path>\0<origPath>` — rename/copy (the
+///   original path is the NEXT NUL-delimited token, consumed here)
+/// - `u ...` — unmerged (counted as a tracked change)
+/// - `? <path>` — untracked, `! <path>` — ignored (ignored are skipped)
+///
+/// The `<sub>` field is `N...` for a non-submodule and `S<c><m><u>` for a
+/// submodule; any of c/m/u being set means the submodule worktree differs
+/// from the recorded pointer. Fails closed on malformed entries: a status
+/// this function cannot understand must not silently read as "clean".
+fn parse_status_v2_z(bytes: &[u8]) -> Result<WorktreeStatus, GitError> {
+    let mut status = WorktreeStatus::default();
+    let mut tokens = bytes
+        .split(|&b| b == 0)
+        .filter(|t| !t.is_empty())
+        .peekable();
+    while let Some(token) = tokens.next() {
+        let text = std::str::from_utf8(token)
+            .map_err(|_| GitError::GitFailed("non-UTF-8 git status entry".to_string()))?;
+        let malformed = || GitError::GitFailed(format!("unparseable git status entry: {text:?}"));
+        let (kind, rest) = text.split_once(' ').ok_or_else(malformed)?;
+        match kind {
+            "1" | "2" => {
+                // Fields: XY sub mH mI mW hH hI [Xscore] path — path is
+                // everything after the fixed-count fields (it may contain
+                // spaces), so split off exactly the field count.
+                let field_count = if kind == "1" { 7 } else { 8 };
+                let mut rest_fields = rest;
+                let mut sub = "";
+                for i in 0..field_count {
+                    let (field, tail) = rest_fields.split_once(' ').ok_or_else(malformed)?;
+                    if i == 1 {
+                        sub = field;
+                    }
+                    rest_fields = tail;
+                }
+                let path = rest_fields;
+                if path.is_empty() {
+                    return Err(malformed());
+                }
+                // `S<c><m><u>`: `c` = commit pointer moved (an ordinary,
+                // committable tracked change), `m`/`u` = the submodule's own
+                // worktree is dirty inside — content the parent diff can
+                // never show.
+                let submodule_dirty_inside =
+                    sub.starts_with('S') && (sub.contains('M') || sub.contains('U'));
+                if submodule_dirty_inside {
+                    status.submodules_dirty.push(path.to_string());
+                } else {
+                    status.tracked_changes.push(path.to_string());
+                }
+                if kind == "2" {
+                    // Consume the rename's original path token.
+                    tokens.next().ok_or_else(malformed)?;
+                }
+            }
+            "u" => {
+                // Unmerged: 8 fixed fields then path.
+                let mut rest_fields = rest;
+                for _ in 0..9 {
+                    let (_, tail) = rest_fields.split_once(' ').ok_or_else(malformed)?;
+                    rest_fields = tail;
+                }
+                status.tracked_changes.push(rest_fields.to_string());
+            }
+            "?" => status.untracked.push(rest.to_string()),
+            "!" => {}
+            _ => return Err(malformed()),
+        }
+    }
+    Ok(status)
 }
 
 /// Current branch name (for `--title` default). `git rev-parse --abbrev-ref HEAD`;
@@ -560,7 +760,7 @@ pub const MAX_TOTAL_BYTES: usize = 50 * 1024 * 1024;
 #[derive(Debug)]
 pub struct DiffOutput {
     pub files: Vec<FileDiff>,
-    pub warnings: Vec<String>,
+    pub warnings: Vec<Warning>,
     /// Full oid the user-supplied base ref resolved to.
     pub base_oid: String,
     /// Full oid `HEAD` resolved to when the diff was computed.
@@ -1058,6 +1258,92 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(8000)].contains(&0)
 }
 
+/// True if `text` is a Git LFS pointer blob: the reviewer would be looking
+/// at a pointer, not the real data, and must be told so.
+fn is_lfs_pointer_text(text: &str) -> bool {
+    text.starts_with("version https://git-lfs.github.com/spec/v1")
+}
+
+/// Lowercase wire name of a file type, matching its serde serialization.
+fn file_type_name(t: FileType) -> &'static str {
+    match t {
+        FileType::Regular => "regular",
+        FileType::Executable => "executable",
+        FileType::Symlink => "symlink",
+        FileType::Gitlink => "gitlink",
+    }
+}
+
+/// Emits per-file warnings for changes the diff body alone under-communicates:
+/// mode changes (e.g. the executable bit appearing), file type changes
+/// (regular ↔ symlink and the like), gitlink (submodule pointer) changes
+/// whose nested diff is not shown, and LFS pointers standing in for real
+/// data. These pair with `FileDiff::requires_ack`, which forces an explicit
+/// acknowledgement for the same categories.
+fn push_shape_warnings(
+    warnings: &mut Vec<Warning>,
+    entry: &RawEntry,
+    old_type: Option<FileType>,
+    new_type: Option<FileType>,
+    lfs_pointer: bool,
+) {
+    let path = display_path(entry);
+    let (old_mode, new_mode) = (&entry.old_mode, &entry.new_mode);
+    let oid_changed = entry.old_oid != entry.new_oid;
+    if old_type == Some(FileType::Gitlink) || new_type == Some(FileType::Gitlink) {
+        // A same-oid pure rename of a submodule path moves no pointer, so
+        // there is nothing hidden to warn about.
+        if oid_changed {
+            warnings.push(
+                Warning::new(
+                    "GITLINK_CHANGED",
+                    Severity::Warning,
+                    format!(
+                        "submodule pointer changed: {path} (only the commit pointer is shown; the submodule's own diff is NOT displayed here)"
+                    ),
+                )
+                .with_path(path),
+            );
+        }
+    } else if let (Some(o), Some(n)) = (old_type, new_type) {
+        if o != n {
+            warnings.push(
+                Warning::new(
+                    "FILE_TYPE_CHANGED",
+                    Severity::Warning,
+                    format!(
+                        "file type changed: {path} ({} -> {})",
+                        file_type_name(o),
+                        file_type_name(n)
+                    ),
+                )
+                .with_path(path),
+            );
+        } else if old_mode != new_mode {
+            warnings.push(
+                Warning::new(
+                    "MODE_CHANGED",
+                    Severity::Warning,
+                    format!("file mode changed: {path} ({old_mode} -> {new_mode})"),
+                )
+                .with_path(path),
+            );
+        }
+    }
+    if lfs_pointer {
+        warnings.push(
+            Warning::new(
+                "LFS_POINTER",
+                Severity::Warning,
+                format!(
+                    "Git LFS pointer: {path} (the pointer file is shown, NOT the real content)"
+                ),
+            )
+            .with_path(path),
+        );
+    }
+}
+
 /// Text representation of one side (old or new) of a raw entry, used as
 /// input to [`text_hunks`]. Never `cat-file`s a gitlink oid (it usually
 /// doesn't exist locally as a blob) — a gitlink side becomes the same
@@ -1114,11 +1400,17 @@ fn text_hunks(old: &str, new: &str) -> Vec<Hunk> {
                     ),
                 };
                 let value = change.value();
-                let content = value.strip_suffix('\n').unwrap_or(value);
-                let content = content.strip_suffix('\r').unwrap_or(content);
+                let (content, eol) = match value.strip_suffix('\n') {
+                    Some(rest) => match rest.strip_suffix('\r') {
+                        Some(rest) => (rest, Eol::Crlf),
+                        None => (rest, Eol::Lf),
+                    },
+                    None => (value, Eol::None),
+                };
                 lines.push(DiffLine {
                     kind,
                     content: content.to_string(),
+                    eol,
                     old_no,
                     new_no,
                 });
@@ -1268,18 +1560,29 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             max_blob = max_blob.max(size);
         }
         if max_blob > MAX_FILE_BYTES {
-            warnings.push(format!(
-                "file too large to display inline: {} ({max_blob} bytes)",
-                display_path(entry)
-            ));
+            warnings.push(
+                Warning::new(
+                    "FILE_TOO_LARGE",
+                    Severity::Warning,
+                    format!(
+                        "file too large to display inline: {} ({max_blob} bytes)",
+                        display_path(entry)
+                    ),
+                )
+                .with_path(display_path(entry)),
+            );
             plans.push(Plan::TooLarge);
             continue;
         }
         if total_bytes + file_bytes > MAX_TOTAL_BYTES {
-            warnings.push(format!(
-                "diff too large: {} not displayed",
-                display_path(entry)
-            ));
+            warnings.push(
+                Warning::new(
+                    "DIFF_TOO_LARGE",
+                    Severity::Warning,
+                    format!("diff too large: {} not displayed", display_path(entry)),
+                )
+                .with_path(display_path(entry)),
+            );
             plans.push(Plan::TooLarge);
             continue;
         }
@@ -1300,6 +1603,7 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
     let mut files = Vec::with_capacity(entries.len());
     for (entry, plan) in entries.iter().zip(&plans) {
         let (old_path, new_path) = entry_paths(entry);
+        let mut lfs_pointer = false;
         let (content_kind, hunks) = match plan {
             Plan::NoContent => (ContentKind::Text, Vec::new()),
             Plan::TooLarge => (ContentKind::TooLarge, Vec::new()),
@@ -1311,21 +1615,33 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
                 } else {
                     match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
                         (Ok(old_text), Ok(new_text)) => {
+                            lfs_pointer =
+                                is_lfs_pointer_text(old_text) || is_lfs_pointer_text(new_text);
                             (ContentKind::Text, text_hunks(old_text, new_text))
                         }
                         _ => {
                             // Different byte contents can lossy-decode to the
                             // same string; never diff lossily.
-                            warnings.push(format!(
-                                "file content is not valid UTF-8, not rendered: {}",
-                                display_path(entry)
-                            ));
+                            warnings.push(
+                                Warning::new(
+                                    "NON_UTF8_CONTENT",
+                                    Severity::Warning,
+                                    format!(
+                                        "file content is not valid UTF-8, not rendered: {}",
+                                        display_path(entry)
+                                    ),
+                                )
+                                .with_path(display_path(entry)),
+                            );
                             (ContentKind::NonUtf8, Vec::new())
                         }
                     }
                 }
             }
         };
+        let old_type = file_type_of_mode(&entry.old_mode);
+        let new_type = file_type_of_mode(&entry.new_mode);
+        push_shape_warnings(&mut warnings, entry, old_type, new_type, lfs_pointer);
         files.push(FileDiff {
             old_path,
             new_path,
@@ -1333,10 +1649,13 @@ pub fn compute_diff(root: &std::path::Path, base: &str) -> Result<DiffOutput, Gi
             content_kind,
             old_mode: mode_opt(&entry.old_mode),
             new_mode: mode_opt(&entry.new_mode),
+            old_type,
+            new_type,
             old_oid: oid_opt(&entry.old_oid),
             new_oid: oid_opt(&entry.new_oid),
             old_size: blob_size(&sizes, &entry.old_mode, &entry.old_oid),
             new_size: blob_size(&sizes, &entry.new_mode, &entry.new_oid),
+            lfs_pointer,
             hunks,
         });
     }
@@ -1864,10 +2183,11 @@ mod git_tests {
         assert!(out.files[0].hunks.is_empty());
         assert_eq!(out.warnings.len(), 1);
         assert!(
-            out.warnings[0].contains("data.txt"),
+            out.warnings[0].message.contains("data.txt"),
             "warning should name the file: {}",
-            out.warnings[0]
+            out.warnings[0].message
         );
+        assert_eq!(out.warnings[0].code, "NON_UTF8_CONTENT");
     }
 
     #[test]
@@ -1886,10 +2206,13 @@ mod git_tests {
         assert!(big_file.hunks.is_empty());
         assert_eq!(out.warnings.len(), 1);
         assert!(
-            out.warnings[0].contains("file too large to display inline: big.txt"),
-            "unexpected warning: {}",
             out.warnings[0]
+                .message
+                .contains("file too large to display inline: big.txt"),
+            "unexpected warning: {}",
+            out.warnings[0].message
         );
+        assert_eq!(out.warnings[0].code, "FILE_TOO_LARGE");
         // Other files in the same diff are unaffected.
         let a = find(&out.files, "a.txt");
         assert!(hunk_contents(a).contains(&"TWO"));
@@ -1960,5 +2283,150 @@ mod git_tests {
         assert!(f.new_oid.is_some());
         assert_eq!(f.new_size, Some(7));
         assert_eq!(f.new_mode.as_deref(), Some("100644"));
+    }
+
+    #[test]
+    fn executable_bit_flip_reports_mode_change_and_requires_ack() {
+        let td = base_repo();
+        let d = td.path();
+        git(d, &["update-index", "--chmod=+x", "a.txt"]);
+        git(d, &["commit", "-m", "make executable"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "a.txt");
+        assert_eq!(f.old_type, Some(FileType::Regular));
+        assert_eq!(f.new_type, Some(FileType::Executable));
+        assert!(
+            f.requires_ack(),
+            "a mode change must require explicit acknowledgement"
+        );
+        // The executable bit is part of the file *type* taxonomy here, so
+        // the flip surfaces as FILE_TYPE_CHANGED (regular -> executable).
+        assert!(
+            out.warnings.iter().any(|w| w.code == "FILE_TYPE_CHANGED"
+                && w.path.as_deref() == Some("a.txt")
+                && w.message.contains("regular -> executable")),
+            "missing FILE_TYPE_CHANGED warning: {:?}",
+            out.warnings
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_to_symlink_reports_type_change() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::remove_file(d.join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("target.txt", d.join("a.txt")).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "symlinkify"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "a.txt");
+        assert_eq!(f.old_type, Some(FileType::Regular));
+        assert_eq!(f.new_type, Some(FileType::Symlink));
+        assert!(f.requires_ack());
+        assert!(
+            out.warnings.iter().any(|w| w.code == "FILE_TYPE_CHANGED"),
+            "missing FILE_TYPE_CHANGED warning: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn crlf_and_missing_final_newline_are_visible_in_eol() {
+        let td = base_repo();
+        let d = td.path();
+        // LF -> CRLF on line 1; the last line loses its final newline. The
+        // display content strips line endings, so without `eol` these
+        // would render as identical-looking strings.
+        std::fs::write(d.join("eol.txt"), "alpha\nlast\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base eol"]);
+        std::fs::write(d.join("eol.txt"), "alpha\r\nlast").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change eol"]);
+
+        // Both commits are on `feature`, so diff the last commit itself.
+        let out = compute_diff(d, "HEAD~1").unwrap();
+        let f = find(&out.files, "eol.txt");
+        let lines: Vec<&DiffLine> = f.hunks.iter().flat_map(|h| &h.lines).collect();
+        let eol_of = |kind: LineKind, content: &str| {
+            lines
+                .iter()
+                .find(|l| {
+                    matches!(
+                        (&l.kind, kind),
+                        (LineKind::Add, LineKind::Add)
+                            | (LineKind::Remove, LineKind::Remove)
+                            | (LineKind::Context, LineKind::Context)
+                    ) && l.content == content
+                })
+                .unwrap_or_else(|| panic!("no {kind:?} line with content {content:?}: {lines:?}"))
+                .eol
+        };
+        assert_eq!(eol_of(LineKind::Remove, "alpha"), Eol::Lf);
+        assert_eq!(eol_of(LineKind::Add, "alpha"), Eol::Crlf);
+        assert_eq!(eol_of(LineKind::Remove, "last"), Eol::Lf);
+        assert_eq!(eol_of(LineKind::Add, "last"), Eol::None);
+    }
+
+    #[test]
+    fn lfs_pointer_is_flagged() {
+        let td = base_repo();
+        let d = td.path();
+        let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsize 12345\n";
+        std::fs::write(d.join("model.bin"), pointer).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "lfs pointer"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "model.bin");
+        assert!(f.lfs_pointer, "pointer blob must be flagged as LFS");
+        assert!(
+            out.warnings.iter().any(|w| w.code == "LFS_POINTER"),
+            "missing LFS_POINTER warning: {:?}",
+            out.warnings
+        );
+    }
+
+    #[test]
+    fn worktree_status_reports_tracked_untracked_and_clean() {
+        let td = fixture_repo();
+        let d = td.path();
+        assert!(worktree_status(d).unwrap().is_clean());
+
+        std::fs::write(d.join("a.txt"), "modified\n").unwrap();
+        std::fs::write(d.join("brand-new.rs"), "fn main() {}\n").unwrap();
+        let status = worktree_status(d).unwrap();
+        assert_eq!(status.tracked_changes, vec!["a.txt".to_string()]);
+        assert_eq!(status.untracked, vec!["brand-new.rs".to_string()]);
+        assert!(status.submodules_dirty.is_empty());
+    }
+
+    #[test]
+    fn parse_status_v2_z_handles_rename_and_rejects_garbage() {
+        // A rename entry's original path is a separate NUL token and must be
+        // consumed with its entry, not misread as another record.
+        let bytes = b"2 R. N... 100644 100644 100644 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 R100 new.txt\0old.txt\0? loose.txt\0".to_vec();
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert_eq!(status.tracked_changes, vec!["new.txt".to_string()]);
+        assert_eq!(status.untracked, vec!["loose.txt".to_string()]);
+
+        // A submodule with inner modifications is its own category.
+        let bytes = b"1 .M S.M. 160000 160000 160000 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 sub\0".to_vec();
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert_eq!(status.submodules_dirty, vec!["sub".to_string()]);
+
+        // A submodule whose only change is the commit pointer is an
+        // ordinary (committable) tracked change.
+        let bytes = b"1 .M SC.. 160000 160000 160000 1111111111111111111111111111111111111111 1111111111111111111111111111111111111111 sub\0".to_vec();
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert_eq!(status.tracked_changes, vec!["sub".to_string()]);
+        assert!(status.submodules_dirty.is_empty());
+
+        // Fail closed on an entry shape this parser doesn't understand.
+        assert!(parse_status_v2_z(b"x whatever\0").is_err());
+        assert!(parse_status_v2_z(b"1 .M\0").is_err());
     }
 }

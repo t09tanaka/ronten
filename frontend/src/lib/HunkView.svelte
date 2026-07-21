@@ -2,6 +2,7 @@
   import { rs } from './state.svelte'
   import CommentEditor from './CommentEditor.svelte'
   import { newTarget, oldTarget, type CommentLineInfo } from './anchors'
+  import { NO_NEWLINE_MARKER, showCrlfBadge, showNoNewlineMarker } from './eol'
   import { highlightLine, langForPath } from './highlight'
   import { revealInvisibles } from './invisibles'
   import type { Comment, ConcernView, DiffLine, FileDiff, Hunk, HunkRef } from './types'
@@ -135,8 +136,24 @@
                    so agent-supplied diff content cannot inject HTML here.
                    revealInvisibles runs first, on the plain content, so its
                    ⟨U+XXXX⟩ markers also flow through that escaping. -->
-              <td class="content">{@html highlightLine(revealInvisibles(line.content), lang)}</td>
+              <td class="content"
+                >{@html highlightLine(revealInvisibles(line.content), lang)}{#if showCrlfBadge(line)}<span
+                    class="eol-badge"
+                    title="Line ends with CRLF (␍␊)">CRLF</span
+                  >{/if}</td
+              >
             </tr>
+            {#if showNoNewlineMarker(line)}
+              <!-- Unified-diff convention: flag the absence of a trailing
+                   newline right after the affected line, so an add/remove
+                   pair differing only in the final newline reads as a real
+                   change. Empty sticky gutters keep column alignment. -->
+              <tr class="no-eol-row">
+                <td class="gutter old-gutter"></td>
+                <td class="gutter new-gutter"></td>
+                <td class="content no-eol-marker">{NO_NEWLINE_MARKER}</td>
+              </tr>
+            {/if}
             {#each [...commentsFor(oldT), ...commentsFor(newT)] as comment (comment)}
               <tr class="comment-row">
                 <td colspan="3">
@@ -327,6 +344,22 @@
        codepoints are also revealed as ⟨U+XXXX⟩ tokens by revealInvisibles). */
     unicode-bidi: isolate;
     direction: ltr;
+  }
+
+  /* Faint marker, not a highlight: it must be findable when hunting an
+     EOL-only change without shouting on every line of a CRLF file. */
+  .eol-badge {
+    margin-left: 8px;
+    padding: 0 4px;
+    border-radius: 2px;
+    background: var(--c-neutral-tint);
+    color: var(--c-ink-3);
+    font-size: 9.5px;
+    user-select: none;
+  }
+
+  .no-eol-marker {
+    color: var(--c-ink-3);
   }
 
   .line-add {
