@@ -680,6 +680,13 @@ struct CappedRead {
     /// `true` if more than `cap` bytes arrived — reading stopped at `cap`
     /// rather than continuing, so `data.len() == cap` in that case.
     overflowed: bool,
+    /// `Some` if the read loop stopped because of a genuine I/O error
+    /// (anything other than a clean `Ok(0)` EOF or a retried
+    /// `ErrorKind::Interrupted`). `data` in that case is a SHORT read, not
+    /// a complete one, and [`wait_with_timeout`] must not treat it as a
+    /// successful, complete `Output` — see the doc comment on
+    /// [`read_stdout_capped`].
+    read_error: Option<std::io::Error>,
 }
 
 const READ_CHUNK_BYTES: usize = 64 * 1024;
@@ -689,10 +696,20 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// buffering more than `cap + READ_CHUNK_BYTES` bytes, and stops the moment
 /// the cap is exceeded instead of draining the rest of a hostile/runaway
 /// stream.
+///
+/// `ErrorKind::Interrupted` (`EINTR`) is retried in place, matching what
+/// `read_to_end` used to do before this loop replaced it. Any OTHER read
+/// error is reported via `read_error` rather than silently treated as EOF:
+/// a short buffer from a genuine error is not a complete, trustworthy
+/// response, and returning it as one would silently truncate the diff
+/// (contradicting this module's "nothing is silently truncated"
+/// guarantee) — see [`wait_with_timeout`], which fails the whole call
+/// instead of returning a truncated success when `read_error` is set.
 fn read_stdout_capped(pipe: Option<std::process::ChildStdout>, cap: usize) -> CappedRead {
     use std::io::Read;
     let mut data = Vec::new();
     let mut overflowed = false;
+    let mut read_error = None;
     if let Some(mut pipe) = pipe {
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
@@ -708,23 +725,44 @@ fn read_stdout_capped(pipe: Option<std::process::ChildStdout>, cap: usize) -> Ca
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
             }
         }
     }
-    CappedRead { data, overflowed }
+    CappedRead {
+        data,
+        overflowed,
+        read_error,
+    }
+}
+
+/// Result of the bounded stderr reader thread in [`wait_with_timeout`]. See
+/// [`CappedRead::read_error`] — the same "a genuine read error is not EOF"
+/// rule applies here.
+struct CappedStderr {
+    data: Vec<u8>,
+    read_error: Option<std::io::Error>,
 }
 
 /// Reads `pipe` to EOF into a ring buffer capped at `cap` bytes, keeping the
 /// *tail* (most recent bytes) rather than the head — git error messages are
 /// almost always at the end of stderr, so on overflow that's what's worth
-/// keeping. Unlike [`read_stdout_capped`] this never stops early: stderr
-/// has no success-path consumer waiting on it, so draining it fully (memory
-/// bounded, unlike the old unbounded `Vec`) is simplest and lets the pipe's
-/// write end close normally.
-fn read_stderr_tail(pipe: Option<std::process::ChildStderr>, cap: usize) -> Vec<u8> {
+/// keeping. Unlike [`read_stdout_capped`] this never stops early on a full
+/// buffer: stderr has no success-path consumer waiting on it, so draining
+/// it fully (memory bounded, unlike the old unbounded `Vec`) is simplest
+/// and lets the pipe's write end close normally.
+///
+/// As in [`read_stdout_capped`], `ErrorKind::Interrupted` is retried and
+/// any other read error is reported via `read_error` instead of being
+/// treated as a clean EOF.
+fn read_stderr_tail(pipe: Option<std::process::ChildStderr>, cap: usize) -> CappedStderr {
     use std::io::Read;
     let mut ring: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(cap);
+    let mut read_error = None;
     if let Some(mut pipe) = pipe {
         let mut chunk = [0u8; READ_CHUNK_BYTES];
         loop {
@@ -738,11 +776,18 @@ fn read_stderr_tail(pipe: Option<std::process::ChildStderr>, cap: usize) -> Vec<
                         ring.push_back(b);
                     }
                 }
-                Err(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
             }
         }
     }
-    ring.into_iter().collect()
+    CappedStderr {
+        data: ring.into_iter().collect(),
+        read_error,
+    }
 }
 
 /// Kills `child`'s whole process group with `SIGKILL` on unix (relies on
@@ -828,7 +873,12 @@ fn reap_child(
 /// only the direct `child` is tracked), the direct child is reaped under a
 /// bounded secondary grace period, and a descriptive error is returned —
 /// never partial success, so callers can't mistake a killed run for a
-/// complete one.
+/// complete one. That includes a genuine pipe read error (anything but a
+/// retried `ErrorKind::Interrupted`): [`read_stdout_capped`] and
+/// [`read_stderr_tail`] report those via `read_error` rather than treating
+/// them as EOF, and this loop breaks out on that exactly like it does on
+/// overflow, so a `read_error` can never be mistaken for a complete,
+/// successful `Output`.
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
@@ -849,8 +899,9 @@ fn wait_with_timeout(
     let deadline = std::time::Instant::now() + timeout;
     let mut status: Option<std::process::ExitStatus> = None;
     let mut stdout_read: Option<CappedRead> = None;
-    let mut stderr_read: Option<Vec<u8>> = None;
+    let mut stderr_read: Option<CappedStderr> = None;
     let mut overflowed = false;
+    let mut read_failed = false;
     loop {
         if status.is_none() {
             status = child.try_wait()?;
@@ -858,15 +909,17 @@ fn wait_with_timeout(
         if stdout_read.is_none() {
             if let Ok(r) = stdout_rx.try_recv() {
                 overflowed = r.overflowed;
+                read_failed |= r.read_error.is_some();
                 stdout_read = Some(r);
             }
         }
         if stderr_read.is_none() {
             if let Ok(r) = stderr_rx.try_recv() {
+                read_failed |= r.read_error.is_some();
                 stderr_read = Some(r);
             }
         }
-        if overflowed {
+        if overflowed || read_failed {
             break;
         }
         match (status, stdout_read.take(), stderr_read.take()) {
@@ -874,7 +927,7 @@ fn wait_with_timeout(
                 return Ok(std::process::Output {
                     status,
                     stdout: stdout_read.data,
-                    stderr: stderr_read,
+                    stderr: stderr_read.data,
                 });
             }
             // Not all three are ready yet: put back whichever ones `take`
@@ -906,6 +959,20 @@ fn wait_with_timeout(
             std::io::ErrorKind::FileTooLarge,
             format!("git subprocess stdout exceeded {max_stdout_bytes} bytes and was killed"),
         ));
+    }
+    if read_failed {
+        // A short buffer from a genuine read error must never be reported
+        // as a complete, successful `Output` — see the doc comment above
+        // and on `CappedRead::read_error`. Prefer the stdout error detail
+        // when both pipes failed; either is enough to explain the failure.
+        let detail = stdout_read
+            .and_then(|r| r.read_error)
+            .or_else(|| stderr_read.and_then(|r| r.read_error))
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown read error".to_string());
+        return Err(std::io::Error::other(format!(
+            "git subprocess pipe read failed before EOF, output cannot be trusted: {detail}"
+        )));
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
@@ -1754,12 +1821,60 @@ fn entry_change_kind(entry: &RawEntry) -> ChangeKind {
     }
 }
 
+/// Joins `writer` (the stdin-writing helper thread started by
+/// [`cat_file_stdin`]) without ever blocking past `grace` from the moment
+/// this is called. A plain, unconditional `.join()` here would reintroduce
+/// exactly the bug `wait_with_timeout`'s process-group kill was written to
+/// avoid, from the write side instead of the read side: a tampered `git`
+/// can exit 0 (so `wait_with_timeout` legitimately returns `Ok` — the
+/// direct child exited, stdout/stderr both EOF'd) while a descendant it
+/// spawned keeps the stdin *read* end open without ever reading it. On
+/// that success path nothing kills the process group, so `write_all` on a
+/// full pipe blocks forever and a `--batch` request for a large diff
+/// (tens to hundreds of KB of oids, past the OS pipe buffer) reaches that
+/// exact deadlock.
+///
+/// Instead this polls [`std::thread::JoinHandle::is_finished`] on a short
+/// interval — mirroring the non-blocking `try_wait`/`try_recv` poll loop in
+/// [`wait_with_timeout`] — and if the writer still hasn't finished by
+/// `grace`, drops the handle (detaching the thread, the same policy
+/// `wait_with_timeout` already applies to its own reader threads on its
+/// timeout path: they are never joined, only left to finish or die on
+/// their own once whatever was blocking them goes away) and reports a
+/// failure instead of blocking further. On the normal fast path — the
+/// writer already finished by the time `wait_with_timeout` returns, which
+/// is the overwhelmingly common case since a cat-file request is at most a
+/// few hundred KB — `is_finished()` is true on the very first check, so
+/// this returns immediately, same as the old unconditional join.
+fn join_writer_bounded(
+    writer: std::thread::JoinHandle<std::io::Result<()>>,
+    grace: std::time::Duration,
+) -> Result<std::io::Result<()>, GitError> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if writer.is_finished() {
+            return writer.join().map_err(|_| {
+                GitError::GitFailed("cat-file stdin writer thread panicked".to_string())
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            drop(writer);
+            return Err(GitError::GitFailed(
+                "git cat-file stdin writer did not drain within deadline".to_string(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Runs `git cat-file <flag>` feeding `input` (one oid per line) on stdin
 /// and returning raw stdout, capped at `max_stdout_bytes`. Stdin is written
 /// from a helper thread so a large response can't deadlock against a full
 /// stdin pipe. A write failure (e.g. git exiting early) means the response
 /// git did produce is for a truncated request, not a complete one, so it
-/// must not be trusted.
+/// must not be trusted. The writer thread is joined via
+/// [`join_writer_bounded`], not a raw blocking `.join()` — see its doc
+/// comment for why an unbounded join here is itself a hang bug.
 fn cat_file_stdin(
     root: &std::path::Path,
     flag: &str,
@@ -1778,9 +1893,7 @@ fn cat_file_stdin(
     let writer =
         std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(input.as_bytes()) });
     let output = wait_with_timeout(child, GIT_TIMEOUT, max_stdout_bytes).map_err(map_wait_err)?;
-    let write_result = writer
-        .join()
-        .map_err(|_| GitError::GitFailed("cat-file stdin writer thread panicked".to_string()))?;
+    let write_result = join_writer_bounded(writer, KILL_GRACE)?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -3150,7 +3263,13 @@ mod git_tests {
                 // The early-exit parse bails at the (max_files + 1)th
                 // record without ever discovering the true total, so the
                 // message reports the limit rather than an exact count.
-                assert!(msg.contains('1'), "unexpected message: {msg}");
+                // Assert the exact boundary substring rather than a bare
+                // '1' (which would also match stray digits anywhere in
+                // the message and not actually verify the limit).
+                assert!(
+                    msg.contains("more than 1 files"),
+                    "unexpected message: {msg}"
+                );
             }
             other => panic!("expected BudgetExceeded, got {other:?}"),
         }
@@ -3268,6 +3387,92 @@ mod git_tests {
             elapsed < std::time::Duration::from_secs(3),
             "must return by ~deadline instead of wedging on the descendant: {elapsed:?}"
         );
+    }
+
+    /// The write-side twin of `descendant_holding_pipe_does_not_wedge_past_deadline`
+    /// above, and the regression test for the `cat_file_stdin` writer-join
+    /// bug: a direct child that backgrounds a descendant holding the stdin
+    /// *read* end open (without reading it) and then exits 0 makes
+    /// `wait_with_timeout` legitimately return `Ok` — the direct child
+    /// exited, stdout/stderr both EOF'd — well before any deadline. The old
+    /// `cat_file_stdin` then unconditionally `.join()`ed the stdin-writer
+    /// thread; with nothing left to drain a >pipe-buffer write, that join
+    /// never returned. A `--batch` request for a large diff is easily past
+    /// the ~64 KiB pipe buffer (see the doc comment on
+    /// `join_writer_bounded`), so this is reachable, not theoretical.
+    ///
+    /// This exercises `join_writer_bounded` directly with `sh` standing in
+    /// for a tampered `git`, the same substitution the existing
+    /// `wait_with_timeout` regression tests above use — shadowing the real
+    /// `git` on `PATH` would be a process-wide mutation racing every other
+    /// test in this module that shells out to a real `git` concurrently
+    /// (see the comment on `rev_parse_honors_short_deadline` below). Unlike
+    /// `descendant_holding_pipe_does_not_wedge_past_deadline`, the
+    /// backgrounded `sleep` here redirects its own stdout/stderr to
+    /// `/dev/null` (keeping only the *stdin* read end via `<&0`), so
+    /// `wait_with_timeout` returns `Ok` within milliseconds instead of
+    /// waiting out the descendant too — isolating the writer-only wedge
+    /// this test is about from the already-covered reader wedge.
+    ///
+    /// The whole check runs on a background thread with a generous
+    /// `recv_timeout` on the main thread: if `join_writer_bounded`
+    /// regresses back to an unbounded block, this test fails promptly
+    /// instead of hanging the entire suite.
+    #[cfg(unix)]
+    #[test]
+    fn cat_file_stdin_writer_does_not_block_forever_on_stuck_reader() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.arg("-c")
+                    .arg("sleep 5 <&0 >/dev/null 2>&1 & exit 0")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                let mut child = spawn_grouped(&mut cmd).unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                // Comfortably larger than any real pipe buffer (typically
+                // 16-64 KiB) so `write_all` is guaranteed to block once the
+                // descendant stops draining it.
+                let payload = vec![b'x'; 8 * 1024 * 1024];
+                let writer = std::thread::spawn(move || -> std::io::Result<()> {
+                    use std::io::Write;
+                    stdin.write_all(&payload)
+                });
+
+                let output =
+                    wait_with_timeout(child, GIT_TIMEOUT, DEFAULT_MAX_STDOUT_BYTES).unwrap();
+                assert!(
+                    output.status.success(),
+                    "the direct `sh` child must exit 0 for this to be the Ok-path regression \
+                     `join_writer_bounded` guards against"
+                );
+
+                let start = std::time::Instant::now();
+                let result = join_writer_bounded(writer, KILL_GRACE);
+                let elapsed = start.elapsed();
+                assert!(
+                    result.is_err(),
+                    "a writer stuck on a full pipe (nothing draining it) must not be \
+                     mistaken for a completed write: {result:?}"
+                );
+                assert!(
+                    elapsed < KILL_GRACE + std::time::Duration::from_secs(3),
+                    "join_writer_bounded must return by ~KILL_GRACE instead of blocking \
+                     forever on the stuck writer: {elapsed:?}"
+                );
+            });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!(
+                "join_writer_bounded did not return within 30s: it has regressed to an \
+                 unbounded block"
+            ),
+        }
     }
 
     /// A hostile or misbehaving git that streams unbounded stdout must be
