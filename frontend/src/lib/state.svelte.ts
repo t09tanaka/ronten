@@ -377,19 +377,12 @@ export class ReviewState {
     // (`DataCloneError`) — it only appeared to work under vitest because
     // Vite's SSR module pipeline compiles `$state` fields to plain objects,
     // not proxies, there.
-    // `$state.snapshot` alone is not enough either: on the CLIENT compile it
-    // does a real deep clone (unwrapping the proxy), but the SERVER/SSR
-    // compile — the one vitest runs — optimizes `$state.snapshot(x)` away to
-    // the bare identity `x` (verified via `svelte/compiler`'s `compileModule`
-    // output), since server-side `$state` fields are already plain and the
-    // compiler assumes nothing needs unwrapping. Used alone under test, the
-    // "snapshot" would just be the same live object, silently reintroducing
-    // this exact bug in a way tests can't see.
-    // Composing both closes both gaps: `$state.snapshot` first strips any
-    // client-side proxy down to a plain object (a no-op under SSR), and the
-    // outer `structuredClone` then deep-clones that plain object for real —
-    // on the client it's a cheap redundant clone of already-plain data; on
-    // SSR/vitest it's what actually performs the clone.
+    // `$state.snapshot` unwraps any client-side proxy to a plain object
+    // (that is its documented purpose); the outer `structuredClone` then
+    // guarantees a real deep copy independent of any target- or
+    // version-specific snapshot behavior. Snapshotting once before the first
+    // attempt and reusing the identical bytes for the retry is what keeps the
+    // same mutation id mapped to the same payload.
     const draftSnapshot = structuredClone($state.snapshot(this.draft))
     const revisionSnapshot = this.#revision
     try {
