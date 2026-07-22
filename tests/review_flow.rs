@@ -50,6 +50,68 @@ fn fixture_repo() -> tempfile::TempDir {
     td
 }
 
+/// Resolves the real `git` binary's absolute path via `command -v git`,
+/// using the test process's own (unmodified) `PATH`. Needed by
+/// [`fake_git_shim`] so its shim script can still pass non-intercepted
+/// invocations through to the genuine binary after `PATH` has been
+/// overridden (for the spawned `ronten` process only) to prefer the fake
+/// `git` ahead of the real one.
+#[cfg(unix)]
+fn real_git_path() -> String {
+    let out = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let path = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    assert!(!path.is_empty(), "could not resolve real git on PATH");
+    path
+}
+
+/// Writes an executable POSIX shell shim named `git` into a fresh tempdir.
+/// Any invocation whose argument list contains `match_substr` as a substring
+/// is intercepted: the shim prints the `FAKE_STDERR` env var to its own
+/// stderr and exits 128 without running real git at all. Every other
+/// invocation is passed straight through to the real `git` binary named by
+/// the `REAL_GIT` env var (see [`real_git_path`]).
+///
+/// This exists to simulate git-internal failures — permission errors,
+/// `safe.directory` rejections, a corrupt repository — that P1-13 requires
+/// be classified as `GitFailed` rather than `NotARepo`/`BadBase`, without
+/// constructing an actually-corrupt or permission-denied repository (fragile
+/// and platform-dependent). Every git call the test under test doesn't care
+/// about behaves exactly like real git, so only the one intercepted call
+/// deviates from a normal review run.
+#[cfg(unix)]
+fn fake_git_shim(match_substr: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in\n  *'{match_substr}'*)\n    printf '%s\\n' \"$FAKE_STDERR\" >&2\n    exit 128\n    ;;\nesac\nexec \"$REAL_GIT\" \"$@\"\n"
+    );
+    let path = dir.path().join("git");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    dir
+}
+
+/// Like [`expect_exit`], but lets the caller set extra environment variables
+/// on the spawned `ronten` process (used to prepend a fake-git shim
+/// directory onto `PATH` and to pass it its `REAL_GIT`/`FAKE_STDERR`
+/// parameters).
+#[cfg(unix)]
+fn expect_exit_with_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> i32 {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ronten"));
+    cmd.current_dir(dir).args(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    assert!(out.stdout.is_empty(), "stdout must be empty on error paths");
+    out.status.code().unwrap()
+}
+
 /// Reads the child's stderr line by line until the `Review session: <url>`
 /// banner and returns the URL. Panics if the process exits first. Delegates
 /// to [`read_review_url_with_prebanner`] and discards the pre-banner text;
@@ -479,6 +541,41 @@ fn result_v3_worktree_rechecked_at_submit() {
     // The dirty file is untouched between start and submit, so the re-check
     // agrees with the start-time result.
     assert_eq!(worktree["clean_at_submit"], false);
+}
+
+/// Task 5.4 (P1-9 middle / P1-12 identity): `build.rs` embeds enough about
+/// the specific binary that produced a result (source commit, dirty flag,
+/// frontend digest, rustc version, target triple, build profile) that two
+/// builds both claiming `ronten_version` 0.1.0 stay distinguishable.
+/// `target`/`profile` come from the `TARGET`/`PROFILE` build-script env vars,
+/// which cargo always sets, so they must be populated for *any* build of
+/// this test binary. `source_commit` needs a git checkout, which this repo
+/// (the tree the test binary is built from) always is.
+#[test]
+fn result_v3_build_identity_is_populated() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &[]);
+
+    let (status, _) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let build = &result["build"];
+    assert_eq!(build["ronten_version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        build["target"].is_string(),
+        "target must always be set from the TARGET build-script env: {build}"
+    );
+    assert!(
+        build["profile"].is_string(),
+        "profile must always be set from the PROFILE build-script env: {build}"
+    );
+    assert!(
+        build["source_commit"].is_string(),
+        "this repo is a git checkout, so source_commit must be populated: {build}"
+    );
 }
 
 /// Posts `draft` to `/submit` and returns `(status, body)` without treating
@@ -1474,6 +1571,89 @@ fn not_a_repo_exits_12() {
         ],
     );
     assert_eq!(code, 12);
+}
+
+/// P1-13: a `git rev-parse --show-toplevel` failure whose stderr is a
+/// `safe.directory`-style rejection (not "not a git repository") must not be
+/// misreported as "not a repo" (exit 12) — it's a git-internal problem, and
+/// exits with `GIT_FAILED` instead.
+#[cfg(unix)]
+#[test]
+fn safe_directory_or_permission_error_is_git_failed_not_12() {
+    let td = tempfile::tempdir().unwrap();
+    std::fs::write(td.path().join("concerns.json"), CONCERNS).unwrap();
+    let shim_dir = fake_git_shim("--show-toplevel");
+    let real_git = real_git_path();
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let code = expect_exit_with_env(
+        td.path(),
+        &[
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ],
+        &[
+            ("PATH", path_env.as_str()),
+            ("REAL_GIT", real_git.as_str()),
+            (
+                "FAKE_STDERR",
+                "fatal: detected dubious ownership in repository at '/repo'\nTo add an exception for this directory, call:\n\n\tgit config --global --add safe.directory /repo",
+            ),
+        ],
+    );
+    assert_ne!(
+        code, 12,
+        "a safe.directory-style rejection must not be reported as exit 12 (not a repo)"
+    );
+    assert_eq!(code, 14, "expected GIT_FAILED exit code, got {code}");
+}
+
+/// P1-13: a base-ref resolution failure whose stderr is NOT a "bad ref"
+/// signature (unknown/bad revision, ambiguous argument) must not be
+/// misclassified as `BadBase` (exit 11) — it's a git-internal problem during
+/// resolution and exits with `GIT_FAILED` instead.
+#[cfg(unix)]
+#[test]
+fn git_internal_base_failure_is_git_failed() {
+    let td = fixture_repo();
+    let shim_dir = fake_git_shim("git-internal-failure-marker^{commit}");
+    let real_git = real_git_path();
+    let path_env = format!(
+        "{}:{}",
+        shim_dir.path().display(),
+        std::env::var("PATH").unwrap()
+    );
+    let code = expect_exit_with_env(
+        td.path(),
+        &[
+            "review",
+            "--base",
+            "git-internal-failure-marker",
+            "--concerns",
+            "concerns.json",
+            "--no-open",
+        ],
+        &[
+            ("PATH", path_env.as_str()),
+            ("REAL_GIT", real_git.as_str()),
+            (
+                "FAKE_STDERR",
+                "fatal: unable to read current working directory: Permission denied",
+            ),
+        ],
+    );
+    assert_ne!(
+        code, 11,
+        "a git-internal failure during base resolution must not be reported as exit 11 (bad base)"
+    );
+    assert_eq!(code, 14, "expected GIT_FAILED exit code, got {code}");
 }
 
 #[test]

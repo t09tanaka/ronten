@@ -20,6 +20,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history (not just the tagged commit) so `origin/main` is
+          # resolvable locally for the ancestor check below.
+          fetch-depth: 0
       - name: Tag must equal Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -29,17 +33,62 @@ jobs:
             echo "tag v$tag does not match Cargo.toml version $version" >&2
             exit 1
           fi
+      - name: Tag commit must be reachable from origin/main
+        # A tag can be pushed on ANY commit — a stale fork, a local rebase,
+        # a manually crafted ref — not just one that went through review.
+        # Requiring the tagged commit to be an ancestor of protected `main`
+        # ties "releasable" to "merged to main" (the only branch this repo
+        # protects), so an unreviewed commit can never produce a release.
+        run: |
+          git fetch --no-tags origin main
+          commit="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$commit" origin/main; then
+            echo "tag commit $commit is not reachable from origin/main; refusing to release" >&2
+            exit 1
+          fi
+
+  # Re-runs the full push/pull_request CI suite (fmt/clippy/test, MSRV,
+  # cargo-deny/audit, package, frontend) at the exact tagged commit, as a
+  # reusable workflow call — `build` below only starts once this passes, so
+  # a release can never ship binaries from a commit CI hasn't actually
+  # verified (P1-8). ci.yml's own `workflow_call` trigger makes this a valid
+  # local-path reusable-workflow reference; its jobs only need
+  # `contents: read`, which this workflow already grants at the top level.
+  full-ci:
+    needs: verify-version
+    uses: ./.github/workflows/ci.yml
 
   build:
-    needs: verify-version
+    needs: [verify-version, full-ci]
     strategy:
       fail-fast: true
       matrix:
         include:
-          - os: ubuntu-latest
+          # ubuntu-22.04 (not -latest) pins the glibc baseline the gnu
+          # build links against, so it stays documented and stable rather
+          # than silently drifting to whatever glibc the "latest" image
+          # ships next (see README's supported-platform matrix).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
+          # Cross-compiled from the same (Apple Silicon) runner rather than
+          # run on a separate Intel runner: GitHub has removed the Intel
+          # macos-13 hosted-runner label, and Xcode's toolchain on an arm64
+          # host already supports linking for x86_64-apple-darwin directly
+          # (cc/ld pick the right `-arch` from the target triple), so no
+          # separate runner is needed. The smoke-test/E2E steps below then
+          # EXECUTE that x86_64 binary on the arm64 runner, which only works
+          # because GitHub's arm64 macOS images ship Rosetta 2 — if that
+          # ever changes, this leg would fail with "Bad CPU type in
+          # executable" at the smoke-test step, not at Build. The upside is
+          # this is the only leg that exercises the binary being installed
+          # under emulation, which is exactly how a real Intel-Mac x86_64
+          # download would run on an Apple Silicon Mac too.
+          - os: macos-latest
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
@@ -50,19 +99,135 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
           toolchain: "1.92.0"
-      - name: Build
-        run: cargo build --release --locked
-      - name: Smoke-test the binary
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+      - name: Install musl cross-compile toolchain
+        if: contains(matrix.target, 'musl')
         run: |
-          ./target/release/ronten --version
-          ./target/release/ronten schema --output > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify artifact architecture
+        # Best-effort: catches a matrix/target typo producing the wrong
+        # architecture binary silently. `file`'s exact wording varies by
+        # platform/version, so this greps for the arch family rather than
+        # asserting an exact string.
+        run: |
+          bin="target/${{ matrix.target }}/release/ronten"
+          file "$bin"
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-gnu)
+              file "$bin" | grep -qi 'x86-64\|x86_64'
+              ;;
+            x86_64-unknown-linux-musl)
+              file "$bin" | grep -qi 'x86-64\|x86_64'
+              file "$bin" | grep -qi 'static'
+              ;;
+            aarch64-apple-darwin)
+              file "$bin" | grep -qi 'arm64'
+              ;;
+            x86_64-apple-darwin)
+              file "$bin" | grep -qi 'x86_64'
+              ;;
+          esac
+      - name: Smoke-test the built binary
+        run: |
+          bin="target/${{ matrix.target }}/release/ronten"
+          "$bin" --version
+          "$bin" schema --output > /dev/null
       - name: Archive
         run: |
           version="${GITHUB_REF_NAME#v}"
           name="ronten-${version}-${{ matrix.target }}"
           mkdir "$name"
-          cp target/release/ronten README.md LICENSE "$name/"
+          cp "target/${{ matrix.target }}/release/ronten" \
+            README.md LICENSE THIRD_PARTY_NOTICES.md "$name/"
           tar -czf "$name.tar.gz" "$name"
+      - name: Extract the archive for artifact smoke tests
+        # From here on, every check runs against the binary as it will
+        # actually reach a user (unpacked from the real tarball), not the
+        # raw cargo build output.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="ronten-${version}-${{ matrix.target }}"
+          mkdir -p smoke-extract
+          tar -xzf "$name.tar.gz" -C smoke-extract
+          echo "SMOKE_BIN=$PWD/smoke-extract/$name/ronten" >> "$GITHUB_ENV"
+      - name: Artifact smoke test — CLI surface
+        run: |
+          "$SMOKE_BIN" --version
+          "$SMOKE_BIN" schema --output > /dev/null
+          "$SMOKE_BIN" schema --input > /dev/null
+          cat > /tmp/sample-concerns.json <<'JSON'
+          {
+            "version": 1,
+            "summary": "Sample concerns for release artifact smoke testing.",
+            "concerns": [
+              { "id": "sample", "title": "Sample concern", "risk": "low", "locations": [{ "path": "README.md" }] }
+            ]
+          }
+          JSON
+          "$SMOKE_BIN" validate-concerns /tmp/sample-concerns.json
+      - name: Artifact smoke test — demo session E2E (GET/PUT/POST)
+        # Real end-to-end round trip against the packaged binary: start
+        # `ronten demo`, then GET the session, PUT a draft, and POST a
+        # submit through the actual HTTP API — the same contract an agent
+        # integration relies on (P1-8). Bounded by the job timeout plus the
+        # trap below so a wedged server can't hang the release.
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          log="$(mktemp)"
+          "$SMOKE_BIN" demo --port 0 --no-open >"$log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+
+          url=""
+          for _ in $(seq 1 100); do
+            if grep -q 'Review session:' "$log"; then
+              url=$(grep -o 'http://127\.0\.0\.1:[0-9]*/r/[A-Za-z0-9_-]*' "$log" | head -1)
+              break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              echo "demo process exited before printing its session URL" >&2
+              cat "$log" >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+          if [ -z "$url" ]; then
+            echo "timed out waiting for the demo session URL" >&2
+            cat "$log" >&2
+            exit 1
+          fi
+
+          base="${url%/r/*}"
+          token="${url##*/r/}"
+          api="$base/api/$token"
+
+          session="$(curl -sf "$api/session")"
+          echo "$session" | jq -e '.title == "ronten demo"' > /dev/null
+
+          curl -sf -X PUT "$api/draft" \
+            -H 'content-type: application/json' \
+            -d '{"revision":0,"draft":{},"mutation_id":"ci-artifact-smoke-draft"}' > /dev/null
+
+          # Approve every concern the session actually requires a verdict
+          # for (read back from GET /session rather than hardcoded, so this
+          # doesn't silently stop covering an "unmapped" entry the demo
+          # fixture may or may not produce).
+          submit_body="$(echo "$session" | jq -c '{
+            revision: 1,
+            draft: { concerns: (reduce .concerns[].id as $id ({}; . + {($id): {verdict: "approve"}})) },
+            mutation_id: "ci-artifact-smoke-submit"
+          }')"
+          curl -sf -X POST "$api/submit" \
+            -H 'content-type: application/json' \
+            -d "$submit_body" | jq -e '.ok == true' > /dev/null
+
+          wait "$pid" || true
+          echo "demo session E2E smoke test passed"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist-${{ matrix.target }}
@@ -85,12 +250,11 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - name: Checksums
-        run: |
-          cd dist
-          sha256sum ronten-*.tar.gz > SHA256SUMS
-          cat SHA256SUMS
       - name: SBOM (SPDX, from the source tree)
+        # Generated BEFORE the checksums step below so the SBOM itself is
+        # covered by SHA256SUMS (P1-10) — otherwise a swapped/tampered SBOM
+        # would go undetected by the exact check the release notes tell a
+        # consumer to run.
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
@@ -98,10 +262,19 @@ jobs:
           output-file: dist/ronten-${{ github.ref_name }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum ronten-*.tar.gz *.spdx.json > SHA256SUMS
+          cat SHA256SUMS
       - name: Build provenance attestation
+        # Subject is every artifact a consumer actually verifies against
+        # SHA256SUMS — the tarballs and the SBOM — not just the tarballs.
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: dist/ronten-*.tar.gz
+          subject-path: |
+            dist/ronten-*.tar.gz
+            dist/ronten-*.spdx.json
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}

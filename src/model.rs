@@ -205,9 +205,12 @@ pub struct WorktreeAudit {
 
 /// Identifies the ronten build that produced this result. `source_commit`,
 /// `source_dirty`, `rust_version`, `target`, `profile`, and `frontend_digest`
-/// are populated by `build.rs`-injected env vars when available; they are
-/// `None` on a build that didn't set them (e.g. this one, until Task 5.4
-/// wires `build.rs` to emit them) rather than a hard build requirement.
+/// are populated by `build.rs`-injected env vars (Task 5.4) when available;
+/// they are `None` on a build that didn't set them — e.g. `source_commit`/
+/// `source_dirty` from a source tree with no `.git` (a `cargo package`
+/// tarball extracted elsewhere) — rather than a hard build requirement.
+/// `target`/`profile` come from cargo's own `TARGET`/`PROFILE` build-script
+/// env vars, so those two are always set.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BuildInfo {
     pub ronten_version: String,
@@ -221,7 +224,8 @@ pub struct BuildInfo {
 
 impl BuildInfo {
     /// Builds from the current binary's compile-time env — `None` for
-    /// anything not injected by `build.rs` yet (Task 5.4).
+    /// anything `build.rs` didn't inject for this build (see the struct
+    /// doc).
     pub fn current() -> Self {
         BuildInfo {
             ronten_version: env!("CARGO_PKG_VERSION").to_string(),

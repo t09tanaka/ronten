@@ -57,11 +57,12 @@ project is pre-1.0 and minor versions may contain breaking changes.
   time); `worktree` — the `--dirty-policy` in effect and whether the
   worktree was checked/clean at session start and re-checked at submit
   (fail-open: a git failure at the submit recheck is a warning, not a
-  blocker); `build` — `ronten_version` now, with
-  `source_commit`/`rust_version`/`target`/`profile`/`frontend_digest`
-  wired but `null` until a future build.rs change populates them. A
-  modified binary file now also emits a structured `BINARY_CONTENT`
-  warning instead of passing through silently.
+  blocker); `build` — `ronten_version`,
+  `source_commit`/`source_dirty`/`rust_version`/`target`/`profile` and a
+  `frontend_digest` (SHA-256 over the embedded `frontend/dist`), so two
+  builds both reporting version 0.1.0 are still distinguishable from the
+  result JSON alone. A modified binary file now also emits a structured
+  `BINARY_CONTENT` warning instead of passing through silently.
 - New `ronten validate-concerns [FILE|-]` subcommand: validates a
   concerns JSON document (file, stdin via `-`/omitted, or piped) with the
   same structural parse and semantic checks `ronten review` runs at
@@ -69,6 +70,11 @@ project is pre-1.0 and minor versions may contain breaking changes.
   `{"valid": true}` (exit 0) or `{"valid": false, "errors": [{"code",
   "message", "concern_id"?}]}` (exit 10, the same code `review` uses for
   invalid concerns).
+- `THIRD_PARTY_NOTICES.md`, shipped in the published crate and in every
+  release tarball, reproducing the licenses of the statically linked Rust
+  dependencies and of the JS/font assets embedded in the frontend bundle.
+  It is generated from both lockfiles by `scripts/gen-third-party.sh`, and
+  CI regenerates it on every PR and fails if the committed copy is stale.
 
 ### Changed
 - File acknowledgement is now server-authoritative and keyed by a stable,
@@ -125,6 +131,23 @@ project is pre-1.0 and minor versions may contain breaking changes.
   hunks when their combined rendered length exceeds 1,000 lines, on top
   of the existing per-hunk 200-line collapse — bounding initial DOM
   without virtualization.
+- The release workflow no longer ships binaries from a commit CI has not
+  verified: a tag must be reachable from `origin/main`, and the full CI
+  suite is re-run at the exact tagged commit (ci.yml is now a reusable
+  workflow) before any build starts. Binaries are built per target triple
+  (`x86_64-unknown-linux-gnu` on ubuntu-22.04 for a documented glibc
+  baseline, `x86_64-unknown-linux-musl` static, plus `aarch64-` and
+  `x86_64-apple-darwin`), their architecture is verified with `file`, and
+  every check from there on runs against the binary unpacked from the real
+  tarball — including a demo-session GET/PUT draft/POST submit round trip
+  over the actual HTTP API. The SBOM is generated before the checksums so
+  `SHA256SUMS` covers it, and it is included in the provenance attestation
+  subjects. README documents the supported platform matrix and that macOS
+  builds are unsigned (Gatekeeper will warn).
+- With `RONTEN_SKIP_FRONTEND_BUILD` set, build.rs now compares the reused
+  `frontend/dist` against `frontend/src` and `package-lock.json` mtimes and
+  emits a `cargo:warning` if it looks stale. It never hard-fails — the flag
+  is a deliberate escape hatch.
 
 ### Fixed
 - The opaque-content ack card (binary/non-UTF-8/too-large) now also shows
@@ -172,6 +195,14 @@ project is pre-1.0 and minor versions may contain breaking changes.
   hard-capped across a review, so a legal but pathological input (e.g.
   200 concerns × 200 locations on one file) is bounded or refused (exit
   18) instead of doing unbounded work.
+- Git failures are no longer misreported as user errors: the repository
+  root is decoded fail-closed (a non-UTF-8 toplevel path errors instead of
+  being lossily mangled to `�`), and "not a git repository" (exit 12) is
+  now distinguished from a git-internal failure — a permission error, a
+  corrupt repository, or a `safe.directory` rejection — by inspecting
+  stderr rather than assuming any non-zero exit means "not a repo". Base
+  resolution is classified the same way, so only a genuinely unresolvable
+  revision reports a bad base.
 
 ## [0.1.0] - 2026-07
 
