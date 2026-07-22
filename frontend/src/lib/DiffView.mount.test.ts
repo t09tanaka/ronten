@@ -311,7 +311,7 @@ describe('ack_reasons_render_and_gate_submission', () => {
     // The one-sided mode badge and the server's ack-reason label both render
     // without the frontend ever recomputing the policy itself.
     expect(container.textContent).toContain('added executable 100755')
-    expect(container.textContent).toContain('New executable file added')
+    expect(container.textContent).toContain('Executable file added — it can be run directly')
 
     const checkbox = container.querySelector('.opaque-ack input') as HTMLInputElement
     expect(checkbox).not.toBeNull()

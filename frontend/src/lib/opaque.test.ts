@@ -125,8 +125,8 @@ describe('ackReasonLabels', () => {
     expect(
       ackReasonLabels(makeFile({ ack_reasons: ['opaque-content', 'mode-changed'] })),
     ).toEqual([
-      'Content not rendered — the summary below is all that is shown',
-      'File mode changed',
+      'Content not rendered — only the summary below is shown',
+      'File mode changed — behavioral effect not shown',
     ])
   })
 
@@ -159,7 +159,7 @@ describe('otherAckReasonLabels', () => {
   it('keeps every other reason alongside opaque content', () => {
     expect(
       otherAckReasonLabels(makeFile({ ack_reasons: ['opaque-content', 'mode-changed'] })),
-    ).toEqual(['File mode changed'])
+    ).toEqual(['File mode changed — behavioral effect not shown'])
   })
 })
 
@@ -264,19 +264,19 @@ describe('fileNotices', () => {
 
   it('flags a gitlink pointer change', () => {
     expect(fileNotices(makeFile({ ack_reasons: ['gitlink-changed'] }))).toEqual([
-      'Submodule pointer change — nested diff not shown',
+      'Submodule commit updated — nested changes not shown',
     ])
   })
 
   it('flags a submodule reference added or removed', () => {
     expect(fileNotices(makeFile({ ack_reasons: ['submodule-pointer'] }))).toEqual([
-      'Submodule reference added or removed — nested diff not shown',
+      'Submodule added or removed — nested contents not shown',
     ])
   })
 
   it('flags an LFS pointer', () => {
     expect(fileNotices(makeFile({ ack_reasons: ['lfs-pointer'] }))).toEqual([
-      'Git LFS pointer — actual content not shown',
+      'Git LFS pointer — stored content not shown',
     ])
   })
 
@@ -284,8 +284,8 @@ describe('fileNotices', () => {
     expect(
       fileNotices(makeFile({ ack_reasons: ['gitlink-changed', 'lfs-pointer'] })),
     ).toEqual([
-      'Submodule pointer change — nested diff not shown',
-      'Git LFS pointer — actual content not shown',
+      'Submodule commit updated — nested changes not shown',
+      'Git LFS pointer — stored content not shown',
     ])
   })
 })
