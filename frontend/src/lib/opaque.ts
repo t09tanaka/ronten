@@ -35,15 +35,15 @@ export function typeChangeBadge(f: FileDiff): string | null {
  * in `fileNotices` below. Keep in sync with the variant list in
  * `types.ts`/`gitdiff.rs`. */
 const ACK_REASON_LABELS: Record<AckReason, string> = {
-  'opaque-content': 'Content not rendered — the summary below is all that is shown',
-  'gitlink-changed': 'Submodule pointer change — nested diff not shown',
-  'mode-changed': 'File mode changed',
-  'added-symlink': 'New symlink added',
-  'deleted-symlink': 'Symlink deleted',
-  'added-executable': 'New executable file added',
-  'regular-to-symlink': 'Regular file became a symlink',
-  'lfs-pointer': 'Git LFS pointer — actual content not shown',
-  'submodule-pointer': 'Submodule reference added or removed — nested diff not shown',
+  'opaque-content': 'Content not rendered — only the summary below is shown',
+  'gitlink-changed': 'Submodule commit updated — nested changes not shown',
+  'mode-changed': 'File mode changed — behavioral effect not shown',
+  'added-symlink': 'Symlink added — target may resolve outside the repository',
+  'deleted-symlink': 'Symlink deleted — path resolution will change',
+  'added-executable': 'Executable file added — it can be run directly',
+  'regular-to-symlink': 'File replaced by symlink — target may resolve outside the repository',
+  'lfs-pointer': 'Git LFS pointer — stored content not shown',
+  'submodule-pointer': 'Submodule added or removed — nested contents not shown',
 }
 
 /** Human-readable label for every reason this file requires an ack, in
