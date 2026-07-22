@@ -1,5 +1,6 @@
 <script lang="ts">
   import { rs } from './state.svelte'
+  import { shouldCollapseAllHunks } from './collapse'
   import HunkView from './HunkView.svelte'
   import type { CommentLineInfo } from './anchors'
   import { hasControlChars, hasInvisibles, reveal } from './invisibles'
@@ -28,6 +29,25 @@
     }
     return out
   })
+
+  // Sum of rendered lines across every hunk the SELECTED concern owns
+  // (not just the ones in a single file group) — the input to the
+  // many-small-hunks collapse rule. A concern with hundreds of small hunks
+  // can build unbounded DOM even though no individual hunk crosses
+  // HunkView's own per-hunk threshold; see collapse.ts.
+  const selectedTotalLines = $derived.by((): number => {
+    const concern = rs.selected
+    const session = rs.session
+    if (!concern || !session) return 0
+    let total = 0
+    for (const ref of concern.hunks) {
+      if (ref.hunk == null) continue
+      total += session.files[ref.file].hunks[ref.hunk].lines.length
+    }
+    return total
+  })
+
+  const forceCollapseAll = $derived(shouldCollapseAllHunks(selectedTotalLines))
 
   // Only called for content_kind === 'text' files with no hunks — opaque
   // files get the detail card + ack checkbox below instead.
@@ -141,6 +161,7 @@
             hunk={file.hunks[hunkRef.hunk]}
             {hunkRef}
             concernId={rs.selected.id}
+            forceCollapsed={forceCollapseAll}
             oncommentline={handleCommentLine}
           />
         {/if}

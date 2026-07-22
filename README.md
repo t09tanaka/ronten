@@ -334,8 +334,14 @@ truncated:
   structured warning (`FILE_TOO_LARGE` / `FILE_TOO_MANY_LINES` / `LINE_TOO_LONG`).
 - Per review: 50 MiB of total blob content and 200,000 total rendered diff lines; files
   past either budget degrade the same way (`DIFF_TOO_LARGE`), which also bounds the session
-  JSON and the DOM. More than 2000 changed files refuses to start (exit 18) — that cannot
-  be meaningfully reviewed in one sitting.
+  JSON. More than 2000 changed files refuses to start (exit 18) — that cannot be
+  meaningfully reviewed in one sitting.
+- The frontend does not render all 200,000 lines' worth of DOM at once — it bounds initial
+  mount with collapsing, not virtualization: any single hunk over 200 lines starts
+  collapsed, and if a selected concern's hunks collectively total over 1,000 rendered
+  lines, every one of that concern's hunks starts collapsed too (each still expandable on
+  demand). A concern's shared-hunk lookup (which other concerns also claim a given hunk)
+  is precomputed once per session load rather than rescanned per rendered hunk.
 - Every git subprocess runs under a hard 60-second deadline and is killed (and reaped) on
   overrun, so a wedged git can neither stall the review nor outlive the process.
 

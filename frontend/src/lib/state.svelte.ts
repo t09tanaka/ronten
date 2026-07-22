@@ -173,12 +173,29 @@ export class ReviewState {
     return this.session.files.every((f, i) => !requiresAck(f) || this.isAcked(i))
   }
 
+  /** `'file:hunk'` -> owning concern ids, built once per session load rather
+   * than re-walking every concern's hunk list on every `hunkOwners` call
+   * (previously O(hunks x concerns x refs) — this component alone re-ran
+   * the full session scan for every rendered hunk). Recomputes automatically
+   * whenever `session` is replaced (fresh load or recovery reload), and
+   * nowhere else. */
+  #ownerIndex = $derived.by((): Map<string, string[]> => {
+    const idx = new Map<string, string[]>()
+    if (!this.session) return idx
+    for (const c of this.session.concerns) {
+      for (const h of c.hunks) {
+        const key = `${h.file}:${h.hunk}`
+        const owners = idx.get(key)
+        if (owners) owners.push(c.id)
+        else idx.set(key, [c.id])
+      }
+    }
+    return idx
+  })
+
   /** Concern ids whose hunks include `ref` (used to render shared-hunk badges). */
   hunkOwners(ref: HunkRef): string[] {
-    if (!this.session) return []
-    return this.session.concerns
-      .filter((c) => c.hunks.some((h) => h.file === ref.file && h.hunk === ref.hunk))
-      .map((c) => c.id)
+    return this.#ownerIndex.get(`${ref.file}:${ref.hunk}`) ?? []
   }
 
   select(idx: number): void {
