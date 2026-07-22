@@ -63,88 +63,189 @@ fn valid_id_pattern(id: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
+/// A single semantic-validation failure from [`validate_concerns`]: a
+/// stable, machine-readable `code`, a human-readable `message` (the same
+/// text `review`'s startup path prints to stderr, via
+/// [`format_validation_errors`]), and — for a failure scoped to one concern
+/// — that concern's `id`. This is `Serialize`-derived so `ronten
+/// validate-concerns` can emit it directly as JSON.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ValidationError {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concern_id: Option<String>,
+}
+
+impl ValidationError {
+    fn new(code: &str, message: String) -> Self {
+        ValidationError {
+            code: code.to_string(),
+            message,
+            concern_id: None,
+        }
+    }
+
+    fn for_concern(code: &str, concern_id: &str, message: String) -> Self {
+        ValidationError {
+            code: code.to_string(),
+            message,
+            concern_id: Some(concern_id.to_string()),
+        }
+    }
+}
+
+/// Joins every error's `message` (in order) with `"; "` into one
+/// human-readable line — used by `review`'s startup path to print a single
+/// stderr summary of the same failures `ronten validate-concerns` reports
+/// structurally (one `ValidationError` per array entry).
+pub fn format_validation_errors(errors: &[ValidationError]) -> String {
+    errors
+        .iter()
+        .map(|e| e.message.as_str())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Validates the concerns list itself (not against a diff): rejects an
 /// unsupported contract version, an empty or oversized list, duplicate ids,
 /// malformed ids (including the reserved `_unmapped`), over-long text
 /// fields, and invalid location ranges.
-pub fn validate_concerns(input: &ConcernsInput) -> Result<(), String> {
+///
+/// Collects every failure found rather than stopping at the first: a caller
+/// gets the complete set of problems in one pass (e.g. an unsupported
+/// version *and* a duplicate id in the same input both show up), matching
+/// what `ronten validate-concerns` reports in its `errors` array. Per
+/// concern, mutually-exclusive checks on the same field (e.g. a reserved id
+/// vs. a malformed id, or a location's `line == 0` vs. `start > end`) still
+/// report only the first applicable problem for that field, to avoid
+/// redundant errors describing the same root cause.
+pub fn validate_concerns(input: &ConcernsInput) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
     if input.version != SUPPORTED_VERSION {
-        return Err(format!(
-            "unsupported version {} (this ronten supports version {SUPPORTED_VERSION})",
-            input.version
+        errors.push(ValidationError::new(
+            "UNSUPPORTED_VERSION",
+            format!(
+                "unsupported version {} (this ronten supports version {SUPPORTED_VERSION})",
+                input.version
+            ),
         ));
     }
     if input.concerns.is_empty() {
-        return Err("concerns list must not be empty".to_string());
+        errors.push(ValidationError::new(
+            "EMPTY_CONCERNS",
+            "concerns list must not be empty".to_string(),
+        ));
     }
     if input.concerns.len() > 200 {
-        return Err(format!(
-            "too many concerns: {} (maximum 200)",
-            input.concerns.len()
+        errors.push(ValidationError::new(
+            "TOO_MANY_CONCERNS",
+            format!("too many concerns: {} (maximum 200)", input.concerns.len()),
         ));
     }
     if let Some(summary) = &input.summary {
         if summary.chars().count() > 2_000 {
-            return Err("summary exceeds 2000 characters".to_string());
+            errors.push(ValidationError::new(
+                "SUMMARY_TOO_LONG",
+                "summary exceeds 2000 characters".to_string(),
+            ));
         }
     }
+
     let mut seen = std::collections::HashSet::new();
     for c in &input.concerns {
         if c.id == UNMAPPED_ID {
-            return Err(format!(
-                "concern id \"{UNMAPPED_ID}\" is reserved and cannot be used"
+            errors.push(ValidationError::for_concern(
+                "RESERVED_CONCERN_ID",
+                &c.id,
+                format!("concern id \"{UNMAPPED_ID}\" is reserved and cannot be used"),
+            ));
+        } else if c.id.is_empty() || c.id.chars().count() > 64 || !valid_id_pattern(&c.id) {
+            errors.push(ValidationError::for_concern(
+                "INVALID_CONCERN_ID",
+                &c.id,
+                format!(
+                    "invalid concern id {:?}: must be 1-64 characters matching ^[A-Za-z0-9][A-Za-z0-9._-]*$",
+                    c.id
+                ),
+            ));
+        } else if !seen.insert(c.id.as_str()) {
+            errors.push(ValidationError::for_concern(
+                "DUPLICATE_CONCERN_ID",
+                &c.id,
+                format!("duplicate concern id: {}", c.id),
             ));
         }
-        if c.id.is_empty() || c.id.chars().count() > 64 || !valid_id_pattern(&c.id) {
-            return Err(format!(
-                "invalid concern id {:?}: must be 1-64 characters matching ^[A-Za-z0-9][A-Za-z0-9._-]*$",
-                c.id
-            ));
-        }
-        if !seen.insert(c.id.as_str()) {
-            return Err(format!("duplicate concern id: {}", c.id));
-        }
+
         if c.title.trim().is_empty() {
-            return Err(format!("concern {:?}: title must not be blank", c.id));
+            errors.push(ValidationError::for_concern(
+                "BLANK_TITLE",
+                &c.id,
+                format!("concern {:?}: title must not be blank", c.id),
+            ));
+        } else if c.title.chars().count() > 200 {
+            errors.push(ValidationError::for_concern(
+                "TITLE_TOO_LONG",
+                &c.id,
+                format!("concern {:?}: title exceeds 200 characters", c.id),
+            ));
         }
-        if c.title.chars().count() > 200 {
-            return Err(format!("concern {:?}: title exceeds 200 characters", c.id));
-        }
+
         if let Some(description) = &c.description {
             if description.chars().count() > 20_000 {
-                return Err(format!(
-                    "concern {:?}: description exceeds 20000 characters",
-                    c.id
+                errors.push(ValidationError::for_concern(
+                    "DESCRIPTION_TOO_LONG",
+                    &c.id,
+                    format!("concern {:?}: description exceeds 20000 characters", c.id),
                 ));
             }
         }
+
         if c.locations.len() > 200 {
-            return Err(format!(
-                "concern {:?}: too many locations: {} (maximum 200)",
-                c.id,
-                c.locations.len()
+            errors.push(ValidationError::for_concern(
+                "TOO_MANY_LOCATIONS",
+                &c.id,
+                format!(
+                    "concern {:?}: too many locations: {} (maximum 200)",
+                    c.id,
+                    c.locations.len()
+                ),
             ));
         }
+
         for loc in &c.locations {
             if loc.start == Some(0) || loc.end == Some(0) {
-                return Err(format!(
-                    "concern {:?}: location {}: line numbers are 1-based (0 is invalid)",
-                    c.id,
-                    sanitize(&loc.path)
-                ));
-            }
-            if let (Some(start), Some(end)) = (loc.start, loc.end) {
-                if start > end {
-                    return Err(format!(
-                        "concern {:?}: location {}: start {start} is greater than end {end}",
+                errors.push(ValidationError::for_concern(
+                    "INVALID_LINE_NUMBER",
+                    &c.id,
+                    format!(
+                        "concern {:?}: location {}: line numbers are 1-based (0 is invalid)",
                         c.id,
                         sanitize(&loc.path)
+                    ),
+                ));
+            } else if let (Some(start), Some(end)) = (loc.start, loc.end) {
+                if start > end {
+                    errors.push(ValidationError::for_concern(
+                        "START_AFTER_END",
+                        &c.id,
+                        format!(
+                            "concern {:?}: location {}: start {start} is greater than end {end}",
+                            c.id,
+                            sanitize(&loc.path)
+                        ),
                     ));
                 }
             }
         }
     }
-    Ok(())
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Sort key for `UnmappedLine.side` in `(file, side, line)` order (`Old`
@@ -1242,11 +1343,49 @@ mod tests {
     fn validate_concerns_rejects_unsupported_version() {
         let mut inp = input(vec![concern("c1", vec![])]);
         inp.version = 2;
-        let err = validate_concerns(&inp).unwrap_err();
+        let errors = validate_concerns(&inp).unwrap_err();
         assert!(
-            err.contains("version 1"),
-            "error should name the supported version: {err}"
+            errors
+                .iter()
+                .any(|e| e.code == "UNSUPPORTED_VERSION" && e.message.contains("version 1")),
+            "errors should include an UNSUPPORTED_VERSION error naming the supported version: {errors:?}"
         );
+    }
+
+    #[test]
+    fn validate_concerns_reports_stable_error_codes() {
+        let dup = input(vec![concern("c1", vec![]), concern("c1", vec![])]);
+        let errors = validate_concerns(&dup).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "DUPLICATE_CONCERN_ID" && e.concern_id.as_deref() == Some("c1")),
+            "expected a DUPLICATE_CONCERN_ID error for c1: {errors:?}"
+        );
+
+        let start_after_end = input(vec![concern(
+            "c1",
+            vec![loc("a.ts", None, Some(5), Some(4))],
+        )]);
+        let errors = validate_concerns(&start_after_end).unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.code == "START_AFTER_END" && e.concern_id.as_deref() == Some("c1")),
+            "expected a START_AFTER_END error for c1: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_concerns_collects_every_error_not_just_the_first() {
+        // Two independent, unrelated problems (an unsupported top-level
+        // version and a duplicate concern id) must both surface, not just
+        // whichever one the validator happens to check first.
+        let mut inp = input(vec![concern("c1", vec![]), concern("c1", vec![])]);
+        inp.version = 2;
+        let errors = validate_concerns(&inp).unwrap_err();
+        assert!(errors.iter().any(|e| e.code == "UNSUPPORTED_VERSION"));
+        assert!(errors.iter().any(|e| e.code == "DUPLICATE_CONCERN_ID"));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::exitcode;
 use crate::gitdiff::{
     compute_diff, current_branch, git_dirs, is_tracked, repo_root, worktree_status, GitError,
 };
-use crate::mapping::{resolve_mapping, validate_concerns};
+use crate::mapping::{format_validation_errors, resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
 use crate::session::{DraftSlot, Phase, SessionState};
@@ -59,6 +59,17 @@ pub enum DirtyPolicy {
     Warn,
     /// Start silently.
     Ignore,
+}
+
+/// Wire name of a `DirtyPolicy`, embedded verbatim in the result's
+/// `WorktreeAudit.policy` — matches the CLI's own `--dirty-policy` value
+/// spelling (clap's kebab-case `ValueEnum` rendering).
+fn dirty_policy_wire_name(policy: DirtyPolicy) -> &'static str {
+    match policy {
+        DirtyPolicy::Error => "error",
+        DirtyPolicy::Warn => "warn",
+        DirtyPolicy::Ignore => "ignore",
+    }
 }
 
 /// Hard cap on the size of the concerns JSON input, to bound memory use
@@ -362,13 +373,18 @@ pub async fn run(args: ReviewArgs) -> u8 {
             return exitcode::INPUT;
         }
     };
-    if let Err(e) = validate_concerns(&input) {
-        // `e` may already carry a sanitized `loc.path` token (see
-        // `validate_concerns`), but the message is passed through `sanitize`
-        // again regardless — it is cheap (a no-op scan) and makes this print
-        // site safe on its own even if some future error string forgets to
-        // sanitize a field itself.
-        eprintln!("invalid concerns: {}", sanitize(&e));
+    if let Err(errors) = validate_concerns(&input) {
+        // Same structured `ValidationError`s `ronten validate-concerns`
+        // reports as JSON, joined into one human-readable line here. Each
+        // message may already carry a sanitized `loc.path` token (see
+        // `validate_concerns`), but the joined string is passed through
+        // `sanitize` again regardless — it is cheap (a no-op scan) and makes
+        // this print site safe on its own even if some future error string
+        // forgets to sanitize a field itself.
+        eprintln!(
+            "invalid concerns: {}",
+            sanitize(&format_validation_errors(&errors))
+        );
         return exitcode::INPUT;
     }
 
@@ -433,12 +449,29 @@ pub async fn run(args: ReviewArgs) -> u8 {
     // is not exempt at all: Task 1.1's preflight-then-reserve ordering means
     // `--out` never exists (tracked or untracked) at dirty-gate time, so no
     // exemption for it is needed.
+    // Resolved once up front (cheap: parent-directory canonicalization only)
+    // and reused for both the start-time gate below and the result's
+    // `WorktreeAudit.excluded_paths` / the submit-time re-check in
+    // `server::recheck_worktree_at_submit` — the exemption must agree at
+    // both points, or the audit would flag ronten's own input file as a
+    // "dirty" change that snuck in between start and submit.
+    let concerns_rel = concerns_repo_relative(&args.concerns, &root);
+    let mut worktree_start = crate::session::WorktreeStartAudit::default();
     let dirty = match args.dirty_policy {
         DirtyPolicy::Ignore => None,
         DirtyPolicy::Error | DirtyPolicy::Warn => match worktree_status(&root) {
             Ok(status) => {
-                let concerns_rel = concerns_repo_relative(&args.concerns, &root);
+                worktree_start.checked = true;
+                let was_exempted = concerns_rel
+                    .as_deref()
+                    .is_some_and(|c| status.untracked.iter().any(|p| p == c));
                 let status = drop_exempt(status, concerns_rel.as_deref());
+                worktree_start.clean = status.is_clean();
+                if was_exempted {
+                    worktree_start
+                        .excluded_paths
+                        .push(concerns_rel.clone().expect("was_exempted implies Some"));
+                }
                 (!status.is_clean()).then_some(status)
             }
             Err(GitError::BadBase(msg))
@@ -459,6 +492,8 @@ pub async fn run(args: ReviewArgs) -> u8 {
                     "warning: git status failed ({}); could not verify the worktree is clean",
                     sanitize(msg.trim())
                 );
+                // `worktree_start.checked` stays `false`: the query itself
+                // failed, so there is nothing to honestly report as clean.
                 None
             }
             Err(GitError::NotARepo) => None,
@@ -573,6 +608,9 @@ pub async fn run(args: ReviewArgs) -> u8 {
         session_id: new_token(),
         snapshot,
         repo_root: Some(root),
+        dirty_policy: dirty_policy_wire_name(args.dirty_policy).to_string(),
+        worktree_start,
+        worktree_exempt_path: concerns_rel,
         started_at,
         deadline_at,
         phase: Mutex::new(Phase::Reviewing(DraftSlot::default())),

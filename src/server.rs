@@ -1,8 +1,8 @@
 //! Token-protected localhost HTTP server exposing the review session.
 
 use crate::assets;
-use crate::model::ResultOutput;
-use crate::session::{Draft, SessionPayload, SessionState};
+use crate::model::{ResultOutput, Severity, Warning};
+use crate::session::{Draft, SessionPayload, SessionState, WorktreeSubmitAudit};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -223,7 +223,11 @@ async fn get_session(
     let payload = SessionPayload {
         title: &state.title,
         summary: state.summary.as_deref(),
-        files: &state.files,
+        files: state
+            .files
+            .iter()
+            .map(crate::session::FileView::from)
+            .collect(),
         concerns,
         unmapped_lines: &state.mapping.unmapped_lines,
         warnings: &state.mapping.warnings,
@@ -232,6 +236,8 @@ async fn get_session(
         limits: crate::session::Limits {
             max_comments: crate::session::MAX_COMMENTS,
             max_comment_chars: crate::session::MAX_COMMENT_CHARS,
+            max_total_comments: crate::session::MAX_TOTAL_COMMENTS,
+            max_total_comment_chars: crate::session::MAX_TOTAL_COMMENT_CHARS,
             max_draft_bytes: MAX_BODY_BYTES,
         },
         finished,
@@ -314,6 +320,25 @@ async fn put_draft(
     }
     if let Some(invalid) = validate_mutation_id(&body.mutation_id) {
         return invalid;
+    }
+    // Resource caps (comment counts/lengths, review-wide totals) apply even
+    // to a draft save — not the full validate_draft (anchors/acks/blanks
+    // stay lenient here, the draft is a scratchpad) — so a draft can never
+    // grow past what the UI advertised as the limits, and therefore stays
+    // submittable on the wire (P1-6). Checked before the phase lock, same
+    // as `post_submit` runs `validate_draft` before discovering an
+    // already-finished session: a violating body is refused regardless of
+    // session state.
+    let resource_violations = state.resource_cap_violations(&body.draft);
+    if !resource_violations.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "error": "draft exceeds limits",
+                "details": resource_violations,
+            })),
+        )
+            .into_response();
     }
     // Draft and terminal state live behind the same lock, so "finished?"
     // and "write the draft" are one atomic step: a submit/abort landing
@@ -420,6 +445,50 @@ async fn check_head_freshness(state: &SessionState) -> Option<Response> {
     None
 }
 
+/// Re-checks worktree cleanliness at submit time, for the result's audit
+/// trail — best-effort and fail-open: a git failure here is recorded as a
+/// warning, never blocks the submit. The submit's validity is already
+/// protected by [`check_head_freshness`]'s `HEAD` pin; worktree cleanliness
+/// is audit information layered on top of that, not a second gate.
+///
+/// Skipped (returns the all-`false`/no-warning default) under
+/// `--dirty-policy ignore` and for sessions with no repository behind them
+/// (demo) — neither has a worktree concept to re-check.
+async fn recheck_worktree_at_submit(state: &SessionState) -> WorktreeSubmitAudit {
+    if state.dirty_policy == "ignore" {
+        return WorktreeSubmitAudit::default();
+    }
+    let Some(root) = state.repo_root.clone() else {
+        return WorktreeSubmitAudit::default();
+    };
+    let exempt = state.worktree_exempt_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::gitdiff::worktree_status(&root).map(|mut status| {
+            if let Some(path) = &exempt {
+                status.untracked.retain(|p| p != path);
+            }
+            status.is_clean()
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Ok(clean)) => WorktreeSubmitAudit {
+            checked: true,
+            clean,
+            warning: None,
+        },
+        _ => WorktreeSubmitAudit {
+            checked: false,
+            clean: false,
+            warning: Some(Warning::new(
+                "WORKTREE_CHECK_FAILED",
+                Severity::Warning,
+                "could not re-verify worktree cleanliness at submit time".to_string(),
+            )),
+        },
+    }
+}
+
 async fn post_submit(
     State(state): State<Arc<SessionState>>,
     Path(token): Path<String>,
@@ -477,7 +546,8 @@ async fn post_submit(
     // gets the same draft-conflict refusal a stale save does — submitting
     // must not be a side door around it. Claimed only after full
     // validation, so a rejected submit never consumes the session.
-    let result = state.build_result(&draft);
+    let worktree_submit = recheck_worktree_at_submit(&state).await;
+    let result = state.build_result(&draft, worktree_submit);
     match state.try_finish_at_revision(
         Outcome::Submitted(Box::new(result)),
         body.revision,
@@ -641,6 +711,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -697,6 +770,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: Some(repo_root),
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -755,6 +831,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -822,6 +901,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -942,6 +1024,9 @@ index 1111111..2222222 100644
         assert_eq!(body["draft_revision"], 1);
         assert_eq!(body["limits"]["max_comment_chars"], 10_000);
         assert_eq!(body["limits"]["max_comments"], 500);
+        assert_eq!(body["limits"]["max_total_comments"], 1000);
+        assert_eq!(body["limits"]["max_total_comment_chars"], 1_500_000);
+        assert_eq!(body["limits"]["max_draft_bytes"], MAX_BODY_BYTES);
     }
 
     /// A save presenting a stale revision must be refused (409) without
@@ -1114,9 +1199,10 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn draft_roundtrip_acknowledged_opaque() {
+    async fn draft_roundtrip_acknowledgements() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
+        let file_id = state.files[1].id();
 
         let draft_body = json!({
             "revision": 0,
@@ -1124,19 +1210,22 @@ index 1111111..2222222 100644
             "draft": {
                 "concerns": {},
                 "general_comments": [],
-                "acknowledged_opaque": [1]
+                "acknowledgements": [file_id]
             }
         });
         let (status, body) = call(
             app.clone(),
-            put_json(&format!("/api/{TOKEN}/draft"), draft_body),
+            put_json(&format!("/api/{TOKEN}/draft"), draft_body.clone()),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["draft"]["acknowledged_opaque"], json!([1]));
+        assert_eq!(
+            body["draft"]["acknowledgements"],
+            draft_body["draft"]["acknowledgements"]
+        );
     }
 
     /// A save whose response was lost (client timed out, but the server
@@ -1708,7 +1797,7 @@ index 1111111..2222222 100644
         let outcome = state.finished_outcome().unwrap();
         match outcome {
             Outcome::Submitted(r) => {
-                assert_eq!(r.version, 2);
+                assert_eq!(r.version, 3);
                 assert_eq!(r.review.base_ref, "main");
                 assert!(r.review.base_oid.is_none(), "no git behind test sessions");
                 assert_eq!(r.concerns[0].comments.len(), 3);
@@ -1759,7 +1848,7 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn submit_without_opaque_ack_422() {
+    async fn submit_without_acking_required_file_422() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
         let draft = json!({
@@ -1776,13 +1865,14 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn submit_with_opaque_ack_succeeds() {
+    async fn submit_with_all_acks_succeeds() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
+        let file_id = state.files[1].id();
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": [],
-            "acknowledged_opaque": [1]
+            "acknowledgements": [file_id]
         });
         let (status, body) = call(
             app,
@@ -1797,13 +1887,16 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn submit_ack_on_non_opaque_file_422() {
+    async fn ack_on_non_required_file_422() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
+        // files[0] is a plain text file — it never requires an ack.
+        let non_required_id = state.files[0].id();
+        let required_id = state.files[1].id();
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": [],
-            "acknowledged_opaque": [0, 1, 99]
+            "acknowledgements": [non_required_id, required_id]
         });
         let (status, body) = call(
             app,
@@ -1811,6 +1904,24 @@ index 1111111..2222222 100644
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn ack_unknown_file_id_422() {
+        let state = build_opaque_state();
+        let app = build_router(state.clone());
+        let draft = json!({
+            "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+            "general_comments": [],
+            "acknowledgements": ["not-a-real-file-id"]
+        });
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert!(body["details"].to_string().contains("unknown file id"));
     }
 
     /// Regression test for the embedded-asset 404 bug: the wildcard
@@ -2109,6 +2220,198 @@ index 1111111..2222222 100644
         assert!(
             check_head_freshness(&state).await.is_none(),
             "a matching HEAD must not be refused under the short deadline"
+        );
+    }
+
+    /// Builds `n` comments anchored anywhere (anchor validity is irrelevant
+    /// to the resource caps under test here — a violating anchor would just
+    /// add unrelated entries to `details`).
+    fn many_comments(n: usize, prefix: &str) -> Vec<serde_json::Value> {
+        (0..n)
+            .map(|i| json!({"path": "src/app.ts", "side": "new", "line": 1, "body": format!("{prefix}{i}")}))
+            .collect()
+    }
+
+    /// P1-6: the review-wide `MAX_TOTAL_COMMENTS` cap (1000) must be
+    /// enforced even when every per-concern/general count stays under the
+    /// per-field `MAX_COMMENTS` cap (500) — 400 + 400 + 400 general comments
+    /// each individually complies, but their sum (1200) does not.
+    #[tokio::test]
+    async fn total_comment_cap_rejected_in_submit() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let general: Vec<String> = (0..400).map(|i| format!("g{i}")).collect();
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": many_comments(400, "c1-") },
+                "c2": { "verdict": "approve", "comments": many_comments(400, "c2-") },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": general
+        });
+
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert!(
+            body["details"]
+                .to_string()
+                .contains("too many comments across the review"),
+            "body: {body}"
+        );
+    }
+
+    /// P1-6: the review-wide `MAX_TOTAL_COMMENT_CHARS` cap (1,500,000) must
+    /// be enforced even when every comment individually stays at or under
+    /// the per-comment `MAX_COMMENT_CHARS` cap (10,000) and the count stays
+    /// under both `MAX_COMMENTS` and `MAX_TOTAL_COMMENTS` — 200 general
+    /// comments of exactly 10,000 chars each sum to 2,000,000 chars.
+    #[tokio::test]
+    async fn total_chars_cap_rejected() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let body_text = "x".repeat(10_000);
+        let general: Vec<String> = (0..200).map(|_| body_text.clone()).collect();
+        let draft = json!({
+            "concerns": {
+                "c1": { "verdict": "approve", "comments": [] },
+                "c2": { "verdict": "approve", "comments": [] },
+                "_unmapped": { "verdict": "approve", "comments": [] }
+            },
+            "general_comments": general
+        });
+
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert!(
+            body["details"]
+                .to_string()
+                .contains("too many comment characters across the review"),
+            "body: {body}"
+        );
+    }
+
+    /// `PUT /draft` must apply the same resource caps as submit (not the
+    /// full validate_draft — anchors/acks/blanks stay lenient), so a draft
+    /// can never be saved past what the UI advertises as the limits. The
+    /// rejected save must not be applied: revision and stored draft stay
+    /// unchanged.
+    #[tokio::test]
+    async fn put_draft_enforces_total_caps() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let general: Vec<String> = (0..1001).map(|i| format!("g{i}")).collect();
+        let draft_body = json!({
+            "revision": 0,
+            "mutation_id": "over-cap-save",
+            "draft": { "concerns": {}, "general_comments": general }
+        });
+        let (status, body) = call(
+            app.clone(),
+            put_json(&format!("/api/{TOKEN}/draft"), draft_body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "draft exceeds limits");
+
+        // The rejected save must not have been applied.
+        let (_, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(body["draft_revision"], 0);
+        assert_eq!(body["draft"]["general_comments"], serde_json::json!([]));
+    }
+
+    /// P1-6: a draft sitting at every advertised limit at once must still
+    /// serialize under `MAX_BODY_BYTES` (8 MiB) — the whole point of the
+    /// review-wide totals is to make the per-field limits (which alone
+    /// permit a wildly un-submittable draft) actually wire-consistent.
+    ///
+    /// The 4-bytes/scalar figure this check uses is the worst case for
+    /// UNESCAPED scalars, not an absolute one: JSON serializers escape C0
+    /// controls other than `\n\t\r\b\f` as `\u00XX` (6 bytes), so escape-heavy
+    /// drafts aren't bounded by `MAX_TOTAL_COMMENT_CHARS` — they're bounded
+    /// instead by the client's byte meter and the server's 8 MiB 413.
+    #[test]
+    fn limits_are_wire_consistent() {
+        // Worst-case UTF-8 byte cost per unescaped Unicode scalar (an
+        // astral-plane character costs 4 bytes) must still leave headroom
+        // under the request body cap once every comment is packed to the
+        // review-wide character cap — the arithmetic half of the
+        // consistency check.
+        let worst_case_bytes = crate::session::MAX_TOTAL_COMMENT_CHARS * 4;
+        assert!(
+            worst_case_bytes < MAX_BODY_BYTES,
+            "worst-case (4 bytes/scalar) total comment bytes {worst_case_bytes} must fit \
+             under MAX_BODY_BYTES ({MAX_BODY_BYTES})"
+        );
+
+        // The concrete half: an actual maximal-but-compliant draft — every
+        // one of MAX_TOTAL_COMMENTS comments present, spread across two
+        // buckets so each stays within the per-field MAX_COMMENTS cap, with
+        // bodies sized so the total character count hits
+        // MAX_TOTAL_COMMENT_CHARS exactly — measured for its real
+        // serialized size (JSON structure/keys/punctuation included, not
+        // just the raw character payload the arithmetic check above covers).
+        assert_eq!(
+            crate::session::MAX_TOTAL_COMMENTS,
+            2 * crate::session::MAX_COMMENTS,
+            "the draft built below assumes the total cap is exactly two per-field buckets"
+        );
+        let per_comment_chars =
+            crate::session::MAX_TOTAL_COMMENT_CHARS / crate::session::MAX_TOTAL_COMMENTS;
+        let body_text = "x".repeat(per_comment_chars);
+        let comment = || crate::model::Comment {
+            path: "src/app.ts".to_string(),
+            side: crate::model::Side::New,
+            line: 1,
+            body: body_text.clone(),
+        };
+        let mut concerns = std::collections::HashMap::new();
+        concerns.insert(
+            "c1".to_string(),
+            crate::session::ConcernDraft {
+                verdict: Some(crate::model::Verdict::Approve),
+                comments: (0..crate::session::MAX_COMMENTS)
+                    .map(|_| comment())
+                    .collect(),
+            },
+        );
+        let general_comments: Vec<String> = (0..crate::session::MAX_COMMENTS)
+            .map(|_| body_text.clone())
+            .collect();
+        let draft = crate::session::Draft {
+            concerns,
+            general_comments,
+            acknowledgements: Vec::new(),
+        };
+
+        let total_chars: usize = draft
+            .concerns
+            .values()
+            .flat_map(|cd| cd.comments.iter())
+            .map(|c| c.body.chars().count())
+            .chain(draft.general_comments.iter().map(|g| g.chars().count()))
+            .sum();
+        assert!(
+            total_chars <= crate::session::MAX_TOTAL_COMMENT_CHARS,
+            "test draft must itself respect the cap it's exercising: {total_chars} chars"
+        );
+
+        let serialized = serde_json::to_string(&draft).unwrap();
+        assert!(
+            serialized.len() < MAX_BODY_BYTES,
+            "a draft at every advertised limit serialized to {} bytes, expected under \
+             MAX_BODY_BYTES ({MAX_BODY_BYTES})",
+            serialized.len()
         );
     }
 }

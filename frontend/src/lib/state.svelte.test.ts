@@ -41,9 +41,15 @@ function makeSession(): Session {
     files: [],
     concerns: [],
     warnings: [],
-    draft: { concerns: {}, general_comments: [], acknowledged_opaque: [] },
+    draft: { concerns: {}, general_comments: [], acknowledgements: [] },
     draft_revision: 3,
-    limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
+    limits: {
+      max_comments: 500,
+      max_comment_chars: 10_000,
+      max_total_comments: 1000,
+      max_total_comment_chars: 1_500_000,
+      max_draft_bytes: 8 * 1024 * 1024,
+    },
     finished: null,
     unmapped_lines: [],
   }
@@ -488,7 +494,7 @@ describe('outcome-unknown recovery', () => {
 
     expect(rs.phase).toBe('outcome_unknown')
     // The local draft must survive so the user can still copy it out.
-    expect(rs.draft).toEqual({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
+    expect(rs.draft).toEqual({ concerns: {}, general_comments: [], acknowledgements: [] })
   })
 
   it('submit_failure_with_session_still_reviewing_shows_retryable_error', async () => {
@@ -633,5 +639,114 @@ describe('hunkOwners owner index', () => {
   it('hunkOwners on an unloaded store returns an empty list, not a throw', () => {
     const rs = new ReviewState()
     expect(rs.hunkOwners(ref(0, 0))).toEqual([])
+  })
+})
+
+// P1-6: the draft's wire byte size (JSON.stringify + UTF-8 bytes) must be
+// tracked against limits.max_draft_bytes so the UI can warn/block before a
+// draft grows past what PUT /draft will now refuse server-side (see
+// resource_cap_violations in session.rs). A tiny max_draft_bytes here makes
+// the thresholds reachable with a couple of ordinary-sized comments instead
+// of megabytes of fixture data.
+describe('draft byte-size limits (P1-6)', () => {
+  async function loadedStateWithByteLimit(maxBytes: number): Promise<ReviewState> {
+    fetchSessionMock.mockResolvedValue({
+      ...makeSession(),
+      limits: { ...makeSession().limits, max_draft_bytes: maxBytes },
+    })
+    const rs = new ReviewState()
+    await rs.load()
+    return rs
+  }
+
+  // With max_draft_bytes = 320: an empty draft serializes to 59 bytes, a
+  // single 230-char general comment to 291 bytes (>= 90% = 288, < 320 —
+  // warning without blocking), and a single 260-char comment to 321 bytes
+  // (>= 320 — blocked). These exact sizes are JSON.stringify + TextEncoder
+  // output, not tuned constants — see the byte-size getters' doc comments
+  // in state.svelte.ts for what's actually measured.
+  const BYTE_LIMIT = 320
+
+  it('byte_measure_warns_at_90_percent', async () => {
+    const rs = await loadedStateWithByteLimit(BYTE_LIMIT)
+
+    // An empty draft's JSON is well under 90% of the cap.
+    expect(rs.draftByteWarning).toBe(false)
+
+    rs.addGeneralComment('x'.repeat(230))
+    expect(rs.draftByteSize).toBeGreaterThanOrEqual(BYTE_LIMIT * 0.9)
+    expect(rs.draftByteSize).toBeLessThan(BYTE_LIMIT)
+    expect(rs.draftByteWarning).toBe(true)
+    expect(rs.draftByteBlocked).toBe(false)
+  })
+
+  it('draft_byte_size_blocks_at_limit', async () => {
+    const rs = await loadedStateWithByteLimit(BYTE_LIMIT)
+
+    rs.addGeneralComment('x'.repeat(260))
+    expect(rs.draftByteSize).toBeGreaterThanOrEqual(BYTE_LIMIT)
+    expect(rs.draftByteBlocked).toBe(true)
+
+    // Further growth is refused once blocked — both a new general comment
+    // and a new concern comment.
+    const countBefore = rs.draft.general_comments.length
+    rs.addGeneralComment('one more comment')
+    expect(rs.draft.general_comments.length).toBe(countBefore)
+
+    rs.addComment('c1', { path: 'a.ts', side: 'new', line: 1, body: 'blocked too' })
+    expect(rs.draft.concerns.c1).toBeUndefined()
+  })
+
+  it('removing content un-blocks further additions', async () => {
+    const rs = await loadedStateWithByteLimit(BYTE_LIMIT)
+    rs.addGeneralComment('x'.repeat(260))
+    expect(rs.draftByteBlocked).toBe(true)
+
+    rs.removeGeneralComment(0)
+    expect(rs.draftByteBlocked).toBe(false)
+    rs.addGeneralComment('short')
+    expect(rs.draft.general_comments).toEqual(['short'])
+  })
+
+  it('totalCommentCount and totalCommentChars sum concern and general comments using scalar counts', async () => {
+    const rs = await loadedStateWithByteLimit(8 * 1024 * 1024)
+    rs.addGeneralComment('😀😀')
+    rs.addComment('c1', { path: 'a.ts', side: 'new', line: 1, body: 'abc' })
+
+    expect(rs.totalCommentCount).toBe(2)
+    // '😀😀' is 2 Unicode scalars (4 UTF-16 units) + 'abc' is 3 scalars.
+    expect(rs.totalCommentChars).toBe(5)
+  })
+})
+
+// `max_total_comments`/`max_total_comment_chars` can be hit far below
+// `max_draft_bytes` (1000 short comments is nowhere near 8 MiB); without a
+// client-side gate on these too, the first sign was a failing autosave.
+describe('total comment/char caps', () => {
+  it('add_blocked_at_total_comment_cap', async () => {
+    const rs = await loadedState()
+    for (let i = 0; i < rs.limits!.max_total_comments; i++) rs.addGeneralComment(`c${i}`)
+
+    expect(rs.totalCommentCount).toBe(rs.limits!.max_total_comments)
+    expect(rs.totalCapBlocked).toBe(true)
+
+    rs.addGeneralComment('one more')
+    expect(rs.totalCommentCount).toBe(rs.limits!.max_total_comments)
+    rs.addComment('c1', { path: 'a.ts', side: 'new', line: 1, body: 'blocked too' })
+    expect(rs.draft.concerns.c1).toBeUndefined()
+  })
+
+  it('total_cap_warning_at_90_percent', async () => {
+    const rs = await loadedState()
+    const ninety = Math.ceil(rs.limits!.max_total_comments * 0.9)
+    for (let i = 0; i < ninety - 1; i++) rs.addGeneralComment(`c${i}`)
+
+    expect(rs.totalCapWarning).toBe(false)
+    expect(rs.totalCapBlocked).toBe(false)
+
+    rs.addGeneralComment('one more')
+    expect(rs.totalCommentCount).toBe(ninety)
+    expect(rs.totalCapWarning).toBe(true)
+    expect(rs.totalCapBlocked).toBe(false)
   })
 })

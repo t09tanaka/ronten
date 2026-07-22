@@ -8,6 +8,7 @@ function makeFile(
   change_kind: ChangeKind = 'modified',
 ): FileDiff {
   return {
+    id: 'test-file-id',
     old_path,
     new_path,
     change_kind,
@@ -22,6 +23,8 @@ function makeFile(
     new_size: null,
     lfs_pointer: false,
     hunks: [],
+    ack_required: false,
+    ack_reasons: [],
   }
 }
 

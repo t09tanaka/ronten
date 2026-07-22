@@ -166,7 +166,7 @@ fn approve_all_exits_0() {
     assert_eq!(result["decision"], "approve");
     assert_eq!(result["concerns"].as_array().unwrap().len(), 2);
     // The result carries the output contract version.
-    assert_eq!(result["version"], 2);
+    assert_eq!(result["version"], 3);
 }
 
 /// stdout of `git <args>` in `dir`, trimmed.
@@ -221,6 +221,264 @@ fn result_pins_reviewed_commits_and_inputs() {
         !review["session_id"].as_str().unwrap().is_empty(),
         "session_id must be present"
     );
+}
+
+/// Concerns matching [`fixture_repo_with_opaque_files`]: `edit`/`add` cover
+/// the plain-text files exactly like [`CONCERNS`], plus `opaque` claiming
+/// each opaque file whole (a path-only location with no `start`/`end`), so
+/// none of them fall into the `_unmapped` bucket.
+const CONCERNS_WITH_OPAQUE: &str = r#"{"version":1,"concerns":[
+  {"id":"edit","title":"Edit a.txt","risk":"low","locations":[{"path":"a.txt"}]},
+  {"id":"add","title":"Add b.txt","risk":"medium","locations":[{"path":"b.txt"}]},
+  {"id":"opaque","title":"Opaque files","risk":"high","locations":[
+    {"path":"binary.bin"},{"path":"data.dat"},{"path":"huge.txt"}]}]}"#;
+
+/// Like [`fixture_repo`], plus a binary file modified, a Git-LFS pointer
+/// file modified, and a >1MB text file added — one of each opaque-content
+/// kind `result_v3_lists_files_with_omission_reasons` needs to see reflected
+/// in the result JSON's `files[]`.
+fn fixture_repo_with_opaque_files() -> tempfile::TempDir {
+    let td = tempfile::tempdir().unwrap();
+    let d = td.path();
+    git(d, &["init", "-b", "main"]);
+    git(d, &["config", "user.email", "t@example.com"]);
+    git(d, &["config", "user.name", "t"]);
+    std::fs::write(d.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(d.join("binary.bin"), b"\x00\x01\x02old-bytes").unwrap();
+    std::fs::write(
+        d.join("data.dat"),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:aaaa\nsize 100\n",
+    )
+    .unwrap();
+    git(d, &["add", "."]);
+    git(d, &["commit", "-m", "base"]);
+    git(d, &["checkout", "-b", "feature"]);
+    std::fs::write(d.join("a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+    std::fs::write(d.join("b.txt"), "new file\n").unwrap();
+    std::fs::write(d.join("binary.bin"), b"\x00\x01\x02new-bytes-here").unwrap();
+    std::fs::write(
+        d.join("data.dat"),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:bbbb\nsize 200\n",
+    )
+    .unwrap();
+    std::fs::write(d.join("huge.txt"), "x".repeat(1_048_576 + 1)).unwrap();
+    git(d, &["add", "."]);
+    git(d, &["commit", "-m", "change"]);
+    std::fs::write(d.join("concerns.json"), CONCERNS_WITH_OPAQUE).unwrap();
+    td
+}
+
+/// Looks up a `GET /session` file entry by path (either side) and returns
+/// its server-computed `id`.
+fn file_id_for(session: &serde_json::Value, path: &str) -> String {
+    session["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["new_path"] == path || f["old_path"] == path)
+        .unwrap_or_else(|| panic!("no file with path {path} in session payload"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// P1-1: the result JSON must let a standalone reader reconstruct which
+/// files existed and what was omitted from rendering, without re-running the
+/// diff — `files[]` covers a plain text file (rendered) alongside binary,
+/// Git-LFS-pointer, and too-large files (each not rendered, with the
+/// matching `omission_reason`).
+#[test]
+fn result_v3_lists_files_with_omission_reasons() {
+    let td = fixture_repo_with_opaque_files();
+    let (child, url) = spawn_review(td.path(), &[]);
+    let api = api_base(&url);
+
+    let (status, session) = common::get_json(&format!("{api}/session"));
+    assert_eq!(status, 200);
+    let ack_ids: Vec<serde_json::Value> = ["binary.bin", "data.dat", "huge.txt"]
+        .iter()
+        .map(|p| serde_json::Value::String(file_id_for(&session, p)))
+        .collect();
+
+    let draft = serde_json::json!({
+        "revision": 0,
+        "mutation_id": "it-omission",
+        "draft": {
+            "concerns": {
+                "edit": {"verdict": "approve", "comments": []},
+                "add": {"verdict": "approve", "comments": []},
+                "opaque": {"verdict": "approve", "comments": []}
+            },
+            "general_comments": [],
+            "acknowledgements": ack_ids
+        }
+    });
+    let (status, body) = submit_raw(&url, draft);
+    assert_eq!(status, 200, "body: {body}");
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let files = result["files"].as_array().unwrap();
+
+    let find = |path: &str| -> &serde_json::Value {
+        files
+            .iter()
+            .find(|f| f["new_path"] == path || f["old_path"] == path)
+            .unwrap_or_else(|| panic!("no file audit entry for {path}: {files:?}"))
+    };
+
+    let a = find("a.txt");
+    assert_eq!(a["content_kind"], "text");
+    assert_eq!(a["rendered"], true);
+    assert!(a["omission_reason"].is_null());
+
+    let binary = find("binary.bin");
+    assert_eq!(binary["content_kind"], "binary");
+    assert_eq!(binary["rendered"], false);
+    assert_eq!(binary["omission_reason"], "binary");
+
+    let lfs = find("data.dat");
+    assert_eq!(lfs["content_kind"], "text");
+    assert_eq!(lfs["rendered"], false);
+    assert_eq!(lfs["omission_reason"], "lfs_pointer");
+
+    let huge = find("huge.txt");
+    assert_eq!(huge["content_kind"], "too-large");
+    assert_eq!(huge["rendered"], false);
+    assert_eq!(huge["omission_reason"], "too_large");
+
+    // Every file audit entry carries a stable id matching the session
+    // payload's own file ids.
+    for path in ["a.txt", "b.txt", "binary.bin", "data.dat", "huge.txt"] {
+        assert_eq!(
+            find(path)["file_id"],
+            serde_json::Value::String(file_id_for(&session, path)),
+            "file_id mismatch for {path}"
+        );
+    }
+}
+
+/// P1-1: acknowledging a required file must be recorded in the result JSON
+/// with the file id, the server-computed reasons acknowledgement was
+/// required, and a timestamp — so a standalone reader can tell what was
+/// acked and why without re-deriving the ack policy itself.
+#[test]
+fn result_v3_records_acknowledgements_with_reasons() {
+    let td = fixture_repo_with_opaque_files();
+    let (child, url) = spawn_review(td.path(), &[]);
+    let api = api_base(&url);
+
+    let (status, session) = common::get_json(&format!("{api}/session"));
+    assert_eq!(status, 200);
+    let binary_id = file_id_for(&session, "binary.bin");
+    let lfs_id = file_id_for(&session, "data.dat");
+    let huge_id = file_id_for(&session, "huge.txt");
+
+    let draft = serde_json::json!({
+        "revision": 0,
+        "mutation_id": "it-ack",
+        "draft": {
+            "concerns": {
+                "edit": {"verdict": "approve", "comments": []},
+                "add": {"verdict": "approve", "comments": []},
+                "opaque": {"verdict": "approve", "comments": []}
+            },
+            "general_comments": [],
+            "acknowledgements": [binary_id.clone(), lfs_id.clone(), huge_id.clone()]
+        }
+    });
+    let (status, body) = submit_raw(&url, draft);
+    assert_eq!(status, 200, "body: {body}");
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let acks = result["acknowledgements"].as_array().unwrap();
+    assert_eq!(acks.len(), 3, "acknowledgements: {acks:?}");
+
+    let find = |id: &str| -> &serde_json::Value {
+        acks.iter()
+            .find(|a| a["file_id"] == id)
+            .unwrap_or_else(|| panic!("no acknowledgement for file id {id}: {acks:?}"))
+    };
+
+    let binary_ack = find(&binary_id);
+    assert_eq!(binary_ack["reasons"], serde_json::json!(["opaque-content"]));
+    let acked_at = binary_ack["acknowledged_at"].as_str().unwrap();
+    assert!(
+        acked_at.contains('T'),
+        "acknowledged_at must be RFC3339: {acked_at}"
+    );
+    // Recorded at submit time (no per-ack tracking), same instant across
+    // every acknowledgement in this submit.
+    assert_eq!(acked_at, result["submitted_at"]);
+
+    let lfs_ack = find(&lfs_id);
+    assert_eq!(lfs_ack["reasons"], serde_json::json!(["lfs-pointer"]));
+
+    let huge_ack = find(&huge_id);
+    assert_eq!(huge_ack["reasons"], serde_json::json!(["opaque-content"]));
+
+    // Files never acknowledged (a.txt, b.txt) must not appear.
+    assert!(
+        !acks
+            .iter()
+            .any(|a| a["file_id"] == file_id_for(&session, "a.txt")),
+        "a.txt was never acknowledged and must not appear: {acks:?}"
+    );
+}
+
+/// P1-1: `--dirty-policy ignore` must not silently claim the worktree was
+/// clean — the result records that the check never ran.
+#[test]
+fn result_v3_worktree_ignore_is_not_clean() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &["--dirty-policy", "ignore"]);
+
+    let (status, _) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let worktree = &result["worktree"];
+    assert_eq!(worktree["policy"], "ignore");
+    assert_eq!(
+        worktree["checked_at_start"], false,
+        "ignore policy must never claim the worktree was checked: {worktree}"
+    );
+    assert_eq!(
+        worktree["clean_at_start"], false,
+        "an unchecked worktree must never be recorded as clean: {worktree}"
+    );
+}
+
+/// P1-1: the worktree is re-checked at submit (not just at session start),
+/// so a change that happened mid-review is reflected in the audit too.
+#[test]
+fn result_v3_worktree_rechecked_at_submit() {
+    let td = fixture_repo();
+    std::fs::write(td.path().join("a.txt"), "one\nTWO\nthree\nfour\nfive\n").unwrap();
+    let (child, url) = spawn_review(td.path(), &["--dirty-policy", "warn"]);
+
+    let (status, _) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let worktree = &result["worktree"];
+    assert_eq!(worktree["policy"], "warn");
+    assert_eq!(worktree["checked_at_start"], true);
+    assert_eq!(worktree["clean_at_start"], false);
+    assert_eq!(
+        worktree["checked_at_submit"], true,
+        "submit must re-run the worktree check under warn policy: {worktree}"
+    );
+    // The dirty file is untouched between start and submit, so the re-check
+    // agrees with the start-time result.
+    assert_eq!(worktree["clean_at_submit"], false);
 }
 
 /// Posts `draft` to `/submit` and returns `(status, body)` without treating
@@ -1325,6 +1583,57 @@ fn reserved_id_exits_10() {
         ],
     );
     assert_eq!(code, 10);
+}
+
+/// `review`'s startup validation and `ronten validate-concerns` share the
+/// same `mapping::validate_concerns` semantic validator (see the P1-3 fix):
+/// this fixture drives an invalid concerns file through both entry points
+/// and asserts the *same* failure — the reserved `_unmapped` id — surfaces
+/// from each, just formatted differently (`review` prints one human-readable
+/// stderr line; `validate-concerns` emits a structured `errors` array).
+#[test]
+fn review_and_validate_concerns_agree_on_reserved_id() {
+    let td = fixture_repo();
+    let reserved = r#"{"version":1,"concerns":[
+      {"id":"_unmapped","title":"nope","risk":"low","locations":[{"path":"a.txt"}]}]}"#;
+    std::fs::write(td.path().join("reserved.json"), reserved).unwrap();
+
+    // `ronten validate-concerns`: structured, machine-readable.
+    let validate_out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args(["validate-concerns", "reserved.json"])
+        .output()
+        .unwrap();
+    assert_eq!(validate_out.status.code(), Some(10));
+    let v: serde_json::Value = serde_json::from_slice(&validate_out.stdout).unwrap();
+    assert_eq!(v["valid"], false);
+    let errors = v["errors"].as_array().unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e["code"] == "RESERVED_CONCERN_ID" && e["concern_id"] == "_unmapped"),
+        "validate-concerns should report RESERVED_CONCERN_ID for _unmapped: {errors:?}"
+    );
+
+    // `ronten review`: same validator, human-readable stderr, same exit code.
+    let review_out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "reserved.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(review_out.status.code(), Some(10));
+    let stderr = String::from_utf8(review_out.stderr).unwrap();
+    assert!(
+        stderr.contains("_unmapped") && stderr.contains("reserved"),
+        "review's stderr should describe the same reserved-id failure: {stderr}"
+    );
 }
 
 /// The concerns file is untrusted input, and `validate_concerns` interpolates

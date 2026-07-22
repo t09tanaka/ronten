@@ -51,6 +51,13 @@ pub async fn run(args: DemoArgs) -> u8 {
         session_id: new_token(),
         snapshot,
         repo_root: None,
+        // The demo has no repository (and no `--dirty-policy`) behind it —
+        // there is nothing to check, so `"ignore"` is the honest wire value
+        // rather than defaulting to `"error"`/`"warn"` and implying a check
+        // that never runs.
+        dirty_policy: "ignore".to_string(),
+        worktree_start: crate::session::WorktreeStartAudit::default(),
+        worktree_exempt_path: None,
         started_at: chrono::Utc::now(),
         deadline_at: None,
         phase: Mutex::new(Phase::Reviewing(DraftSlot::default())),

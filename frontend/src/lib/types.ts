@@ -37,7 +37,27 @@ export type ContentKind = 'text' | 'binary' | 'non-utf8' | 'too-large'
  * "text" content while being a different kind of object entirely. */
 export type FileType = 'regular' | 'executable' | 'symlink' | 'gitlink'
 
+/** Why a file requires an explicit reviewer acknowledgement before submit —
+ * server-computed (see `FileDiff::ack_reasons` in gitdiff.rs), the ONE
+ * place this policy is defined. The frontend only displays these, it must
+ * never recompute them (that used to drift between Rust and TypeScript,
+ * P0-5). */
+export type AckReason =
+  | 'opaque-content'
+  | 'gitlink-changed'
+  | 'mode-changed'
+  | 'added-symlink'
+  | 'deleted-symlink'
+  | 'added-executable'
+  | 'regular-to-symlink'
+  | 'lfs-pointer'
+  | 'submodule-pointer'
+
 export interface FileDiff {
+  /** Stable, index-independent identifier for this file (see
+   * `FileDiff::id` in gitdiff.rs) — what `Draft.acknowledgements` keys off
+   * of, instead of a fragile array index. */
+  id: string
   old_path: string | null
   new_path: string | null
   change_kind: ChangeKind
@@ -54,6 +74,14 @@ export interface FileDiff {
    * not the actual content. */
   lfs_pointer: boolean
   hunks: Hunk[]
+  /** Whether submit requires an explicit acknowledgement of this file —
+   * `true` iff `ack_reasons` is non-empty. Server-computed; do not
+   * recompute client-side. */
+  ack_required: boolean
+  /** Every reason this file requires an acknowledgement (may be more than
+   * one, e.g. opaque content AND a mode change — acknowledging once covers
+   * all of them). Empty when `ack_required` is false. */
+  ack_reasons: AckReason[]
 }
 
 export interface HunkRef {
@@ -94,7 +122,9 @@ export interface ConcernDraft {
 export interface Draft {
   concerns: Record<string, ConcernDraft>
   general_comments: string[]
-  acknowledged_opaque: number[]
+  /** `FileDiff.id` of every file the reviewer explicitly acknowledged (see
+   * `FileDiff.ack_required`/`ack_reasons`). */
+  acknowledgements: string[]
 }
 
 /** A structured warning surfaced to the reviewer (see model.rs). `path` /
@@ -112,6 +142,14 @@ export interface Warning {
 export interface Limits {
   max_comments: number
   max_comment_chars: number
+  /** Review-wide cap on the total number of comments across every concern
+   * plus general comments — not just the per-concern/per-general
+   * `max_comments` above (see `MAX_TOTAL_COMMENTS` in session.rs, P1-6). */
+  max_total_comments: number
+  /** Review-wide cap on the summed character length of every comment body
+   * (same Unicode-scalar counting as `max_comment_chars`) — see
+   * `MAX_TOTAL_COMMENT_CHARS` in session.rs, P1-6. */
+  max_total_comment_chars: number
   max_draft_bytes: number
 }
 

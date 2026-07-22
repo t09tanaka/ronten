@@ -3,7 +3,7 @@
 import { SvelteMap } from 'svelte/reactivity'
 import { abortSession, fetchSession, saveDraft, submit } from './api'
 import { isVerdictConfirmed } from './confirmation'
-import { requiresAck } from './opaque'
+import { scalarLength } from './textLimits'
 import type {
   Comment,
   ConcernDraft,
@@ -74,7 +74,7 @@ export function commentTargetKey(concernId: string, t: CommentTarget): string {
 
 export class ReviewState {
   session = $state<Session | null>(null)
-  draft = $state<Draft>({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
+  draft = $state<Draft>({ concerns: {}, general_comments: [], acknowledgements: [] })
   selectedIdx = $state(0)
   phase = $state<Phase>('loading')
   submitting = $state(false)
@@ -117,6 +117,85 @@ export class ReviewState {
     return this.session?.limits ?? null
   }
 
+  /** Bytes the draft would take on the wire — `JSON.stringify` + UTF-8 byte
+   * count via `TextEncoder`, the same measure `PUT /draft`'s body-size cap
+   * (`limits.max_draft_bytes`) is checked against server-side. Recomputed
+   * from `this.draft` on every access, but that's cheap in practice:
+   * `draft` itself only changes on a committed mutation (add/remove
+   * comment, set verdict, toggle ack), never on every keystroke — in-
+   * progress text lives in `editorBuffers` instead (see its own doc
+   * comment), so this never runs on a keystroke cadence. */
+  get draftByteSize(): number {
+    return new TextEncoder().encode(JSON.stringify(this.draft)).length
+  }
+
+  /** `draftByteSize` / `limits.max_draft_bytes`, or `null` before the
+   * session (and its limits) has loaded. */
+  get draftByteUsageRatio(): number | null {
+    const max = this.limits?.max_draft_bytes
+    if (!max) return null
+    return this.draftByteSize / max
+  }
+
+  /** True once the draft is within 10% of the wire body-size cap — the UI
+   * should warn but not yet block. */
+  get draftByteWarning(): boolean {
+    return (this.draftByteUsageRatio ?? 0) >= 0.9
+  }
+
+  /** True once the draft is at (or over) the wire body-size cap —
+   * `addComment`/`addGeneralComment` refuse further growth while this is
+   * true, so a draft this store holds can never itself become
+   * unsubmittable on size grounds alone. */
+  get draftByteBlocked(): boolean {
+    return (this.draftByteUsageRatio ?? 0) >= 1
+  }
+
+  /** Total comments across every concern plus general comments — what the
+   * server checks against `limits.max_total_comments` (see
+   * `MAX_TOTAL_COMMENTS` in session.rs, P1-6). */
+  get totalCommentCount(): number {
+    let n = this.draft.general_comments.length
+    for (const cd of Object.values(this.draft.concerns)) n += cd.comments.length
+    return n
+  }
+
+  /** Total comment-body characters (Unicode scalars, matching the server's
+   * `chars().count()`) across every concern plus general comments — what
+   * the server checks against `limits.max_total_comment_chars`. */
+  get totalCommentChars(): number {
+    let n = 0
+    for (const g of this.draft.general_comments) n += scalarLength(g)
+    for (const cd of Object.values(this.draft.concerns)) {
+      for (const c of cd.comments) n += scalarLength(c.body)
+    }
+    return n
+  }
+
+  /** True once `totalCommentCount`/`totalCommentChars` has reached (or
+   * passed) `limits.max_total_comments`/`max_total_comment_chars` — these
+   * review-wide caps can be hit far below `draftByteBlocked`'s 8 MiB, and
+   * without this gate the first sign of it was a failing autosave.
+   * `addComment`/`addGeneralComment` refuse further growth while this is
+   * true, same as `draftByteBlocked`. */
+  get totalCapBlocked(): boolean {
+    if (!this.limits) return false
+    return (
+      this.totalCommentCount >= this.limits.max_total_comments ||
+      this.totalCommentChars >= this.limits.max_total_comment_chars
+    )
+  }
+
+  /** True once either total cap is within 10% of being reached — mirrors
+   * `draftByteWarning` but for the comment-count/char caps. */
+  get totalCapWarning(): boolean {
+    if (!this.limits) return false
+    return (
+      this.totalCommentCount >= this.limits.max_total_comments * 0.9 ||
+      this.totalCommentChars >= this.limits.max_total_comment_chars * 0.9
+    )
+  }
+
   get selected(): ConcernView | null {
     return this.session?.concerns[this.selectedIdx] ?? null
   }
@@ -153,24 +232,25 @@ export class ReviewState {
     return this.session != null && this.reviewedCount === this.session.concerns.length
   }
 
-  isAcked(fileIndex: number): boolean {
-    return this.draft.acknowledged_opaque.includes(fileIndex)
+  isAcked(fileId: string): boolean {
+    return this.draft.acknowledgements.includes(fileId)
   }
 
-  toggleAck(fileIndex: number): void {
+  toggleAck(fileId: string): void {
     if (this.#locked) return
-    const i = this.draft.acknowledged_opaque.indexOf(fileIndex)
-    if (i >= 0) this.draft.acknowledged_opaque.splice(i, 1)
-    else this.draft.acknowledged_opaque.push(fileIndex)
+    const i = this.draft.acknowledgements.indexOf(fileId)
+    if (i >= 0) this.draft.acknowledgements.splice(i, 1)
+    else this.draft.acknowledgements.push(fileId)
     this.scheduleSave()
   }
 
   /** Files that can't be judged from the rendered diff body alone (opaque
-   * content, gitlink, mode change — see requiresAck) need an explicit ack
-   * instead of a verdict-driven confirmation. */
-  get allOpaqueAcked(): boolean {
+   * content, gitlink, mode change, added/deleted symlink, new executable,
+   * LFS pointer — see `FileDiff.ack_reasons`, server-computed) need an
+   * explicit ack instead of a verdict-driven confirmation. */
+  get allAcked(): boolean {
     if (!this.session) return true
-    return this.session.files.every((f, i) => !requiresAck(f) || this.isAcked(i))
+    return this.session.files.every((f) => !f.ack_required || this.isAcked(f.id))
   }
 
   /** `'file:hunk'` -> owning concern ids, built once per session load rather
@@ -260,7 +340,7 @@ export class ReviewState {
   }
 
   addComment(id: string, c: Comment): void {
-    if (this.#locked) return
+    if (this.#locked || this.draftByteBlocked || this.totalCapBlocked) return
     this.#ensureConcernDraft(id).comments.push(c)
     this.scheduleSave()
   }
@@ -272,7 +352,7 @@ export class ReviewState {
   }
 
   addGeneralComment(body: string): void {
-    if (this.#locked) return
+    if (this.#locked || this.draftByteBlocked || this.totalCapBlocked) return
     const trimmed = body.trim()
     if (!trimmed) return
     this.draft.general_comments.push(trimmed)
@@ -290,19 +370,17 @@ export class ReviewState {
     try {
       const session = await fetchSession()
       this.session = session
-      // Older drafts predate acknowledged_opaque — default it so allOpaqueAcked
-      // and toggleAck can assume the array always exists. The lenient PUT
+      // Older drafts predate acknowledgements — default it so allAcked and
+      // toggleAck can assume the array always exists. The lenient PUT
       // /draft endpoint can also have persisted unknown/stale/duplicate
-      // indices (e.g. from a stale client); normalize to the set of file
-      // indices that actually require an ack so the UI can't get stuck
-      // unrecoverable on bad saved state.
-      const ackIdx = new Set(
-        session.files.map((f, i) => (requiresAck(f) ? i : -1)).filter((i) => i >= 0),
+      // ids (e.g. from a stale client); normalize to the set of file ids
+      // the server currently reports as requiring an ack so the UI can't
+      // get stuck unrecoverable on bad saved state.
+      const ackIds = new Set(session.files.filter((f) => f.ack_required).map((f) => f.id))
+      const acked = [...new Set(session.draft.acknowledgements ?? [])].filter((id) =>
+        ackIds.has(id),
       )
-      const acked = [...new Set(session.draft.acknowledged_opaque ?? [])].filter((i) =>
-        ackIdx.has(i),
-      )
-      this.draft = { ...session.draft, acknowledged_opaque: acked }
+      this.draft = { ...session.draft, acknowledgements: acked }
       this.#revision = session.draft_revision
       this.selectedIdx = 0
       this.phase = phaseForFinished(session.finished)

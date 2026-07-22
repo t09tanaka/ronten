@@ -9,6 +9,7 @@
   import { renderMarkdown } from './lib/markdown'
   import { focusGeneralComments } from './lib/scroll'
   import { formatCountdown, remainingMs } from './lib/countdown'
+  import { scalarLength, truncateToScalars } from './lib/textLimits'
   import type { Verdict } from './lib/types'
 
   onMount(() => {
@@ -204,7 +205,7 @@
         e.preventDefault()
         if (showSubmitConfirm) {
           void confirmSubmit()
-        } else if (!confirmOpen && rs.allReviewed && rs.allOpaqueAcked) {
+        } else if (!confirmOpen && rs.allReviewed && rs.allAcked) {
           openSubmitConfirm()
         }
         break
@@ -225,11 +226,33 @@
 
   const maxCommentChars = $derived(rs.limits?.max_comment_chars)
 
+  /** Which review-wide limit(s) are currently at/near their cap, for the
+   * shared limits banner below — names the limit instead of just failing
+   * autosave with "Save failed" once `totalCapBlocked` is hit (see
+   * `totalCapBlocked`/`totalCapWarning` doc comments in state.svelte.ts). */
+  const limitsBannerReasons = $derived.by((): string[] => {
+    const reasons: string[] = []
+    const limits = rs.limits
+    if (limits && rs.totalCommentCount >= limits.max_total_comments * 0.9) reasons.push('comment count')
+    if (limits && rs.totalCommentChars >= limits.max_total_comment_chars * 0.9) reasons.push('characters')
+    if (rs.draftByteWarning) reasons.push('size')
+    return reasons
+  })
+
+  // Truncates by Unicode scalar count, matching the server's
+  // `chars().count()` — see CommentEditor.svelte's identical helper (P1-6).
+  function setGeneralCommentText(v: string): void {
+    rs.setEditorBuffer(
+      GENERAL_BUFFER_KEY,
+      maxCommentChars != null ? truncateToScalars(v, maxCommentChars) : v,
+    )
+  }
+
   const submitTitle = $derived(
     !rs.allReviewed
       ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
-      : !rs.allOpaqueAcked
-        ? 'Acknowledge all flagged changes (undisplayed contents, mode or submodule changes) to submit'
+      : !rs.allAcked
+        ? "Acknowledge every change that can't be fully reviewed to submit"
         : 'Submit review',
   )
 </script>
@@ -264,6 +287,14 @@
             >{remainingCountdown}</span
           >
         {/if}
+        {#if rs.limits}
+          <span
+            class="usage-indicator"
+            title="Comments / characters used across the whole review, against the server's review-wide limits"
+            >{rs.totalCommentCount}/{rs.limits.max_total_comments} comments · {rs.totalCommentChars}/{rs
+              .limits.max_total_comment_chars} chars</span
+          >
+        {/if}
         <span
           class="save-indicator"
           class:save-indicator-error={rs.saveState === 'error'}
@@ -273,6 +304,20 @@
         </span>
       </div>
     </header>
+    {#if rs.draftByteWarning || rs.totalCapWarning}
+      <div
+        class="limits-banner"
+        class:limits-banner-blocked={rs.draftByteBlocked || rs.totalCapBlocked}
+        role="status"
+      >
+        {#if rs.draftByteBlocked || rs.totalCapBlocked}
+          Draft is at the {limitsBannerReasons.join(' / ')} limit — remove some comments before
+          adding more.
+        {:else}
+          Draft is approaching the {limitsBannerReasons.join(' / ')} limit.
+        {/if}
+      </div>
+    {/if}
     {#if rs.draftConflict}
       <div class="conflict-banner" role="alert">
         <span>
@@ -340,7 +385,7 @@
           <button
             type="button"
             class="btn-primary"
-            disabled={!rs.allReviewed || !rs.allOpaqueAcked || rs.draftConflict}
+            disabled={!rs.allReviewed || !rs.allAcked || rs.draftConflict}
             title={submitTitle}
             onclick={openSubmitConfirm}>Submit review</button
           >
@@ -382,19 +427,19 @@
           <h3>General comments</h3>
           <textarea
             id="general-comment-textarea"
-            bind:value={() => generalCommentText, (v) => rs.setEditorBuffer(GENERAL_BUFFER_KEY, v)}
+            bind:value={() => generalCommentText, setGeneralCommentText}
             placeholder="Add a general comment…"
             rows="3"
-            maxlength={maxCommentChars}
           ></textarea>
-          {#if maxCommentChars != null && generalCommentText.length > maxCommentChars * 0.9}
-            <span class="char-count">{generalCommentText.length}/{maxCommentChars}</span>
+          {#if maxCommentChars != null && scalarLength(generalCommentText) > maxCommentChars * 0.9}
+            <span class="char-count">{scalarLength(generalCommentText)}/{maxCommentChars}</span>
           {/if}
           <button
             type="button"
             class="btn-outline"
             onclick={addGeneralComment}
-            disabled={!generalCommentText.trim()}>Add comment</button
+            disabled={!generalCommentText.trim() || rs.draftByteBlocked || rs.totalCapBlocked}
+            >Add comment</button
           >
           {#if rs.draft.general_comments.length > 0}
             <ul class="general-comment-list">
@@ -558,6 +603,13 @@
     color: var(--c-ink-2);
   }
 
+  .usage-indicator {
+    flex-shrink: 0;
+    font-size: 12px;
+    color: var(--c-ink-3);
+    font-variant-numeric: tabular-nums;
+  }
+
   .save-indicator {
     flex-shrink: 0;
     font-size: 12px;
@@ -565,6 +617,20 @@
   }
 
   .save-indicator-error {
+    color: var(--c-shu);
+  }
+
+  .limits-banner {
+    padding: 8px 16px;
+    background: var(--c-odo-tint);
+    border-bottom: 1px solid #ead9ab;
+    color: var(--c-odo);
+    font-size: 13px;
+  }
+
+  .limits-banner-blocked {
+    background: var(--c-shu-tint);
+    border-bottom: 1px solid var(--c-shu-tint-2);
     color: var(--c-shu);
   }
 

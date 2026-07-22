@@ -4,7 +4,16 @@
   import HunkView from './HunkView.svelte'
   import type { CommentLineInfo } from './anchors'
   import { hasControlChars, hasInvisibles, reveal } from './invisibles'
-  import { contentNote, fileNotices, modeChangeBadge, opaqueDetails, requiresAck, typeChangeBadge } from './opaque'
+  import {
+    ackReasonLabels,
+    contentNote,
+    fileNotices,
+    modeChangeBadge,
+    oneSidedModeBadge,
+    opaqueDetails,
+    otherAckReasonLabels,
+    typeChangeBadge,
+  } from './opaque'
   import type { ChangeKind, FileDiff, HunkRef } from './types'
 
   interface FileGroup {
@@ -129,6 +138,9 @@
           {#if modeChangeBadge(file)}
             <span class="file-status kind-meta">{modeChangeBadge(file)}</span>
           {/if}
+          {#if oneSidedModeBadge(file)}
+            <span class="file-status kind-meta">{oneSidedModeBadge(file)}</span>
+          {/if}
           {#if typeChangeBadge(file)}
             <span class="file-status kind-meta">{typeChangeBadge(file)}</span>
           {/if}
@@ -158,12 +170,19 @@
                     {/each}
                   </dl>
                 {/if}
+                {#if otherAckReasonLabels(file).length > 0}
+                  <ul class="ack-reasons">
+                    {#each otherAckReasonLabels(file) as label (label)}
+                      <li>{label}</li>
+                    {/each}
+                  </ul>
+                {/if}
                 <label class="opaque-ack">
                   <input
                     type="checkbox"
-                    checked={rs.isAcked(group.fileIndex)}
+                    checked={rs.isAcked(file.id)}
                     disabled={rs.phase !== 'review'}
-                    onchange={() => rs.toggleAck(group.fileIndex)}
+                    onchange={() => rs.toggleAck(file.id)}
                   />
                   I acknowledge this change without reviewing its contents
                 </label>
@@ -180,18 +199,27 @@
             />
           {/if}
         {/each}
-        <!-- Text files can still require an ack (gitlink, mode change — see
-             requiresAck): the header badges above explain why, and the same
-             ack checkbox as the opaque card gates submission. Opaque files
-             already carry theirs inside the opaque card. -->
-        {#if file.content_kind === 'text' && requiresAck(file)}
+        <!-- Text files can still require an ack (gitlink, mode change, an
+             added/deleted symlink, a new executable — see
+             FileDiff.ack_reasons): the header badges above explain the
+             shape of the change, and this card + checkbox gates submission
+             the same way the opaque card above does. Opaque files already
+             carry theirs inside the opaque card. -->
+        {#if file.content_kind === 'text' && file.ack_required}
           <div class="opaque-card">
+            {#if ackReasonLabels(file).length > 0}
+              <ul class="ack-reasons">
+                {#each ackReasonLabels(file) as label (label)}
+                  <li>{label}</li>
+                {/each}
+              </ul>
+            {/if}
             <label class="opaque-ack">
               <input
                 type="checkbox"
-                checked={rs.isAcked(group.fileIndex)}
+                checked={rs.isAcked(file.id)}
                 disabled={rs.phase !== 'review'}
-                onchange={() => rs.toggleAck(group.fileIndex)}
+                onchange={() => rs.toggleAck(file.id)}
               />
               I acknowledge this change
             </label>
@@ -308,6 +336,13 @@
     font-size: 13px;
     color: var(--c-ink);
     cursor: pointer;
+  }
+
+  .ack-reasons {
+    margin: 0 0 8px;
+    padding-left: 18px;
+    font-size: 12px;
+    color: var(--c-ink-2);
   }
 
   .empty-diff {

@@ -126,6 +126,11 @@ visible instead of rendering as two identical-looking lines.
 | 17 | worktree not clean under `--dirty-policy error` (the default); commit/stash first or pass `--dirty-policy warn` |
 | 18 | the diff exceeds a hard resource budget (e.g. more than 2000 changed files); review it in smaller pieces |
 
+This table describes `ronten review` only. `ronten validate-concerns` has its own, narrower
+exit codes (0 valid / 10 invalid) — see the [`ronten validate-concerns`](#ronten-validate-concerns)
+section below; its exit 0 means "structurally and semantically valid concerns JSON", not "review
+approved".
+
 ### `ronten schema`
 
 ```sh
@@ -135,8 +140,33 @@ ronten schema --output    # result JSON Schema only
 ```
 
 Prints the JSON Schemas for the concerns input and result output to stdout. The schemas are
-generated from the same serde types the binary uses at runtime, so they can never drift from
-the implementation — an agent can self-discover the contract without reading this README.
+generated from the same serde types the binary uses at runtime (via `schemars`), so field
+names, types, and simple constraints (lengths, ranges, the pinned `version` `const`) can
+never drift from the implementation.
+
+This is a **structural** schema only. Semantic constraints that depend on the whole document
+— no duplicate concern ids, no blank-after-trim titles, `start <= end`, the reserved
+`_unmapped` id — are enforced at runtime and are not (and cannot fully be) expressed in JSON
+Schema. To check those, run `ronten validate-concerns` instead of hand-validating against
+the schema.
+
+### `ronten validate-concerns`
+
+```sh
+ronten validate-concerns concerns.json   # validate a file
+ronten validate-concerns -               # validate from stdin
+cat concerns.json | ronten validate-concerns
+```
+
+Parses a concerns JSON document and runs the same semantic validation `ronten review` runs at
+startup — without needing a git repository or opening a session. Always prints one JSON object
+to stdout:
+
+- Valid: `{"valid": true}`, exit 0.
+- Invalid: `{"valid": false, "errors": [{"code": "...", "message": "...", "concern_id": "..."}]}`,
+  exit 10 (the same code `ronten review` exits with for invalid concerns). `concern_id` is
+  present only for failures scoped to a specific concern; `code` is a stable, machine-readable
+  identifier (e.g. `DUPLICATE_CONCERN_ID`, `START_AFTER_END`, `RESERVED_CONCERN_ID`).
 
 ### Integration patterns
 
@@ -230,7 +260,7 @@ never a context line. An omitted `side` claims on *both* numbering schemes at on
 
 ```jsonc
 {
-  "version": 2,
+  "version": 3,
   "review": {
     "session_id": "9f2c…",
     "ronten_version": "0.1.0",
@@ -268,9 +298,72 @@ never a context line. An omitted `side` claims on *both* numbering schemes at on
       "concern_id": "auth-core"
     }
   ],
+  "files": [
+    {
+      "file_id": "3f9a2b7c1d4e5f60",
+      "old_path": "src/middleware/auth.ts",
+      "new_path": "src/middleware/auth.ts",
+      "old_mode": "100644",
+      "new_mode": "100644",
+      "file_type": "regular",
+      "old_oid": "1a2b3c…",
+      "new_oid": "4d5e6f…",
+      "content_kind": "text",
+      "rendered": true
+    },
+    {
+      "file_id": "8b1c4d2e9f0a3b7c",
+      "old_path": null,
+      "new_path": "assets/logo.png",
+      "old_mode": null,
+      "new_mode": "100644",
+      "file_type": "regular",
+      "old_oid": null,
+      "new_oid": "7e8f9a…",
+      "content_kind": "binary",
+      "rendered": false,
+      "omission_reason": "binary"
+    }
+  ],
+  "acknowledgements": [
+    {
+      "file_id": "8b1c4d2e9f0a3b7c",
+      "reasons": ["opaque-content"],
+      "acknowledged_at": "2026-07-22T04:32:10Z"
+    }
+  ],
+  "worktree": {
+    "policy": "error",
+    "checked_at_start": true,
+    "clean_at_start": true,
+    "checked_at_submit": true,
+    "clean_at_submit": true,
+    "excluded_paths": ["concerns.json"]
+  },
+  "build": {
+    "ronten_version": "0.1.0",
+    "source_commit": null,
+    "source_dirty": null,
+    "rust_version": null,
+    "target": null,
+    "profile": null,
+    "frontend_digest": null
+  },
   "started_at": "…", "submitted_at": "…"
 }
 ```
+
+`files` lists every file in the reviewed diff, including ones whose content was not shown
+(`rendered: false` with an `omission_reason` of `binary`, `lfs_pointer`, `too_large`,
+`non_utf8`, or `submodule`) — so a standalone reader of the JSON can reconstruct what was and
+wasn't shown to the reviewer without re-running the diff. `acknowledgements` lists every file
+the reviewer explicitly acknowledged before submit, keyed by the same `file_id` as `files`,
+with the server-computed reasons acknowledgement was required and the submit-time timestamp.
+`worktree` records the `--dirty-policy` in effect and whether the worktree was checked/clean
+at session start and re-checked at submit (`checked_at_*` is `false` under `--dirty-policy
+ignore`, or if the query itself failed). `build` identifies the binary that produced the
+result; `source_commit`/`source_dirty`/`rust_version`/`target`/`profile`/`frontend_digest` are
+`null` unless the build was compiled with the corresponding `build.rs`-injected env vars.
 
 `decision` is one of exactly two values, `approve` or `request-changes` — there is no `abort`
 decision — derived from the per-concern verdicts: any `request-changes` verdict makes the
@@ -400,6 +493,7 @@ src/
   review.rs      — orchestration for `ronten review`
   demo.rs        — orchestration for `ronten demo` (embedded fixtures, no git)
   schema_cmd.rs  — `ronten schema`
+  validate_cmd.rs — `ronten validate-concerns`
   assets.rs      — embedded frontend static assets
 frontend/        — Svelte app (npm project; build output embedded into the binary)
 fixtures/        — demo diff + concerns used by `ronten demo`

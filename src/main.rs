@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::PathBuf;
 
 mod assets;
 mod demo;
@@ -11,6 +12,7 @@ mod server;
 mod session;
 mod snapshot;
 mod termsafe;
+mod validate_cmd;
 
 pub mod exitcode {
     pub const APPROVED: u8 = 0;
@@ -49,6 +51,9 @@ enum Cli {
     Review(review::ReviewArgs),
     /// Print JSON Schemas for the input/output contract
     Schema(SchemaArgs),
+    /// Validate a concerns JSON document (structural + semantic) without
+    /// starting a review
+    ValidateConcerns(ValidateConcernsArgs),
     /// Launch the UI with an embedded sample session (no git required)
     Demo(demo::DemoArgs),
 }
@@ -63,9 +68,16 @@ struct SchemaArgs {
     output: bool,
 }
 
+#[derive(clap::Args, Debug)]
+struct ValidateConcernsArgs {
+    /// Path to concerns JSON; use `-` (or omit) for stdin
+    file: Option<PathBuf>,
+}
+
 fn run(cli: Cli) -> u8 {
     match cli {
         Cli::Schema(a) => schema_cmd::run(a.input, a.output),
+        Cli::ValidateConcerns(a) => validate_cmd::run(a.file),
         Cli::Review(a) => block_on_and_exit_promptly(review::run(a)),
         Cli::Demo(a) => block_on_and_exit_promptly(demo::run(a)),
     }

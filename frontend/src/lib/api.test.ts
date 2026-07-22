@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { saveDraft, submit } from './api'
 import type { Draft } from './types'
 
-const draft: Draft = { concerns: {}, general_comments: ['hi'], acknowledged_opaque: [] }
+const draft: Draft = { concerns: {}, general_comments: ['hi'], acknowledgements: [] }
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
