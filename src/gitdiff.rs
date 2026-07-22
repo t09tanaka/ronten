@@ -1186,6 +1186,64 @@ fn map_wait_err(e: std::io::Error) -> GitError {
     }
 }
 
+/// Substrings of `git rev-parse --show-toplevel` stderr that reliably mean
+/// "there is no repository here" across git versions — as opposed to a git
+/// command that ran against a repository but failed for some other reason
+/// (permission denied, corrupt object database, a `safe.directory`
+/// rejection, ...). Matched case-insensitively.
+const NOT_A_REPO_STDERR_MARKERS: &[&str] = &["not a git repository"];
+
+/// Classifies a non-zero `git rev-parse --show-toplevel` exit by inspecting
+/// `stderr`, rather than treating every non-zero exit as "not a
+/// repository". Git's own wording for "there is no repository here" ("not a
+/// git repository" / "not a git repository (or any of the parent
+/// directories): .git") has been stable across versions and is what
+/// [`GitError::NotARepo`] is reserved for; anything else — a permission
+/// error, a corrupt repository, a `safe.directory` rejection ("detected
+/// dubious ownership in repository at ..."), etc. — is a git-internal
+/// failure and must surface as [`GitError::GitFailed`] (a different exit
+/// code) instead of the misleading "you're not in a repo".
+///
+/// Pure and independent of any real git invocation so it can be unit-tested
+/// on synthetic stderr bytes without constructing a corrupt or
+/// permission-denied repository.
+fn classify_repo_root_error(stderr: &[u8]) -> GitError {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let lower = stderr.to_ascii_lowercase();
+    if NOT_A_REPO_STDERR_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        GitError::NotARepo
+    } else {
+        GitError::GitFailed(stderr)
+    }
+}
+
+/// Decodes the trimmed stdout of `git rev-parse --show-toplevel` into a
+/// repo-root path, failing closed (returning `GitError::GitFailed`) instead
+/// of lossily collapsing invalid bytes to `�` if the toplevel path is not
+/// valid UTF-8 — the same fail-closed treatment [`utf8_path`] already gives
+/// individual path tokens elsewhere in this module. A `PathBuf` built from a
+/// lossily-decoded root would silently point at the wrong directory (or no
+/// directory at all) for every subsequent `-C <root>` git invocation, so
+/// rejecting up front is strictly more correct than continuing on a mangled
+/// path.
+///
+/// Pure and independent of any real git invocation so it can be
+/// unit-tested on synthetic non-UTF-8 bytes without constructing a
+/// repository at a non-UTF-8 path (impractical to do portably).
+fn decode_repo_root(stdout: &[u8]) -> Result<std::path::PathBuf, GitError> {
+    std::str::from_utf8(stdout)
+        .map(|s| std::path::PathBuf::from(s.trim()))
+        .map_err(|_| {
+            GitError::GitFailed(format!(
+                "repository root path {:?} is not valid UTF-8 (ronten requires UTF-8 paths)",
+                String::from_utf8_lossy(stdout).trim()
+            ))
+        })
+}
+
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
 pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     let mut cmd = base_git();
@@ -1195,10 +1253,74 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     // misreported as "run this from inside a repo".
     let output = timed_output(cmd, DEFAULT_MAX_STDOUT_BYTES).map_err(map_wait_err)?;
     if !output.status.success() {
-        return Err(GitError::NotARepo);
+        return Err(classify_repo_root_error(&output.stderr));
     }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(std::path::PathBuf::from(path))
+    decode_repo_root(&output.stdout)
+}
+
+#[cfg(test)]
+mod repo_root_classification_tests {
+    use super::*;
+
+    #[test]
+    fn not_a_git_repository_stderr_classifies_as_not_a_repo() {
+        let stderr = b"fatal: not a git repository (or any of the parent directories): .git\n";
+        assert!(matches!(
+            classify_repo_root_error(stderr),
+            GitError::NotARepo
+        ));
+    }
+
+    #[test]
+    fn not_a_git_repository_matches_case_insensitively() {
+        let stderr = b"FATAL: Not A Git Repository (or any of the parent directories)\n";
+        assert!(matches!(
+            classify_repo_root_error(stderr),
+            GitError::NotARepo
+        ));
+    }
+
+    #[test]
+    fn safe_directory_rejection_is_git_failed_not_not_a_repo() {
+        let stderr = b"fatal: detected dubious ownership in repository at '/repo'\n\
+              To add an exception for this directory, call:\n\n\
+              \tgit config --global --add safe.directory /repo\n";
+        match classify_repo_root_error(stderr) {
+            GitError::GitFailed(msg) => assert!(msg.contains("dubious ownership")),
+            other => panic!("expected GitFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn permission_denied_is_git_failed_not_not_a_repo() {
+        let stderr = b"fatal: cannot come back to cwd: Permission denied\n";
+        match classify_repo_root_error(stderr) {
+            GitError::GitFailed(msg) => assert!(msg.contains("Permission denied")),
+            other => panic!("expected GitFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_utf8_repo_root_fails_closed() {
+        // A lone continuation byte (0x80) is never valid UTF-8 on its own,
+        // so this exercises the fail-closed path without needing a real
+        // repository checked out at a non-UTF-8 path (impractical to
+        // construct portably).
+        let stdout = b"/tmp/repo-\x80-broken\n";
+        match decode_repo_root(stdout) {
+            Err(GitError::GitFailed(msg)) => {
+                assert!(msg.contains("not valid UTF-8"), "message was: {msg}");
+            }
+            other => panic!("expected fail-closed GitFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn utf8_repo_root_decodes_and_trims() {
+        let stdout = b"/tmp/repo\n";
+        let path = decode_repo_root(stdout).unwrap();
+        assert_eq!(path, std::path::PathBuf::from("/tmp/repo"));
+    }
 }
 
 /// Structured worktree cleanliness report, from `git status --porcelain=v2
@@ -1608,13 +1730,134 @@ pub(crate) fn is_tracked(root: &std::path::Path, rel_path: &str) -> Result<bool,
     Ok(output.status.success())
 }
 
+/// Substrings of `git rev-parse --verify` stderr that reliably mean "this
+/// revision does not exist / does not resolve", as opposed to git having run
+/// against a valid rev but failed for some internal reason. Matched
+/// case-insensitively.
+///
+/// "needed a single revision" is the one this module's actual call
+/// (`rev-parse --verify --end-of-options <rev>^{commit}`) produces in
+/// practice, across every unresolvable-rev shape observed (nonexistent ref,
+/// syntactically invalid ref, an oid that resolves to the wrong object
+/// type): `--verify` itself always reports "did not resolve to exactly one
+/// revision" this way rather than the "unknown revision"/"bad
+/// revision"/"ambiguous argument" wording plain `git rev-parse` (without
+/// `--verify`) uses. The other three are kept as well in case this function
+/// is ever reused against a plain (non-`--verify`) rev-parse call, or a git
+/// version phrases it differently; they cost nothing since none of them
+/// plausibly appears in a genuine internal-failure message.
+const BAD_BASE_STDERR_MARKERS: &[&str] = &[
+    "needed a single revision",
+    "unknown revision",
+    "bad revision",
+    "ambiguous argument",
+];
+
+/// Classifies a non-zero `git rev-parse --verify <rev>^{commit}` exit by
+/// inspecting `stderr`, rather than treating every non-zero exit as "bad
+/// base ref". Git's wording for an unresolvable rev under `--verify`
+/// ("Needed a single revision", possibly preceded by an "expected commit
+/// type, but the object dereferences to ... type" line) is what
+/// [`GitError::BadBase`] is reserved for; anything else — a permission
+/// error, a corrupt repository, a `safe.directory` rejection — is a
+/// git-internal failure and must surface as [`GitError::GitFailed`]
+/// instead, even though the command being run was resolving the
+/// user-supplied base.
+///
+/// Pure and independent of any real git invocation so it can be
+/// unit-tested on synthetic stderr bytes.
+fn classify_bad_base_error(stderr: &[u8]) -> GitError {
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+    let lower = stderr.to_ascii_lowercase();
+    if BAD_BASE_STDERR_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        GitError::BadBase(stderr)
+    } else {
+        GitError::GitFailed(stderr)
+    }
+}
+
+#[cfg(test)]
+mod bad_base_classification_tests {
+    use super::*;
+
+    #[test]
+    fn needed_a_single_revision_classifies_as_bad_base() {
+        // What real git (2.45) actually prints for every unresolvable-rev
+        // shape under `rev-parse --verify --end-of-options <rev>^{commit}`
+        // — the exact call this module makes. See `bad_base_is_distinguished`
+        // and `bad_base_exits_11` for the same thing exercised end-to-end
+        // against real git.
+        let stderr = b"fatal: Needed a single revision\n";
+        assert!(matches!(
+            classify_bad_base_error(stderr),
+            GitError::BadBase(_)
+        ));
+    }
+
+    #[test]
+    fn wrong_object_type_dereference_still_classifies_as_bad_base() {
+        // `rev-parse --verify <blob-oid>^{commit}` prints an extra `error:`
+        // line ahead of the same "Needed a single revision" fatal line.
+        let stderr = b"error: 0123456789abcdef0123456789abcdef01234567^{commit}: expected commit type, but the object dereferences to blob type\nfatal: Needed a single revision\n";
+        assert!(matches!(
+            classify_bad_base_error(stderr),
+            GitError::BadBase(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_revision_classifies_as_bad_base() {
+        // Plain (non-`--verify`) `git rev-parse` wording — not what this
+        // module's actual call produces, but kept as a recognized marker in
+        // case this classifier is ever reused against that call shape.
+        let stderr = b"fatal: ambiguous argument 'no-such-ref^{commit}': unknown revision or path not in the working tree.\n";
+        assert!(matches!(
+            classify_bad_base_error(stderr),
+            GitError::BadBase(_)
+        ));
+    }
+
+    #[test]
+    fn bad_revision_classifies_as_bad_base() {
+        let stderr = b"fatal: bad revision 'garbage^{commit}'\n";
+        assert!(matches!(
+            classify_bad_base_error(stderr),
+            GitError::BadBase(_)
+        ));
+    }
+
+    #[test]
+    fn unrelated_git_internal_failure_is_git_failed() {
+        let stderr = b"fatal: unable to read current working directory: Permission denied\n";
+        match classify_bad_base_error(stderr) {
+            GitError::GitFailed(msg) => assert!(msg.contains("Permission denied")),
+            other => panic!("expected GitFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn safe_directory_rejection_during_base_resolution_is_git_failed() {
+        let stderr = b"fatal: detected dubious ownership in repository at '/repo'\n";
+        match classify_bad_base_error(stderr) {
+            GitError::GitFailed(msg) => assert!(msg.contains("dubious ownership")),
+            other => panic!("expected GitFailed, got {other:?}"),
+        }
+    }
+}
+
 /// Resolves `<rev>^{commit}` to a full oid.
 ///
 /// Distinguishes *why* it failed: if git itself couldn't be run at all (spawn
 /// error — e.g. the binary is missing), that's `GitFailed` regardless of
-/// which rev was being resolved. If git ran and exited non-zero (the rev
-/// doesn't resolve), that's `BadBase` here; callers resolving `HEAD` remap
-/// that to `GitFailed` since `HEAD` is never the user-supplied base.
+/// which rev was being resolved. If git ran and exited non-zero, `stderr` is
+/// inspected (see [`classify_bad_base_error`]): a genuinely unresolvable rev
+/// is `BadBase`, while a git-internal failure (permission error, corrupt
+/// repository, ...) is `GitFailed` even though the command was resolving the
+/// user-supplied base. Callers resolving `HEAD` remap `BadBase` to
+/// `GitFailed` regardless, since `HEAD` is never the user-supplied base.
 pub(crate) fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, GitError> {
     rev_parse_commit_with_deadline(root, rev, GIT_TIMEOUT)
 }
@@ -1641,9 +1884,7 @@ pub(crate) fn rev_parse_commit_with_deadline(
     let output =
         timed_output_with_deadline(cmd, timeout, DEFAULT_MAX_STDOUT_BYTES).map_err(map_wait_err)?;
     if !output.status.success() {
-        return Err(GitError::BadBase(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
+        return Err(classify_bad_base_error(&output.stderr));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
