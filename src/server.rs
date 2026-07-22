@@ -267,6 +267,30 @@ fn validate_mutation_id(id: &str) -> Option<Response> {
     None
 }
 
+/// If the session is already `Finished(Outcome::Submitted, Some(id))` with
+/// `id` matching `mutation_id`, this is a lost-response retry of the submit
+/// that already won: answers 200 immediately. Checked (and dropped) under
+/// the same `phase` lock every other phase read uses, with no `await` held.
+///
+/// This must run BEFORE `check_head_freshness`/the verdict-completeness and
+/// draft-validation checks in `post_submit`: those inspect *live* state
+/// (the repository's current `HEAD`) that may have legitimately moved on in
+/// the time between the original submit winning and this retry arriving —
+/// exactly what freshness exists to catch for a genuinely NEW submit, but
+/// it must not be able to turn a successful retry of the one that already
+/// won into a stale-HEAD 409 or a validation 422. An `Aborted`/`Timeout`
+/// finish, or a `Submitted` finish under a DIFFERENT id, does not match
+/// here and falls through to the normal (still-409ing) path.
+fn already_submitted_replay(state: &SessionState, mutation_id: &str) -> Option<Response> {
+    let phase = crate::session::lock_ignore_poison(&state.phase);
+    let is_replay = matches!(
+        &*phase,
+        crate::session::Phase::Finished(Outcome::Submitted(_), Some(id)) if id.as_str() == mutation_id
+    );
+    drop(phase);
+    is_replay.then(|| Json(json!({"ok": true})).into_response())
+}
+
 async fn put_draft(
     State(state): State<Arc<SessionState>>,
     Path(token): Path<String>,
@@ -391,6 +415,16 @@ async fn post_submit(
     }
     if let Some(invalid) = validate_mutation_id(&body.mutation_id) {
         return invalid;
+    }
+    // Lost-response retry short-circuit: must run BEFORE freshness/
+    // completeness/validation below, all of which read live state that may
+    // have moved on since the original submit already won. See
+    // `already_submitted_replay`'s doc comment for why. `try_finish_at_revision`'s
+    // `AlreadySubmittedSame` further down is the second line of defense for
+    // the race where the winning submit finishes between this check and the
+    // claim.
+    if let Some(replay) = already_submitted_replay(&state, &body.mutation_id) {
+        return replay;
     }
     let draft = body.draft;
 
@@ -583,6 +617,61 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            started_at: chrono::Utc::now(),
+            phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
+                crate::session::DraftSlot::default(),
+            )),
+            outcome_tx: tx,
+        })
+    }
+
+    /// Same session shape as `build_state`, but pinned to a real repo at
+    /// `head_oid` — the only way to exercise `check_head_freshness`'s live
+    /// `HEAD` re-check (it's a no-op whenever `repo_root` is `None`, which
+    /// every other test in this module uses).
+    fn build_state_with_repo(repo_root: std::path::PathBuf, head_oid: String) -> Arc<SessionState> {
+        let files = parse_unified_diff(MODIFIED);
+        let input = ConcernsInput {
+            version: 1,
+            summary: Some("summary text".to_string()),
+            concerns: vec![
+                Concern {
+                    id: "c1".to_string(),
+                    title: "Concern one".to_string(),
+                    description: Some("desc one".to_string()),
+                    risk: Risk::High,
+                    locations: vec![Location {
+                        path: "src/app.ts".to_string(),
+                        side: None,
+                        start: Some(1),
+                        end: Some(4),
+                    }],
+                },
+                Concern {
+                    id: "c2".to_string(),
+                    title: "Concern two".to_string(),
+                    description: None,
+                    risk: Risk::Low,
+                    locations: vec![],
+                },
+            ],
+        };
+        let mapping = resolve_mapping(&files, &input);
+        assert_eq!(mapping.unmapped.len(), 1);
+
+        let mut snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
+        snapshot.head_oid = Some(head_oid);
+        let (tx, _rx) = tokio::sync::watch::channel(());
+        Arc::new(SessionState {
+            title: "review title".to_string(),
+            summary: Some("summary text".to_string()),
+            files,
+            mapping,
+            input,
+            token: TOKEN.to_string(),
+            session_id: "sessid".to_string(),
+            snapshot,
+            repo_root: Some(repo_root),
             started_at: chrono::Utc::now(),
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
                 crate::session::DraftSlot::default(),
@@ -1112,6 +1201,32 @@ index 1111111..2222222 100644
         assert_eq!(body["error"], "invalid mutation id");
     }
 
+    /// Same as `save_invalid_mutation_id_422`, for `POST /submit`: an empty
+    /// or oversized `mutation_id` is refused with 422, not a panic.
+    #[tokio::test]
+    async fn submit_invalid_mutation_id_422() {
+        let state = build_state();
+        let app = build_router(state.clone());
+
+        let empty = json!({"revision": 0, "mutation_id": "", "draft": complete_draft()});
+        let (status, body) = call(
+            app.clone(),
+            post_json(&format!("/api/{TOKEN}/submit"), empty),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "invalid mutation id");
+
+        let oversized = json!({
+            "revision": 0,
+            "mutation_id": "x".repeat(101),
+            "draft": complete_draft()
+        });
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), oversized)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert_eq!(body["error"], "invalid mutation id");
+    }
+
     #[tokio::test]
     async fn submit_incomplete_422() {
         let state = build_state();
@@ -1327,6 +1442,76 @@ index 1111111..2222222 100644
         assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
         assert_eq!(body["error"], "session finished");
         assert_eq!(body["finished"], "submitted");
+    }
+
+    /// A submit's HTTP response can be lost (client-side timeout/network
+    /// failure) even though the server already committed to `Submitted`.
+    /// Retrying with the SAME mutation id must still replay 200 even if the
+    /// live `HEAD` has moved on in the meantime (e.g. an agent pushed
+    /// another commit while the response was in flight back to the
+    /// client): freshness exists to catch a NEW submit against a diff
+    /// that's no longer current, not to un-approve a retry of the one that
+    /// already won. This is only observable with a real `repo_root`
+    /// (`check_head_freshness` is a no-op otherwise), hence
+    /// `build_state_with_repo` instead of the usual `build_state`.
+    ///
+    /// Before the fix (`already_submitted_replay` added before
+    /// `check_head_freshness` in `post_submit`), this test failed: the
+    /// retry hit the live `HEAD` re-check first and got 409 "review stale"
+    /// instead of replaying 200.
+    #[tokio::test]
+    async fn submit_same_id_replays_200_even_after_head_moved() {
+        let td = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .current_dir(td.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                st.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(td.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let head_oid = crate::gitdiff::rev_parse_commit(td.path(), "HEAD").unwrap();
+
+        let state = build_state_with_repo(td.path().to_path_buf(), head_oid);
+        let app = build_router(state.clone());
+
+        let submit = json!({
+            "revision": 0,
+            "mutation_id": "retry-me",
+            "draft": complete_draft()
+        });
+        let (status, body) = call(
+            app.clone(),
+            post_json(&format!("/api/{TOKEN}/submit"), submit.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+
+        // HEAD moves on after the winning submit — a NEW commit lands while
+        // the (lost) response was supposedly in flight back to the client.
+        std::fs::write(td.path().join("a.txt"), "one\nmore\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "moved after submit"]);
+
+        // The retry, same mutation id: must replay 200, not 409/503 off the
+        // now-mismatched HEAD.
+        let (status, body) = call(app, post_json(&format!("/api/{TOKEN}/submit"), submit)).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["ok"], true);
+        assert!(matches!(
+            state.finished_outcome().unwrap(),
+            Outcome::Submitted(_)
+        ));
     }
 
     #[tokio::test]
