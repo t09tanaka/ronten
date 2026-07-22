@@ -5,7 +5,7 @@ use crate::exitcode;
 use crate::gitdiff::{
     compute_diff, current_branch, git_dirs, is_tracked, repo_root, worktree_status, GitError,
 };
-use crate::mapping::{resolve_mapping, validate_concerns};
+use crate::mapping::{format_validation_errors, resolve_mapping, validate_concerns};
 use crate::model::{ConcernsInput, Decision};
 use crate::server::{build_router, new_token, Outcome};
 use crate::session::{DraftSlot, Phase, SessionState};
@@ -373,13 +373,18 @@ pub async fn run(args: ReviewArgs) -> u8 {
             return exitcode::INPUT;
         }
     };
-    if let Err(e) = validate_concerns(&input) {
-        // `e` may already carry a sanitized `loc.path` token (see
-        // `validate_concerns`), but the message is passed through `sanitize`
-        // again regardless — it is cheap (a no-op scan) and makes this print
-        // site safe on its own even if some future error string forgets to
-        // sanitize a field itself.
-        eprintln!("invalid concerns: {}", sanitize(&e));
+    if let Err(errors) = validate_concerns(&input) {
+        // Same structured `ValidationError`s `ronten validate-concerns`
+        // reports as JSON, joined into one human-readable line here. Each
+        // message may already carry a sanitized `loc.path` token (see
+        // `validate_concerns`), but the joined string is passed through
+        // `sanitize` again regardless — it is cheap (a no-op scan) and makes
+        // this print site safe on its own even if some future error string
+        // forgets to sanitize a field itself.
+        eprintln!(
+            "invalid concerns: {}",
+            sanitize(&format_validation_errors(&errors))
+        );
         return exitcode::INPUT;
     }
 

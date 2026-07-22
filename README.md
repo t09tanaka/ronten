@@ -135,8 +135,33 @@ ronten schema --output    # result JSON Schema only
 ```
 
 Prints the JSON Schemas for the concerns input and result output to stdout. The schemas are
-generated from the same serde types the binary uses at runtime, so they can never drift from
-the implementation — an agent can self-discover the contract without reading this README.
+generated from the same serde types the binary uses at runtime (via `schemars`), so field
+names, types, and simple constraints (lengths, ranges, the pinned `version` `const`) can
+never drift from the implementation.
+
+This is a **structural** schema only. Semantic constraints that depend on the whole document
+— no duplicate concern ids, no blank-after-trim titles, `start <= end`, the reserved
+`_unmapped` id — are enforced at runtime and are not (and cannot fully be) expressed in JSON
+Schema. To check those, run `ronten validate-concerns` instead of hand-validating against
+the schema.
+
+### `ronten validate-concerns`
+
+```sh
+ronten validate-concerns concerns.json   # validate a file
+ronten validate-concerns -               # validate from stdin
+cat concerns.json | ronten validate-concerns
+```
+
+Parses a concerns JSON document and runs the same semantic validation `ronten review` runs at
+startup — without needing a git repository or opening a session. Always prints one JSON object
+to stdout:
+
+- Valid: `{"valid": true}`, exit 0.
+- Invalid: `{"valid": false, "errors": [{"code": "...", "message": "...", "concern_id": "..."}]}`,
+  exit 10 (the same code `ronten review` exits with for invalid concerns). `concern_id` is
+  present only for failures scoped to a specific concern; `code` is a stable, machine-readable
+  identifier (e.g. `DUPLICATE_CONCERN_ID`, `START_AFTER_END`, `RESERVED_CONCERN_ID`).
 
 ### Integration patterns
 
@@ -400,6 +425,7 @@ src/
   review.rs      — orchestration for `ronten review`
   demo.rs        — orchestration for `ronten demo` (embedded fixtures, no git)
   schema_cmd.rs  — `ronten schema`
+  validate_cmd.rs — `ronten validate-concerns`
   assets.rs      — embedded frontend static assets
 frontend/        — Svelte app (npm project; build output embedded into the binary)
 fixtures/        — demo diff + concerns used by `ronten demo`

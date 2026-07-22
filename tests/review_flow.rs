@@ -1585,6 +1585,57 @@ fn reserved_id_exits_10() {
     assert_eq!(code, 10);
 }
 
+/// `review`'s startup validation and `ronten validate-concerns` share the
+/// same `mapping::validate_concerns` semantic validator (see the P1-3 fix):
+/// this fixture drives an invalid concerns file through both entry points
+/// and asserts the *same* failure — the reserved `_unmapped` id — surfaces
+/// from each, just formatted differently (`review` prints one human-readable
+/// stderr line; `validate-concerns` emits a structured `errors` array).
+#[test]
+fn review_and_validate_concerns_agree_on_reserved_id() {
+    let td = fixture_repo();
+    let reserved = r#"{"version":1,"concerns":[
+      {"id":"_unmapped","title":"nope","risk":"low","locations":[{"path":"a.txt"}]}]}"#;
+    std::fs::write(td.path().join("reserved.json"), reserved).unwrap();
+
+    // `ronten validate-concerns`: structured, machine-readable.
+    let validate_out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args(["validate-concerns", "reserved.json"])
+        .output()
+        .unwrap();
+    assert_eq!(validate_out.status.code(), Some(10));
+    let v: serde_json::Value = serde_json::from_slice(&validate_out.stdout).unwrap();
+    assert_eq!(v["valid"], false);
+    let errors = v["errors"].as_array().unwrap();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e["code"] == "RESERVED_CONCERN_ID" && e["concern_id"] == "_unmapped"),
+        "validate-concerns should report RESERVED_CONCERN_ID for _unmapped: {errors:?}"
+    );
+
+    // `ronten review`: same validator, human-readable stderr, same exit code.
+    let review_out = Command::new(env!("CARGO_BIN_EXE_ronten"))
+        .current_dir(td.path())
+        .args([
+            "review",
+            "--base",
+            "main",
+            "--concerns",
+            "reserved.json",
+            "--no-open",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(review_out.status.code(), Some(10));
+    let stderr = String::from_utf8(review_out.stderr).unwrap();
+    assert!(
+        stderr.contains("_unmapped") && stderr.contains("reserved"),
+        "review's stderr should describe the same reserved-id failure: {stderr}"
+    );
+}
+
 /// The concerns file is untrusted input, and `validate_concerns` interpolates
 /// a location's `path` straight into its error message. A `path` carrying a
 /// raw ESC byte (plus a newline, for good measure) must not reach stderr

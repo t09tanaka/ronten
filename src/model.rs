@@ -27,7 +27,7 @@ pub const OUTPUT_VERSION: u32 = 3;
 #[serde(deny_unknown_fields)]
 pub struct ConcernsInput {
     /// Contract version. Must be exactly 1 (the only supported version).
-    #[schemars(range(min = 1, max = 1))]
+    #[schemars(extend("const" = SUPPORTED_VERSION))]
     pub version: u32,
     /// Optional overall summary of the change (at most 2000 characters).
     #[serde(default)]
@@ -103,7 +103,7 @@ pub enum Side {
 pub struct ResultOutput {
     /// Contract version this result was emitted under; always
     /// [`OUTPUT_VERSION`] for a given build.
-    #[schemars(range(min = 3, max = 3))]
+    #[schemars(extend("const" = OUTPUT_VERSION))]
     pub version: u32,
     /// What this result applies to: the reviewed commits and digests of the
     /// diff and concerns input, plus the assurance level of the outcome.
@@ -125,7 +125,11 @@ pub struct ResultOutput {
     pub worktree: WorktreeAudit,
     /// What produced this result (binary version, source commit, target).
     pub build: BuildInfo,
+    /// RFC3339 UTC instant the review session started.
+    #[schemars(extend("format" = "date-time"))]
     pub started_at: String,
+    /// RFC3339 UTC instant the result was submitted.
+    #[schemars(extend("format" = "date-time"))]
     pub submitted_at: String,
 }
 
@@ -168,6 +172,7 @@ pub struct Acknowledgement {
     /// acknowledgement isn't tracked separately from the rest of the draft
     /// (the draft is a scratchpad edited freely until submit), so this is
     /// always the submit time — the moment the acknowledgement became final.
+    #[schemars(extend("format" = "date-time"))]
     pub acknowledged_at: String,
 }
 
@@ -491,13 +496,35 @@ mod tests {
                 "output schema missing {field}: {schema}"
             );
         }
-        // The `version` field must be pinned to the literal 3, not left as
-        // an unconstrained u32 — mirrors the input contract's own version
-        // pin (see `input_schema_denies_unknown_fields_on_every_object`'s
-        // sibling concern for `ConcernsInput`).
+        // The `version` field must be pinned via a real JSON Schema `const`,
+        // not just documented in prose — mirrors the input contract's own
+        // version pin (see `input_schema_pins_version_const`).
         assert!(
-            schema.contains("\"minimum\":3") && schema.contains("\"maximum\":3"),
-            "output schema must pin version to the literal 3: {schema}"
+            schema.contains("\"const\":3"),
+            "output schema must pin version to the const 3: {schema}"
+        );
+        // Timestamp fields must declare `format: date-time` — the generated
+        // schema is *structural only* (see the README's `validate-concerns`
+        // section); this is the one semantic-adjacent fact schemars can
+        // still express, so it should.
+        assert_eq!(
+            schema.matches("\"format\":\"date-time\"").count(),
+            3,
+            "expected date-time format on started_at, submitted_at, and \
+             acknowledged_at: {schema}"
+        );
+    }
+
+    /// Companion to `output_schema_pins_v3_audit_fields_and_version_literal`:
+    /// the input contract's own `version` field must likewise be a real
+    /// schema `const`, not just a documented literal.
+    #[test]
+    fn input_schema_pins_version_const() {
+        let schema = serde_json::to_string(&schemars::schema_for!(ConcernsInput))
+            .expect("schema serializes to JSON");
+        assert!(
+            schema.contains("\"const\":1"),
+            "input schema must pin version to the const 1: {schema}"
         );
     }
 
