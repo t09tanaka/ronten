@@ -786,6 +786,29 @@ fn untracked_file_blocks_start_by_default() {
     );
 }
 
+/// `git status`'s entry-count cap (Task 3.2, P0-6) must fail closed: once
+/// the worktree has more untracked entries than the cap, the dirty gate
+/// stops enumerating individual paths and instead blocks with a summary,
+/// exactly like an ordinary dirty worktree (exit 17) — never silently
+/// "clean" just because enumeration was cut short.
+#[test]
+fn status_overflow_blocks_as_dirty() {
+    let td = fixture_repo();
+    let dir = td.path().join("many");
+    std::fs::create_dir(&dir).unwrap();
+    // One entry past `STATUS_MAX_ENTRIES` (10_000) in src/gitdiff.rs.
+    for i in 0..10_001 {
+        std::fs::write(dir.join(format!("f{i}.txt")), "").unwrap();
+    }
+
+    let (code, stderr) = expect_exit_with_stderr(td.path(), &[]);
+    assert_eq!(code, 17, "stderr: {stderr}");
+    assert!(
+        stderr.contains("more than 10000 entries"),
+        "stderr must summarize the overflow instead of (or in addition to) enumerating every path: {stderr}"
+    );
+}
+
 /// Unix filenames may contain bytes a terminal or log line would otherwise
 /// interpret specially — here an ESC (start of an ANSI/OSC escape sequence)
 /// and a raw newline (which could forge an extra, fake log line). The dirty

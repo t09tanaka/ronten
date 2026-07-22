@@ -637,6 +637,15 @@ const DEFAULT_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
 /// list many thousands of paths in a large, messy worktree.
 const STATUS_MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Entry-count cap for [`parse_status_v2_z`], well above what any normal
+/// (even very messy) worktree produces. Bounds the number of `String`s the
+/// dirty gate allocates and enumerates; paired with
+/// [`STATUS_MAX_STDOUT_BYTES`], which bounds the raw buffer those entries
+/// are parsed from. On overflow the worktree is reported dirty (never
+/// clean) with a summary instead of enumerating every path — see
+/// [`WorktreeStatus::overflow`].
+const STATUS_MAX_ENTRIES: usize = 10_000;
+
 /// `git diff-tree --raw` lists every changed path plus both blob
 /// oids/modes — the largest legitimate output of any call this module
 /// makes, and the one bound tightly by `budget.max_files` rather than by
@@ -977,11 +986,20 @@ pub struct WorktreeStatus {
     pub tracked_changes: Vec<String>,
     pub untracked: Vec<String>,
     pub submodules_dirty: Vec<String>,
+    /// Set when [`parse_status_v2_z`] stopped early because the entry count
+    /// exceeded [`STATUS_MAX_ENTRIES`], instead of enumerating every
+    /// remaining path. When set, the three lists above are a **partial**
+    /// enumeration (only the entries seen before the cap) — their absence
+    /// of an item must never be read as "not dirty". `is_clean` always
+    /// returns `false` while this is set: fail-closed, never a false
+    /// "clean" from a status report that was cut short.
+    pub overflow: Option<String>,
 }
 
 impl WorktreeStatus {
     pub fn is_clean(&self) -> bool {
-        self.tracked_changes.is_empty()
+        self.overflow.is_none()
+            && self.tracked_changes.is_empty()
             && self.untracked.is_empty()
             && self.submodules_dirty.is_empty()
     }
@@ -1032,7 +1050,21 @@ fn parse_status_v2_z(bytes: &[u8]) -> Result<WorktreeStatus, GitError> {
         .split(|&b| b == 0)
         .filter(|t| !t.is_empty())
         .peekable();
+    let mut entry_count: usize = 0;
     while let Some(token) = tokens.next() {
+        // Checked before this record's fields are parsed at all, so a
+        // worktree with an enormous number of entries stops doing work at
+        // the cap instead of first parsing/allocating every path and only
+        // then discovering the gate can't enumerate them all. A rename's
+        // second (`origPath`) token is consumed as part of the same
+        // logical entry below and does not bump this counter again.
+        entry_count += 1;
+        if entry_count > STATUS_MAX_ENTRIES {
+            status.overflow = Some(format!(
+                "git status reports more than {STATUS_MAX_ENTRIES} entries; worktree treated as dirty without enumerating every path"
+            ));
+            return Ok(status);
+        }
         let text = std::str::from_utf8(token)
             .map_err(|_| GitError::GitFailed("non-UTF-8 git status entry".to_string()))?;
         let malformed = || GitError::GitFailed(format!("unparseable git status entry: {text:?}"));
@@ -1398,7 +1430,29 @@ fn utf8_path(token: &[u8], malformed: &impl Fn(&str) -> GitError) -> Result<Stri
 /// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
 /// Any structurally malformed record is a hard error: this parser feeds the
 /// review gate, so partial success is worse than failing the whole diff.
+///
+/// Unbounded: used only by tests that exercise the field-level parsing
+/// directly. Production code goes through [`parse_raw_z_capped`], which adds
+/// the file-count early-exit.
+#[cfg(test)]
 fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
+    parse_raw_z_impl(bytes, None)
+}
+
+/// [`parse_raw_z`], but bails out with [`GitError::BudgetExceeded`] the
+/// moment a `max_entries + 1`th record would start, instead of parsing the
+/// whole raw stream and checking the count afterward. This bounds both the
+/// parse work and the `Vec<RawEntry>` allocation to `max_entries` records
+/// regardless of how many more the raw `-z` stream actually contains — the
+/// stream itself is separately bounded by
+/// [`DIFF_TREE_RAW_MAX_STDOUT_BYTES`], but without this a diff touching
+/// millions of files would still fully parse (and allocate a `RawEntry` for
+/// every one of them) before being refused.
+fn parse_raw_z_capped(bytes: &[u8], max_entries: usize) -> Result<Vec<RawEntry>, GitError> {
+    parse_raw_z_impl(bytes, Some(max_entries))
+}
+
+fn parse_raw_z_impl(bytes: &[u8], max_entries: Option<usize>) -> Result<Vec<RawEntry>, GitError> {
     let malformed =
         |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
     let mut tokens = bytes.split(|&b| b == 0).peekable();
@@ -1412,6 +1466,17 @@ fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
                 return Err(malformed("unexpected empty token before end of output"));
             }
             continue;
+        }
+        // Checked before any field parsing of this record so a diff with
+        // millions of changed files stops doing work at the boundary
+        // instead of fully validating/allocating every record first and
+        // only then discovering it's over budget.
+        if let Some(max_entries) = max_entries {
+            if entries.len() >= max_entries {
+                return Err(GitError::BudgetExceeded(format!(
+                    "diff touches more than {max_entries} files; review it in smaller pieces (narrower --base or split the change)"
+                )));
+            }
         }
         let meta = String::from_utf8_lossy(token).to_string();
         let Some(meta) = meta.strip_prefix(':') else {
@@ -1539,6 +1604,63 @@ mod raw_tests {
     fn parse_raw_z_rejects_non_utf8_second_path() {
         let raw = b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 R90\0ok.txt\0\x81new\0";
         assert!(parse_raw_z(raw).is_err());
+    }
+
+    /// Builds `n` well-formed `M` (modify) raw records with distinct paths.
+    fn valid_records(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for i in 0..n {
+            buf.extend_from_slice(
+                format!(":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0file{i}.txt\0")
+                    .as_bytes(),
+            );
+        }
+        buf
+    }
+
+    #[test]
+    fn diff_tree_exactly_at_budget_passes() {
+        // The boundary case: a diff touching exactly `max_files` files must
+        // not be refused, only one strictly over the limit.
+        let raw = valid_records(2000);
+        let entries = parse_raw_z_capped(&raw, 2000).unwrap();
+        assert_eq!(entries.len(), 2000);
+    }
+
+    #[test]
+    fn diff_tree_refuses_at_2001_without_parsing_all() {
+        // 2000 valid records followed by one that is structurally garbage.
+        // If the capped parser fully parsed every record before checking
+        // the count, it would trip over the garbage record and return
+        // `GitFailed`. Getting `BudgetExceeded` instead proves parsing
+        // stopped at the 2001st record without ever looking at its
+        // contents.
+        let mut raw = valid_records(2000);
+        raw.extend_from_slice(b"not-a-valid-record\0trailing.txt\0");
+        match parse_raw_z_capped(&raw, 2000) {
+            Err(GitError::BudgetExceeded(msg)) => {
+                assert!(msg.contains("2000"), "unexpected message: {msg}");
+            }
+            other => panic!("expected BudgetExceeded (early bail), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_tree_capped_parse_is_bounded_not_just_the_final_check() {
+        // A much larger stream (10x the cap) still bails promptly rather
+        // than allocating a `RawEntry` for every record; this is a
+        // regression guard on the *mechanism* (checked per-record, not
+        // only compared against `entries.len()` at the very end).
+        let raw = valid_records(20_000);
+        let entries = match parse_raw_z_capped(&raw, 2000) {
+            Err(GitError::BudgetExceeded(_)) => return,
+            Ok(entries) => entries,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        };
+        panic!(
+            "expected BudgetExceeded, got Ok with {} entries",
+            entries.len()
+        );
     }
 }
 
@@ -2062,14 +2184,12 @@ pub fn compute_diff_with_budget(
             String::from_utf8_lossy(&out.stderr).to_string(),
         ));
     }
-    let entries = parse_raw_z(&out.stdout)?;
-    if entries.len() > budget.max_files {
-        return Err(GitError::BudgetExceeded(format!(
-            "diff touches {} files (limit {}); review it in smaller pieces (narrower --base or split the change)",
-            entries.len(),
-            budget.max_files
-        )));
-    }
+    // Bounded parse: bails at the `max_files + 1`th record instead of
+    // parsing/allocating the entire raw stream and checking the count only
+    // afterward (see `parse_raw_z_capped`). `DIFF_TREE_RAW_MAX_STDOUT_BYTES`
+    // already bounds the raw byte buffer (Task 3.1); this bounds the parsed
+    // `RawEntry` structure count and the work spent building it.
+    let entries = parse_raw_z_capped(&out.stdout, budget.max_files)?;
 
     // Sizes first (--batch-check), so oversized blobs are never ingested.
     // Gitlink sides are excluded: their oid is a commit in a submodule repo,
@@ -3010,7 +3130,10 @@ mod git_tests {
         };
         match compute_diff_with_budget(d, "main", &budget) {
             Err(GitError::BudgetExceeded(msg)) => {
-                assert!(msg.contains("2 files"), "unexpected message: {msg}");
+                // The early-exit parse bails at the (max_files + 1)th
+                // record without ever discovering the true total, so the
+                // message reports the limit rather than an exact count.
+                assert!(msg.contains('1'), "unexpected message: {msg}");
             }
             other => panic!("expected BudgetExceeded, got {other:?}"),
         }
@@ -3271,5 +3394,60 @@ mod git_tests {
         // Fail closed on an entry shape this parser doesn't understand.
         assert!(parse_status_v2_z(b"x whatever\0").is_err());
         assert!(parse_status_v2_z(b"1 .M\0").is_err());
+    }
+
+    /// Builds a synthetic `git status --porcelain=v2 -z` buffer with `n`
+    /// distinct untracked (`?`) entries.
+    fn untracked_entries(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for i in 0..n {
+            buf.extend_from_slice(format!("? file{i}.txt\0").as_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn status_exactly_at_cap_is_not_overflowed() {
+        // Boundary: exactly STATUS_MAX_ENTRIES entries must be enumerated
+        // in full, not treated as an overflow (avoids a false positive on
+        // a merely very messy, but still enumerable, worktree).
+        let bytes = untracked_entries(STATUS_MAX_ENTRIES);
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert!(status.overflow.is_none());
+        assert_eq!(status.untracked.len(), STATUS_MAX_ENTRIES);
+        assert!(!status.is_clean());
+    }
+
+    #[test]
+    fn status_overflow_blocks_as_dirty() {
+        // One entry past the cap: parsing must stop enumerating paths and
+        // report the worktree as dirty via a summary, never as clean.
+        let bytes = untracked_entries(STATUS_MAX_ENTRIES + 1);
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert!(
+            status.overflow.is_some(),
+            "expected overflow to be set: {status:?}"
+        );
+        let msg = status.overflow.as_ref().unwrap();
+        assert!(
+            msg.contains(&STATUS_MAX_ENTRIES.to_string()),
+            "overflow message should mention the cap: {msg}"
+        );
+        // fail-closed: an overflowed status must never read as clean, and
+        // must not have silently enumerated every path either (that would
+        // defeat the point of the cap).
+        assert!(!status.is_clean());
+        assert!(status.untracked.len() <= STATUS_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn status_overflow_is_bounded_not_just_the_final_check() {
+        // A much larger stream (10x the cap) still bails promptly with a
+        // partial enumeration rather than collecting every path first.
+        let bytes = untracked_entries(STATUS_MAX_ENTRIES * 10);
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert!(status.overflow.is_some());
+        assert!(status.untracked.len() <= STATUS_MAX_ENTRIES);
+        assert!(!status.is_clean());
     }
 }

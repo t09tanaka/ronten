@@ -474,6 +474,9 @@ pub async fn run(args: ReviewArgs) -> u8 {
         for path in &status.submodules_dirty {
             eprintln!("  dirty submodule: {}", sanitize(path));
         }
+        if let Some(msg) = &status.overflow {
+            eprintln!("  {}", sanitize(msg));
+        }
     };
     if let Some(status) = &dirty {
         if args.dirty_policy == DirtyPolicy::Error {
