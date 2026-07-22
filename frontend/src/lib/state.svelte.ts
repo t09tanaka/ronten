@@ -19,7 +19,14 @@ import { buildUnmappedSet, isUnmappedInSet } from './unmappedLines'
 
 export const SAVE_DEBOUNCE_MS = 500
 
-export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error' | 'outcome_unknown'
+export type Phase =
+  | 'loading'
+  | 'review'
+  | 'submitted'
+  | 'aborted'
+  | 'timed_out'
+  | 'error'
+  | 'outcome_unknown'
 
 /** True only for the errors that mean "we genuinely don't know whether this
  * reached the server": the AbortController firing on `apiFetch`'s 40s
@@ -35,12 +42,13 @@ function isAmbiguousFetchError(e: unknown): boolean {
   return (e instanceof DOMException && e.name === 'AbortError') || e instanceof TypeError
 }
 
-/** UI phase for a server-reported ending. A timeout renders as the aborted
- * screen: from the reviewer's side both mean "this session ended without a
- * decision". */
+/** UI phase for a server-reported ending. `timeout` gets its own terminal
+ * screen distinct from an explicit abort, so a reviewer who ran out of time
+ * isn't told they cancelled the review themselves. */
 export function phaseForFinished(finished: FinishedKind | null): Phase {
   if (finished === 'submitted') return 'submitted'
-  if (finished === 'aborted' || finished === 'timeout') return 'aborted'
+  if (finished === 'aborted') return 'aborted'
+  if (finished === 'timeout') return 'timed_out'
   return 'review'
 }
 export type SaveState = 'idle' | 'saving' | 'saved' | 'error'
@@ -166,7 +174,12 @@ export class ReviewState {
    * while a submit/abort is actively in flight — mutations and saves are
    * inert in either case. */
   get #locked(): boolean {
-    return this.phase === 'submitted' || this.phase === 'aborted' || this.#actionLocked
+    return (
+      this.phase === 'submitted' ||
+      this.phase === 'aborted' ||
+      this.phase === 'timed_out' ||
+      this.#actionLocked
+    )
   }
 
   #ensureConcernDraft(id: string): ConcernDraft {

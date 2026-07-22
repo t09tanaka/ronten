@@ -235,6 +235,7 @@ async fn get_session(
             max_draft_bytes: MAX_BODY_BYTES,
         },
         finished,
+        deadline_at: state.deadline_at.map(|d| d.to_rfc3339()),
     };
     Json(payload).into_response()
 }
@@ -589,6 +590,15 @@ index 1111111..2222222 100644
     const TOKEN: &str = "sesstoken";
 
     fn build_state() -> Arc<SessionState> {
+        build_state_with_deadline(None)
+    }
+
+    /// Same session shape as `build_state`, with `deadline_at` overridable —
+    /// used to exercise the `GET /session` payload's `deadline_at` field
+    /// (Task 2.4) without duplicating the whole fixture for that one case.
+    fn build_state_with_deadline(
+        deadline_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Arc<SessionState> {
         let files = parse_unified_diff(MODIFIED);
         let input = ConcernsInput {
             version: 1,
@@ -632,6 +642,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
+            deadline_at,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
                 crate::session::DraftSlot::default(),
             )),
@@ -687,6 +698,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: Some(repo_root),
             started_at: chrono::Utc::now(),
+            deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
                 crate::session::DraftSlot::default(),
             )),
@@ -744,6 +756,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
+            deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
                 crate::session::DraftSlot::default(),
             )),
@@ -810,6 +823,7 @@ index 1111111..2222222 100644
             snapshot,
             repo_root: None,
             started_at: chrono::Utc::now(),
+            deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
                 crate::session::DraftSlot::default(),
             )),
@@ -876,6 +890,20 @@ index 1111111..2222222 100644
         assert_eq!(concerns[2]["id"], "_unmapped");
         assert_eq!(concerns[2]["unmapped"], true);
         assert_eq!(body["finished"], serde_json::Value::Null);
+        // No --timeout given: no deadline to report.
+        assert_eq!(body["deadline_at"], serde_json::Value::Null);
+    }
+
+    /// Task 2.4: when the session was started with `--timeout`, the payload
+    /// carries the RFC3339 deadline so the UI can render a countdown.
+    #[tokio::test]
+    async fn get_session_reports_deadline_at_when_timeout_set() {
+        let deadline = chrono::Utc::now() + chrono::Duration::minutes(30);
+        let state = build_state_with_deadline(Some(deadline));
+        let app = build_router(state.clone());
+        let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["deadline_at"], deadline.to_rfc3339());
     }
 
     #[tokio::test]

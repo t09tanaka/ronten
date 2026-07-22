@@ -130,6 +130,9 @@ export interface Session {
    * "submitted". */
   finished: FinishedKind | null
   unmapped_lines: UnmappedLine[]
+  /** RFC3339 UTC instant this session's `--timeout` will elapse, for
+   * rendering a countdown. Absent/null when no `--timeout` was given. */
+  deadline_at?: string | null
 }
 
 /** How a finished session ended. */

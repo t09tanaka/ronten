@@ -9,7 +9,7 @@ vi.mock('./api', () => ({
 }))
 
 import { abortSession, fetchSession, saveDraft, submit } from './api'
-import { ReviewState, SAVE_DEBOUNCE_MS } from './state.svelte'
+import { phaseForFinished, ReviewState, SAVE_DEBOUNCE_MS } from './state.svelte'
 
 const fetchSessionMock = vi.mocked(fetchSession)
 const saveDraftMock = vi.mocked(saveDraft)
@@ -154,6 +154,42 @@ describe('draft conflict handling', () => {
     expect(rs.phase).toBe('aborted')
     expect(rs.saveState).toBe('idle')
     expect(rs.draftConflict).toBe(false)
+  })
+
+  it('joins the timed_out state (not aborted) on a finished(timeout) conflict', async () => {
+    const rs = await loadedState()
+
+    saveDraftMock.mockResolvedValueOnce({
+      ok: false,
+      error: 'session finished',
+      finished: 'timeout',
+    })
+    rs.addGeneralComment('late')
+    await vi.runAllTimersAsync()
+    expect(rs.phase).toBe('timed_out')
+    expect(rs.saveState).toBe('idle')
+    expect(rs.draftConflict).toBe(false)
+  })
+})
+
+describe('phaseForFinished', () => {
+  it('finished_timeout_maps_to_timed_out_phase', () => {
+    // Task 2.4: `timeout` used to fold into the aborted screen; it now gets
+    // its own terminal phase so the UI can tell a reviewer who ran out of
+    // time apart from one who explicitly cancelled.
+    expect(phaseForFinished('timeout')).toBe('timed_out')
+  })
+
+  it('finished_aborted_maps_to_aborted_phase', () => {
+    expect(phaseForFinished('aborted')).toBe('aborted')
+  })
+
+  it('finished_submitted_maps_to_submitted_phase', () => {
+    expect(phaseForFinished('submitted')).toBe('submitted')
+  })
+
+  it('null_finished_maps_to_review_phase', () => {
+    expect(phaseForFinished(null)).toBe('review')
   })
 })
 

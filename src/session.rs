@@ -112,6 +112,9 @@ pub struct SessionPayload<'a> {
     /// (`"submitted"` / `"aborted"` / `"timeout"`), so the UI can show the
     /// right terminal screen instead of calling every ending "submitted".
     pub finished: Option<&'static str>,
+    /// RFC3339 UTC instant this session's `--timeout` will elapse, so the UI
+    /// can render a countdown. `null` when no `--timeout` was given.
+    pub deadline_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -142,6 +145,11 @@ pub struct SessionState {
     /// check.
     pub repo_root: Option<std::path::PathBuf>,
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// `started_at` + `--timeout`, if one was given; `None` for an
+    /// untimed session. Computed once at session construction so every
+    /// `GET /session` response reports the same deadline instead of
+    /// re-deriving it from an elapsed-time calculation that could drift.
+    pub deadline_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Lifecycle phase; see [`Phase`]. Transitioned to `Finished` only by
     /// [`try_finish`]; the in-progress draft lives inside `Reviewing`.
     ///

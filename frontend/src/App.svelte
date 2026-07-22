@@ -8,11 +8,33 @@
   import { revealControlChars } from './lib/invisibles'
   import { renderMarkdown } from './lib/markdown'
   import { focusGeneralComments } from './lib/scroll'
+  import { formatCountdown, remainingMs } from './lib/countdown'
   import type { Verdict } from './lib/types'
 
   onMount(() => {
     void rs.load()
   })
+
+  // Display-only countdown to session.deadline_at. Ticks once a second while
+  // the review is active and a deadline exists; the effect's cleanup (return)
+  // stops the interval both when the deadline disappears and when the phase
+  // leaves 'review' (submitted/aborted/timed_out/etc.), so it never keeps
+  // running past a terminal screen. This never ends the session itself —
+  // when it reaches zero the server ends the session on its own and the next
+  // GET/action reflects that; no client-side auto-abort here.
+  let now = $state(Date.now())
+  $effect(() => {
+    if (rs.phase !== 'review' || !rs.session?.deadline_at) return
+    const id = setInterval(() => {
+      now = Date.now()
+    }, 1000)
+    return () => clearInterval(id)
+  })
+  const remainingCountdown = $derived(
+    rs.phase === 'review' && rs.session?.deadline_at
+      ? formatCountdown(remainingMs(rs.session.deadline_at, now))
+      : null,
+  )
 
   let showSubmitConfirm = $state(false)
   let showAbortConfirm = $state(false)
@@ -220,6 +242,8 @@
   <div class="center-message">Review submitted. You can close this tab.</div>
 {:else if rs.phase === 'aborted'}
   <div class="center-message">Review aborted. You can close this tab.</div>
+{:else if rs.phase === 'timed_out'}
+  <div class="center-message">Review timed out — the session ended before you submitted.</div>
 {:else if rs.session}
   <div class="app">
     <header class="topbar">
@@ -232,13 +256,20 @@
           {/if}
         </div>
       </div>
-      <span
-        class="save-indicator"
-        class:save-indicator-error={rs.saveState === 'error'}
-        aria-live="polite"
-      >
-        {#if rs.saveState === 'saving'}Saving…{:else if rs.saveState === 'saved'}Saved{:else if rs.saveState === 'error'}Save failed{/if}
-      </span>
+      <div class="topbar-status">
+        {#if remainingCountdown}
+          <span class="countdown-indicator" aria-live="polite" title="Time remaining before this session times out"
+            >{remainingCountdown}</span
+          >
+        {/if}
+        <span
+          class="save-indicator"
+          class:save-indicator-error={rs.saveState === 'error'}
+          aria-live="polite"
+        >
+          {#if rs.saveState === 'saving'}Saving…{:else if rs.saveState === 'saved'}Saved{:else if rs.saveState === 'error'}Save failed{/if}
+        </span>
+      </div>
     </header>
     {#if rs.draftConflict}
       <div class="conflict-banner" role="alert">
@@ -510,6 +541,19 @@
     font-size: 13px;
     color: var(--c-ink-2);
     font-variant-numeric: tabular-nums;
+  }
+
+  .topbar-status {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .countdown-indicator {
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--c-ink-2);
   }
 
   .save-indicator {

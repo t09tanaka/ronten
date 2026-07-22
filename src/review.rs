@@ -531,6 +531,14 @@ pub async fn run(args: ReviewArgs) -> u8 {
     let token = new_token();
     let summary = input.summary.clone();
     let (tx, rx) = watch::channel(());
+    let started_at = chrono::Utc::now();
+    // `chrono::Duration::from_std` only fails for a duration too large to
+    // represent (well beyond anything `--timeout` would realistically be
+    // given); fall back to no deadline rather than panic on it.
+    let deadline_at = args
+        .timeout
+        .and_then(|d| chrono::Duration::from_std(d).ok())
+        .map(|d| started_at + d);
     let state = Arc::new(SessionState {
         title,
         summary,
@@ -541,7 +549,8 @@ pub async fn run(args: ReviewArgs) -> u8 {
         session_id: new_token(),
         snapshot,
         repo_root: Some(root),
-        started_at: chrono::Utc::now(),
+        started_at,
+        deadline_at,
         phase: Mutex::new(Phase::Reviewing(DraftSlot::default())),
         outcome_tx: tx,
     });
