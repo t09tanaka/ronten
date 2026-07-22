@@ -67,6 +67,12 @@ project is pre-1.0 and minor versions may contain breaking changes.
   into the aborted screen; the session payload includes a UTC
   `deadline_at` when `--timeout` is set, and the review screen shows a
   live countdown to it.
+- The review UI precomputes a `(file, hunk)` → concern hunk-owner index
+  once per session load instead of re-walking every concern's hunks on
+  each rendered hunk, and now force-collapses all of a selected concern's
+  hunks when their combined rendered length exceeds 1,000 lines, on top
+  of the existing per-hunk 200-line collapse — bounding initial DOM
+  without virtualization.
 
 ### Fixed
 - Save, submit, and abort are serialized through a single mutation chain,
@@ -94,6 +100,23 @@ project is pre-1.0 and minor versions may contain breaking changes.
   switching concerns or closing the editor and is covered by the
   unsaved-changes warning instead of silently disappearing; submitting
   with unsent comment text now prompts for confirmation.
+- Git subprocesses now run in their own process group, and the whole
+  group (not just the direct child) is killed on the 60s deadline, so a
+  descendant holding a pipe open can no longer wedge the parent past the
+  timeout. Subprocess stdout is capped per call (64 MiB for `diff-tree`,
+  16 MiB for `status`, 8 MiB otherwise) and stderr is kept as a bounded
+  8 KiB tail instead of being read unbounded.
+- `diff-tree` and `git status` output is now parsed with entry-count caps
+  checked during parsing, not after: a diff touching more than 2000 files
+  is refused (exit 18) before every entry is materialized, and a worktree
+  with more than 10,000 status entries is treated as dirty (never clean)
+  without enumerating them all.
+- Concern location intervals are normalized (sorted and merged) per
+  `(concern, path, side)` before walking changed lines, and total
+  resolved edges (1,000,000) and hunk references (100,000) are now
+  hard-capped across a review, so a legal but pathological input (e.g.
+  200 concerns × 200 locations on one file) is bounded or refused (exit
+  18) instead of doing unbounded work.
 
 ## [0.1.0] - 2026-07
 

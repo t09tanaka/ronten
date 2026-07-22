@@ -342,8 +342,12 @@ truncated:
   lines, every one of that concern's hunks starts collapsed too (each still expandable on
   demand). A concern's shared-hunk lookup (which other concerns also claim a given hunk)
   is precomputed once per session load rather than rescanned per rendered hunk.
-- Every git subprocess runs under a hard 60-second deadline and is killed (and reaped) on
-  overrun, so a wedged git can neither stall the review nor outlive the process.
+- Every git subprocess runs in its own process group under a hard 60-second deadline; on
+  overrun the whole group is killed (and reaped), not just the direct child, so a
+  descendant holding a pipe open can no longer stall the review past the deadline.
+  Subprocess stdout is also capped per call (64 MiB for diff-tree, 16 MiB for status, 8 MiB
+  otherwise) and stderr is kept as a bounded 8 KiB tail, so a runaway git refuses rather
+  than being read into memory unbounded.
 
 ## Non-goals for v0.1
 
