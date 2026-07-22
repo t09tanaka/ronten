@@ -11,6 +11,7 @@
     modeChangeBadge,
     oneSidedModeBadge,
     opaqueDetails,
+    otherAckReasonLabels,
     typeChangeBadge,
   } from './opaque'
   import type { ChangeKind, FileDiff, HunkRef } from './types'
@@ -168,6 +169,13 @@
                       <dd>{row.value}</dd>
                     {/each}
                   </dl>
+                {/if}
+                {#if otherAckReasonLabels(file).length > 0}
+                  <ul class="ack-reasons">
+                    {#each otherAckReasonLabels(file) as label (label)}
+                      <li>{label}</li>
+                    {/each}
+                  </ul>
                 {/if}
                 <label class="opaque-ack">
                   <input

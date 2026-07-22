@@ -6,6 +6,7 @@ import {
   modeChangeBadge,
   oneSidedModeBadge,
   opaqueDetails,
+  otherAckReasonLabels,
   typeChangeBadge,
 } from './opaque'
 import type { FileDiff } from './types'
@@ -147,6 +148,18 @@ describe('ackReasonLabels', () => {
         }),
       ),
     ).toHaveLength(9)
+  })
+})
+
+describe('otherAckReasonLabels', () => {
+  it('drops opaque-content (already covered by contentNote)', () => {
+    expect(otherAckReasonLabels(makeFile({ ack_reasons: ['opaque-content'] }))).toEqual([])
+  })
+
+  it('keeps every other reason alongside opaque content', () => {
+    expect(
+      otherAckReasonLabels(makeFile({ ack_reasons: ['opaque-content', 'mode-changed'] })),
+    ).toEqual(['File mode changed'])
   })
 })
 

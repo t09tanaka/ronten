@@ -52,6 +52,14 @@ export function ackReasonLabels(f: FileDiff): string[] {
   return f.ack_reasons.map((r) => ACK_REASON_LABELS[r])
 }
 
+/** Same as `ackReasonLabels`, minus `opaque-content` — for the opaque
+ * card, whose `contentNote` already explains that reason; this only adds
+ * whatever ELSE also makes the file ack-required (e.g. a mode change on a
+ * binary file). */
+export function otherAckReasonLabels(f: FileDiff): string[] {
+  return f.ack_reasons.filter((r) => r !== 'opaque-content').map((r) => ACK_REASON_LABELS[r])
+}
+
 /** Always-visible notices for changes whose real content is not the text
  * shown in the diff body (submodule pointers, LFS pointers) — derived from
  * the server's `ack_reasons`, not recomputed. */
