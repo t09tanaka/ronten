@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Lets release.yml call this workflow at the exact tagged commit as a
+  # required "full CI" gate before building release binaries (P1-8), on top
+  # of the push/pull_request triggers above used for normal development.
+  workflow_call:
 
 # Actions are pinned to full commit SHAs (the version tag is the trailing
 # comment) so a moved tag cannot silently change what runs in CI; Dependabot

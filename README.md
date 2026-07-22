@@ -464,15 +464,41 @@ CI pins every GitHub Action to a full commit SHA, pins the Rust toolchain
 runs the binary, so "`cargo install ronten` works without Node.js" is enforced,
 not assumed.
 
-Tagging `vX.Y.Z` (which must equal the `Cargo.toml` version) builds Linux and
-macOS binaries and attaches them to a **draft** GitHub release together with a
-`SHA256SUMS` file, an SPDX SBOM, and a build-provenance attestation. Before
-publishing the draft, verify an artifact end to end:
+Tagging `vX.Y.Z` (which must equal the `Cargo.toml` version) first re-runs the
+entire CI suite (fmt/clippy/test, MSRV, `cargo deny`/`cargo audit`, package,
+frontend) at the exact tagged commit, and refuses to release unless that
+commit is reachable from `origin/main` — a tag on an unreviewed or arbitrary
+commit cannot produce binaries. Only once that passes are the platform
+binaries built and attached to a **draft** GitHub release together with a
+`SHA256SUMS` file (which also covers the SBOM below), an SPDX SBOM, and a
+build-provenance attestation over both. Before publishing the draft, verify
+an artifact end to end:
 
 ```sh
 sha256sum --check SHA256SUMS
 gh attestation verify ronten-<version>-<target>.tar.gz --repo t09tanaka/ronten
 ```
+
+### Supported release platforms
+
+| OS | Arch | Target triple | Notes |
+| --- | --- | --- | --- |
+| Linux | x86_64 | `x86_64-unknown-linux-gnu` | Dynamically linked against glibc; built on Ubuntu 22.04, so the minimum glibc is that image's (2.35). |
+| Linux | x86_64 | `x86_64-unknown-linux-musl` | Statically linked (musl libc) — no runtime glibc dependency at all; use this on distros with an older or different libc. |
+| macOS | arm64 (Apple Silicon) | `aarch64-apple-darwin` | macOS 11+ (Big Sur). |
+| macOS | x86_64 (Intel) | `x86_64-apple-darwin` | macOS 11+ (Big Sur). |
+
+**macOS binaries are not signed or notarized.** Gatekeeper will warn ("cannot
+be opened because the developer cannot be verified") on first launch; the
+usual workaround is `xattr -d com.apple.quarantine <path-to-ronten>` or
+right-click → Open. Signing/notarization needs an Apple Developer account and
+its associated secrets, which this project does not have — it is explicitly
+out of scope, not an oversight. Building from source (`cargo install
+--locked ronten` or `cargo build --release`) sidesteps this entirely, since
+the binary is compiled locally rather than downloaded.
+
+Native Windows binaries are not built or supported (see "Non-goals" below);
+use WSL.
 
 Publishing to crates.io remains a deliberate manual `cargo publish`. See
 [SECURITY.md](SECURITY.md) for the vulnerability-reporting process and threat
