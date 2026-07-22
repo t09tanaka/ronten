@@ -79,7 +79,14 @@ jobs:
           # macos-13 hosted-runner label, and Xcode's toolchain on an arm64
           # host already supports linking for x86_64-apple-darwin directly
           # (cc/ld pick the right `-arch` from the target triple), so no
-          # separate runner is needed.
+          # separate runner is needed. The smoke-test/E2E steps below then
+          # EXECUTE that x86_64 binary on the arm64 runner, which only works
+          # because GitHub's arm64 macOS images ship Rosetta 2 — if that
+          # ever changes, this leg would fail with "Bad CPU type in
+          # executable" at the smoke-test step, not at Build. The upside is
+          # this is the only leg that exercises the binary being installed
+          # under emulation, which is exactly how a real Intel-Mac x86_64
+          # download would run on an Apple Silicon Mac too.
           - os: macos-latest
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -156,7 +163,7 @@ jobs:
             "version": 1,
             "summary": "Sample concerns for release artifact smoke testing.",
             "concerns": [
-              { "id": "sample", "title": "Sample concern", "locations": [{ "path": "README.md" }] }
+              { "id": "sample", "title": "Sample concern", "risk": "low", "locations": [{ "path": "README.md" }] }
             ]
           }
           JSON
