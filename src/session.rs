@@ -64,7 +64,11 @@ pub const MAX_TOTAL_COMMENTS: usize = 1000;
 /// [`crate::server::MAX_BODY_BYTES`]: even at the UTF-8 worst case of 4
 /// bytes/scalar this is 6 MiB, leaving headroom under the 8 MiB body cap for
 /// JSON structure, paths, and anchors (see the `limits_are_wire_consistent`
-/// test in server.rs).
+/// test in server.rs). That 4-byte figure is the worst case for UNESCAPED
+/// scalars; escape-heavy content (C0 controls other than `\n\t\r\b\f`, which
+/// JSON serializers escape as `\u00XX`, 6 bytes) isn't bounded by this char
+/// cap — it's bounded instead by the byte meter (client) and the 8 MiB 413
+/// (server).
 pub const MAX_TOTAL_COMMENT_CHARS: usize = 1_500_000;
 
 /// The draft plus its monotonically increasing revision. Every accepted

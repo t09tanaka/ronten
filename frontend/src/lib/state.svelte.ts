@@ -172,6 +172,30 @@ export class ReviewState {
     return n
   }
 
+  /** True once `totalCommentCount`/`totalCommentChars` has reached (or
+   * passed) `limits.max_total_comments`/`max_total_comment_chars` — these
+   * review-wide caps can be hit far below `draftByteBlocked`'s 8 MiB, and
+   * without this gate the first sign of it was a failing autosave.
+   * `addComment`/`addGeneralComment` refuse further growth while this is
+   * true, same as `draftByteBlocked`. */
+  get totalCapBlocked(): boolean {
+    if (!this.limits) return false
+    return (
+      this.totalCommentCount >= this.limits.max_total_comments ||
+      this.totalCommentChars >= this.limits.max_total_comment_chars
+    )
+  }
+
+  /** True once either total cap is within 10% of being reached — mirrors
+   * `draftByteWarning` but for the comment-count/char caps. */
+  get totalCapWarning(): boolean {
+    if (!this.limits) return false
+    return (
+      this.totalCommentCount >= this.limits.max_total_comments * 0.9 ||
+      this.totalCommentChars >= this.limits.max_total_comment_chars * 0.9
+    )
+  }
+
   get selected(): ConcernView | null {
     return this.session?.concerns[this.selectedIdx] ?? null
   }
@@ -316,7 +340,7 @@ export class ReviewState {
   }
 
   addComment(id: string, c: Comment): void {
-    if (this.#locked || this.draftByteBlocked) return
+    if (this.#locked || this.draftByteBlocked || this.totalCapBlocked) return
     this.#ensureConcernDraft(id).comments.push(c)
     this.scheduleSave()
   }
@@ -328,7 +352,7 @@ export class ReviewState {
   }
 
   addGeneralComment(body: string): void {
-    if (this.#locked || this.draftByteBlocked) return
+    if (this.#locked || this.draftByteBlocked || this.totalCapBlocked) return
     const trimmed = body.trim()
     if (!trimmed) return
     this.draft.general_comments.push(trimmed)

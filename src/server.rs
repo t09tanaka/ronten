@@ -2334,12 +2334,19 @@ index 1111111..2222222 100644
     /// serialize under `MAX_BODY_BYTES` (8 MiB) — the whole point of the
     /// review-wide totals is to make the per-field limits (which alone
     /// permit a wildly un-submittable draft) actually wire-consistent.
+    ///
+    /// The 4-bytes/scalar figure this check uses is the worst case for
+    /// UNESCAPED scalars, not an absolute one: JSON serializers escape C0
+    /// controls other than `\n\t\r\b\f` as `\u00XX` (6 bytes), so escape-heavy
+    /// drafts aren't bounded by `MAX_TOTAL_COMMENT_CHARS` — they're bounded
+    /// instead by the client's byte meter and the server's 8 MiB 413.
     #[test]
     fn limits_are_wire_consistent() {
-        // Worst-case UTF-8 byte cost per Unicode scalar (an astral-plane
-        // character costs 4 bytes) must still leave headroom under the
-        // request body cap once every comment is packed to the review-wide
-        // character cap — the arithmetic half of the consistency check.
+        // Worst-case UTF-8 byte cost per unescaped Unicode scalar (an
+        // astral-plane character costs 4 bytes) must still leave headroom
+        // under the request body cap once every comment is packed to the
+        // review-wide character cap — the arithmetic half of the
+        // consistency check.
         let worst_case_bytes = crate::session::MAX_TOTAL_COMMENT_CHARS * 4;
         assert!(
             worst_case_bytes < MAX_BODY_BYTES,

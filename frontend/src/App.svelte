@@ -226,6 +226,19 @@
 
   const maxCommentChars = $derived(rs.limits?.max_comment_chars)
 
+  /** Which review-wide limit(s) are currently at/near their cap, for the
+   * shared limits banner below — names the limit instead of just failing
+   * autosave with "Save failed" once `totalCapBlocked` is hit (see
+   * `totalCapBlocked`/`totalCapWarning` doc comments in state.svelte.ts). */
+  const limitsBannerReasons = $derived.by((): string[] => {
+    const reasons: string[] = []
+    const limits = rs.limits
+    if (limits && rs.totalCommentCount >= limits.max_total_comments * 0.9) reasons.push('comment count')
+    if (limits && rs.totalCommentChars >= limits.max_total_comment_chars * 0.9) reasons.push('characters')
+    if (rs.draftByteWarning) reasons.push('size')
+    return reasons
+  })
+
   // Truncates by Unicode scalar count, matching the server's
   // `chars().count()` — see CommentEditor.svelte's identical helper (P1-6).
   function setGeneralCommentText(v: string): void {
@@ -239,7 +252,7 @@
     !rs.allReviewed
       ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
       : !rs.allAcked
-        ? 'Acknowledge all flagged changes (undisplayed contents, mode or submodule changes) to submit'
+        ? "Acknowledge every change that can't be fully reviewed to submit"
         : 'Submit review',
   )
 </script>
@@ -291,13 +304,17 @@
         </span>
       </div>
     </header>
-    {#if rs.draftByteWarning}
-      <div class="limits-banner" class:limits-banner-blocked={rs.draftByteBlocked} role="status">
-        {#if rs.draftByteBlocked}
-          Draft is at the size limit ({Math.round((rs.draftByteUsageRatio ?? 0) * 100)}%) — remove
-          some comments before adding more.
+    {#if rs.draftByteWarning || rs.totalCapWarning}
+      <div
+        class="limits-banner"
+        class:limits-banner-blocked={rs.draftByteBlocked || rs.totalCapBlocked}
+        role="status"
+      >
+        {#if rs.draftByteBlocked || rs.totalCapBlocked}
+          Draft is at the {limitsBannerReasons.join(' / ')} limit — remove some comments before
+          adding more.
         {:else}
-          Draft is approaching the size limit ({Math.round((rs.draftByteUsageRatio ?? 0) * 100)}%).
+          Draft is approaching the {limitsBannerReasons.join(' / ')} limit.
         {/if}
       </div>
     {/if}
@@ -421,7 +438,8 @@
             type="button"
             class="btn-outline"
             onclick={addGeneralComment}
-            disabled={!generalCommentText.trim() || rs.draftByteBlocked}>Add comment</button
+            disabled={!generalCommentText.trim() || rs.draftByteBlocked || rs.totalCapBlocked}
+            >Add comment</button
           >
           {#if rs.draft.general_comments.length > 0}
             <ul class="general-comment-list">

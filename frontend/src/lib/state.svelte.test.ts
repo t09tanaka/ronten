@@ -718,3 +718,35 @@ describe('draft byte-size limits (P1-6)', () => {
     expect(rs.totalCommentChars).toBe(5)
   })
 })
+
+// `max_total_comments`/`max_total_comment_chars` can be hit far below
+// `max_draft_bytes` (1000 short comments is nowhere near 8 MiB); without a
+// client-side gate on these too, the first sign was a failing autosave.
+describe('total comment/char caps', () => {
+  it('add_blocked_at_total_comment_cap', async () => {
+    const rs = await loadedState()
+    for (let i = 0; i < rs.limits!.max_total_comments; i++) rs.addGeneralComment(`c${i}`)
+
+    expect(rs.totalCommentCount).toBe(rs.limits!.max_total_comments)
+    expect(rs.totalCapBlocked).toBe(true)
+
+    rs.addGeneralComment('one more')
+    expect(rs.totalCommentCount).toBe(rs.limits!.max_total_comments)
+    rs.addComment('c1', { path: 'a.ts', side: 'new', line: 1, body: 'blocked too' })
+    expect(rs.draft.concerns.c1).toBeUndefined()
+  })
+
+  it('total_cap_warning_at_90_percent', async () => {
+    const rs = await loadedState()
+    const ninety = Math.ceil(rs.limits!.max_total_comments * 0.9)
+    for (let i = 0; i < ninety - 1; i++) rs.addGeneralComment(`c${i}`)
+
+    expect(rs.totalCapWarning).toBe(false)
+    expect(rs.totalCapBlocked).toBe(false)
+
+    rs.addGeneralComment('one more')
+    expect(rs.totalCommentCount).toBe(ninety)
+    expect(rs.totalCapWarning).toBe(true)
+    expect(rs.totalCapBlocked).toBe(false)
+  })
+})

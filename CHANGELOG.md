@@ -99,10 +99,12 @@ project is pre-1.0 and minor versions may contain breaking changes.
   `validate-concerns` subcommand share this one validator, so they can
   never report different results for the same input.
 - Comment limits are now mutually consistent end to end: new review-wide
-  totals (1000 comments, 1,500,000 comment characters) guarantee a draft
-  satisfying every advertised per-field limit still fits the 8 MiB
-  request body cap; `PUT /draft` now enforces these caps too (422 "draft
-  exceeds limits"), not just submit. The browser measures draft byte size
+  totals (1000 comments, 1,500,000 comment characters) keep a draft
+  satisfying every advertised limit within the 8 MiB request body cap for
+  typical content; escape-heavy drafts (e.g. runs of C0 control characters,
+  which serialize as 6-byte `\u00XX` escapes) are bounded by the byte cap
+  and the 8 MiB 413 instead. `PUT /draft` now enforces these caps too (422
+  "draft exceeds limits"), not just submit. The browser measures draft byte size
   (warns at 90%, blocks at 100% of the advertised max) and now
   counts/truncates comment text by Unicode scalar instead of UTF-16 code
   units, matching how the server counts characters.

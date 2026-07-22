@@ -57,7 +57,7 @@
       type="button"
       class="editor-add"
       onclick={add}
-      disabled={!body.trim() || rs.draftByteBlocked}>Add comment</button
+      disabled={!body.trim() || rs.draftByteBlocked || rs.totalCapBlocked}>Add comment</button
     >
     <button type="button" class="editor-cancel" onclick={cancel}>Cancel</button>
   </div>

@@ -90,12 +90,13 @@ pub enum AckReason {
 /// Stable, index-independent identifier for a `FileDiff`, derived purely
 /// from the values that identify "this same file change" — never its
 /// position in the file list. SHA-256 of `old_path\0new_path\0old_oid\0
-/// new_oid\0old_mode\0new_mode` (absent components as empty strings),
-/// truncated to the first 16 hex chars (64 bits): collisions are
-/// astronomically unlikely for one diff's file set. This is what lets the
-/// client's acknowledgement list survive being keyed by something other
-/// than an array index, which a stale client (or a reordered/rebuilt file
-/// list) could otherwise point at the wrong file.
+/// new_oid\0old_mode\0new_mode\0` (absent components as empty strings, each
+/// component including the last followed by its own NUL), truncated to the
+/// first 16 hex chars (64 bits): collisions are astronomically unlikely for
+/// one diff's file set. This is what lets the client's acknowledgement list
+/// survive being keyed by something other than an array index, which a
+/// stale client (or a reordered/rebuilt file list) could otherwise point at
+/// the wrong file.
 fn compute_file_id(
     old_path: Option<&str>,
     new_path: Option<&str>,
