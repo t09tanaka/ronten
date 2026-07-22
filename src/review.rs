@@ -527,7 +527,23 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
 
     // 4. Build the session state.
-    let mut mapping = resolve_mapping(&files, &input);
+    let mut mapping = match resolve_mapping(&files, &input) {
+        Ok(mapping) => mapping,
+        Err(GitError::BudgetExceeded(msg)) => {
+            eprintln!("review too large: {msg}");
+            return exitcode::REVIEW_TOO_LARGE;
+        }
+        // `resolve_mapping` never returns any other `GitError` variant; kept
+        // exhaustive (not a wildcard) so a future variant added to
+        // `GitError` fails to compile here instead of silently falling
+        // through unhandled.
+        Err(
+            e @ (GitError::NotARepo
+            | GitError::BadBase(_)
+            | GitError::GitFailed(_)
+            | GitError::OutputOverflow(_)),
+        ) => unreachable!("resolve_mapping does not produce {e:?}"),
+    };
     // Surface diff-level warnings (e.g. files too large to display) ahead
     // of mapping warnings.
     if !diff_warnings.is_empty() {

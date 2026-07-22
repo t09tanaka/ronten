@@ -1173,6 +1173,21 @@ pub struct ResourceBudget {
     /// Total rendered diff lines across the whole review; files past the
     /// budget degrade to `TooLarge` (bounds the session JSON and the DOM).
     pub max_total_lines: usize,
+    /// Total claimed changed-line registrations across every concern's
+    /// resolved locations (`mapping::resolve_mapping`). Changed lines
+    /// themselves are already bounded by `max_total_lines`, but a concern
+    /// can re-claim the same large file's lines, and up to 200 concerns can
+    /// each do so — this bounds that cross-concern multiplication. Once
+    /// exceeded the review refuses to start (`GitError::BudgetExceeded`)
+    /// rather than building an oversized session.
+    pub max_resolved_edges: usize,
+    /// Total `HunkRef` entries across every concern's displayed hunks
+    /// (`mapping::resolve_mapping`). Bounds the size of the mapping (and the
+    /// session JSON it feeds) independent of `max_resolved_edges`, since a
+    /// concern's hunk list is deduplicated per `(file, hunk)` pair but still
+    /// scales with distinct hunks touched across up to 200 concerns. Once
+    /// exceeded the review refuses to start (`GitError::BudgetExceeded`).
+    pub max_hunk_refs: usize,
 }
 
 impl Default for ResourceBudget {
@@ -1184,6 +1199,8 @@ impl Default for ResourceBudget {
             max_file_lines: 50_000,
             max_line_bytes: 64 * 1024,
             max_total_lines: 200_000,
+            max_resolved_edges: 1_000_000,
+            max_hunk_refs: 100_000,
         }
     }
 }
