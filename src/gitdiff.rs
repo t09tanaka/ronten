@@ -1,5 +1,6 @@
 use crate::model::{Severity, Warning};
-use serde::Serialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
@@ -12,7 +13,7 @@ pub enum ChangeKind {
     Copied,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub enum ContentKind {
     #[serde(rename = "text")]
     Text,
@@ -28,7 +29,7 @@ pub enum ContentKind {
 /// Surfaced separately from `ContentKind` because a symlink or gitlink can
 /// render "text" content (the target path / `Subproject commit` line) while
 /// being a fundamentally different kind of object than a regular file.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FileType {
     Regular,
@@ -57,7 +58,7 @@ fn file_type_of_mode(mode: &str) -> Option<FileType> {
 /// duplicated verbatim in TypeScript (`opaque.ts`'s `requiresAck`); the two
 /// could — and did — drift (P0-5). The frontend now only displays these
 /// server-computed reasons, never recomputes them.
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum AckReason {
     /// Content not rendered in the diff body (binary / non-utf8 / too-large).
@@ -2595,6 +2596,23 @@ pub fn compute_diff_with_budget(
                 let old = side_bytes(&entry.old_mode, &entry.old_oid, &contents)?;
                 let new = side_bytes(&entry.new_mode, &entry.new_oid, &contents)?;
                 if is_binary(&old) || is_binary(&new) {
+                    // P1-2: binary content was previously classified with no
+                    // corresponding structured warning — a result JSON
+                    // reader had no machine-readable signal that a binary
+                    // file's content was never rendered, only the
+                    // `content_kind` on the (not always inspected) file
+                    // entry itself.
+                    warnings.push(
+                        Warning::new(
+                            "BINARY_CONTENT",
+                            Severity::Warning,
+                            format!(
+                                "binary file content is not rendered: {}",
+                                display_path(entry)
+                            ),
+                        )
+                        .with_path(display_path(entry)),
+                    );
                     (ContentKind::Binary, Vec::new())
                 } else {
                     match (std::str::from_utf8(&old), std::str::from_utf8(&new)) {
@@ -3174,6 +3192,41 @@ mod git_tests {
         let f = find(&out.files, "blob.bin");
         assert_eq!(f.content_kind, ContentKind::Binary);
         assert!(f.hunks.is_empty());
+    }
+
+    /// P1-2: a *modified* binary file (both sides present, bytes differ) is
+    /// the case that previously fell through with `content_kind: Binary` and
+    /// no structured warning at all — a result JSON reader had no
+    /// machine-readable way to know a binary file's content was never
+    /// rendered.
+    #[test]
+    fn modified_binary_emits_structured_warning() {
+        let td = tempfile::tempdir().unwrap();
+        let d = td.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("blob.bin"), b"\x00\x01\x02old-bytes").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "base"]);
+        git(d, &["checkout", "-b", "feature"]);
+        std::fs::write(d.join("blob.bin"), b"\x00\x01\x02new-bytes-here").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "change"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        assert_eq!(out.files.len(), 1);
+        let f = &out.files[0];
+        assert_eq!(f.content_kind, ContentKind::Binary);
+        assert_eq!(f.change_kind, ChangeKind::Modified);
+        assert!(f.hunks.is_empty());
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.code == "BINARY_CONTENT" && w.path.as_deref() == Some("blob.bin")),
+            "expected a BINARY_CONTENT warning naming blob.bin: {:?}",
+            out.warnings
+        );
     }
 
     #[test]

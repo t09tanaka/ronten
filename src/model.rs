@@ -5,6 +5,7 @@
 //! silently be dropped and widen a location to whole-file. Any intentional
 //! extension happens in a future version 2, not by loosening this one.
 
+use crate::gitdiff::{AckReason, ContentKind, FileType};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -13,8 +14,13 @@ pub const SUPPORTED_VERSION: u32 = 1;
 
 /// The result *output* contract version this build of ronten emits. v2 added
 /// the `review` block pinning the result to the reviewed commits and to
-/// canonical digests of the diff and concerns input.
-pub const OUTPUT_VERSION: u32 = 2;
+/// canonical digests of the diff and concerns input. v3 added `files`
+/// (per-file audit, including what was omitted and why), `acknowledgements`
+/// (what the reviewer explicitly acked and why), `worktree` (dirty-worktree
+/// audit at start and submit), and `build` (what produced this result) — so
+/// the result JSON is auditable standalone, without re-deriving any of that
+/// from the live session.
+pub const OUTPUT_VERSION: u32 = 3;
 
 /// Top-level input: a list of concerns an agent wants a human to review.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -95,6 +101,9 @@ pub enum Side {
 /// to exactly what was reviewed via the `review` block.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ResultOutput {
+    /// Contract version this result was emitted under; always
+    /// [`OUTPUT_VERSION`] for a given build.
+    #[schemars(range(min = 3, max = 3))]
     pub version: u32,
     /// What this result applies to: the reviewed commits and digests of the
     /// diff and concerns input, plus the assurance level of the outcome.
@@ -103,8 +112,122 @@ pub struct ResultOutput {
     pub concerns: Vec<ConcernResult>,
     pub general_comments: Vec<String>,
     pub warnings: Vec<Warning>,
+    /// Every file in the reviewed diff, including what was (or was not)
+    /// rendered to the reviewer and why — so a standalone reader of this
+    /// JSON can tell whether a binary/LFS/too-large/submodule file was
+    /// present without re-running the diff.
+    pub files: Vec<FileAudit>,
+    /// Every file the reviewer explicitly acknowledged before submit, with
+    /// the reasons acknowledgement was required.
+    pub acknowledgements: Vec<Acknowledgement>,
+    /// Worktree cleanliness audit: what dirty-worktree policy was in effect,
+    /// and whether the worktree was clean at review start and at submit.
+    pub worktree: WorktreeAudit,
+    /// What produced this result (binary version, source commit, target).
+    pub build: BuildInfo,
     pub started_at: String,
     pub submitted_at: String,
+}
+
+/// Per-file audit entry: identity, the git-level facts about the change, and
+/// whether its content was actually rendered to the reviewer.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FileAudit {
+    /// Same id as `FileDiff::id()` / the session's `acknowledgements` —
+    /// stable across the session, not an array index.
+    pub file_id: String,
+    pub old_path: Option<String>,
+    pub new_path: Option<String>,
+    pub old_mode: Option<String>,
+    pub new_mode: Option<String>,
+    /// The kind of filesystem object this file is — `new_type` if present
+    /// (the file as it now stands), else `old_type` (a deletion).
+    pub file_type: Option<FileType>,
+    pub old_oid: Option<String>,
+    pub new_oid: Option<String>,
+    pub content_kind: ContentKind,
+    /// Whether the actual file content was shown to the reviewer. `false`
+    /// whenever `omission_reason` is set.
+    pub rendered: bool,
+    /// Why content was not rendered, when `rendered` is `false`: `binary`,
+    /// `lfs_pointer`, `too_large`, `non_utf8`, `submodule`. A file can have
+    /// more than one issue (e.g. an LFS pointer that also decodes as
+    /// non-UTF-8 would not, but binary-and-too-large could); this picks the
+    /// single dominant reason rather than listing every contributing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omission_reason: Option<String>,
+}
+
+/// One reviewer acknowledgement of a file whose change required explicit
+/// sign-off (see `FileDiff::ack_reasons`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Acknowledgement {
+    pub file_id: String,
+    pub reasons: Vec<AckReason>,
+    /// RFC3339 UTC instant this acknowledgement was recorded. Per-ack
+    /// acknowledgement isn't tracked separately from the rest of the draft
+    /// (the draft is a scratchpad edited freely until submit), so this is
+    /// always the submit time — the moment the acknowledgement became final.
+    pub acknowledged_at: String,
+}
+
+/// Worktree cleanliness audit, captured at review start and re-checked at
+/// submit. `clean_at_start`/`clean_at_submit` are only meaningful when the
+/// corresponding `checked_at_*` is `true` — an unchecked worktree (policy
+/// `ignore`, or a submit-time git failure) is never recorded as clean.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeAudit {
+    /// The `--dirty-policy` in effect for this session: `error`, `warn`, or
+    /// `ignore`.
+    pub policy: String,
+    /// Whether the worktree was actually queried at session start. `false`
+    /// under `--dirty-policy ignore`, or when the query itself failed.
+    pub checked_at_start: bool,
+    /// Meaningful only when `checked_at_start` is `true`.
+    pub clean_at_start: bool,
+    /// Whether the worktree was re-queried at submit. Only attempted when
+    /// the policy is `warn` or `error`; `false` under `ignore` or when the
+    /// re-check itself failed (a git failure at submit is recorded as a
+    /// warning and does not block the submit — see `warnings`).
+    pub checked_at_submit: bool,
+    /// Meaningful only when `checked_at_submit` is `true`.
+    pub clean_at_submit: bool,
+    /// Paths excluded from the dirty check (currently: the concerns input
+    /// file itself, when it is present untracked at its own repo-relative
+    /// path).
+    pub excluded_paths: Vec<String>,
+}
+
+/// Identifies the ronten build that produced this result. `source_commit`,
+/// `source_dirty`, `rust_version`, `target`, `profile`, and `frontend_digest`
+/// are populated by `build.rs`-injected env vars when available; they are
+/// `None` on a build that didn't set them (e.g. this one, until Task 5.4
+/// wires `build.rs` to emit them) rather than a hard build requirement.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuildInfo {
+    pub ronten_version: String,
+    pub source_commit: Option<String>,
+    pub source_dirty: Option<bool>,
+    pub rust_version: Option<String>,
+    pub target: Option<String>,
+    pub profile: Option<String>,
+    pub frontend_digest: Option<String>,
+}
+
+impl BuildInfo {
+    /// Builds from the current binary's compile-time env — `None` for
+    /// anything not injected by `build.rs` yet (Task 5.4).
+    pub fn current() -> Self {
+        BuildInfo {
+            ronten_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_commit: option_env!("RONTEN_SOURCE_COMMIT").map(str::to_string),
+            source_dirty: option_env!("RONTEN_SOURCE_DIRTY").map(|v| v == "true"),
+            rust_version: option_env!("RONTEN_RUSTC_VERSION").map(str::to_string),
+            target: option_env!("RONTEN_TARGET").map(str::to_string),
+            profile: option_env!("RONTEN_PROFILE").map(str::to_string),
+            frontend_digest: option_env!("RONTEN_FRONTEND_DIGEST").map(str::to_string),
+        }
+    }
 }
 
 /// A structured warning surfaced to the reviewer and preserved in the
@@ -328,6 +451,53 @@ mod tests {
             count >= 3,
             "expected additionalProperties:false at least 3 times \
              (ConcernsInput, Concern, Location), found {count} in schema: {schema}"
+        );
+    }
+
+    /// v3 result-contract audit fields (files / acknowledgements / worktree /
+    /// build) must actually show up in the generated JSON Schema — this
+    /// pins the schema's *text* so a future refactor that accidentally
+    /// drops a field (or a schemars major bump that renders them
+    /// differently) fails here first, not only via a downstream consumer
+    /// silently losing audit data. The version literal is pinned too: a
+    /// consumer reading `ronten schema --output` must see the schema itself
+    /// declare "always 3", not just the runtime constant.
+    #[test]
+    fn output_schema_pins_v3_audit_fields_and_version_literal() {
+        let schema = serde_json::to_string(&schemars::schema_for!(ResultOutput))
+            .expect("schema serializes to JSON");
+        for field in [
+            "\"files\"",
+            "\"acknowledgements\"",
+            "\"worktree\"",
+            "\"build\"",
+            "\"file_id\"",
+            "\"content_kind\"",
+            "\"rendered\"",
+            "\"omission_reason\"",
+            "\"reasons\"",
+            "\"acknowledged_at\"",
+            "\"policy\"",
+            "\"checked_at_start\"",
+            "\"clean_at_start\"",
+            "\"checked_at_submit\"",
+            "\"clean_at_submit\"",
+            "\"excluded_paths\"",
+            "\"ronten_version\"",
+            "\"source_commit\"",
+        ] {
+            assert!(
+                schema.contains(field),
+                "output schema missing {field}: {schema}"
+            );
+        }
+        // The `version` field must be pinned to the literal 3, not left as
+        // an unconstrained u32 — mirrors the input contract's own version
+        // pin (see `input_schema_denies_unknown_fields_on_every_object`'s
+        // sibling concern for `ConcernsInput`).
+        assert!(
+            schema.contains("\"minimum\":3") && schema.contains("\"maximum\":3"),
+            "output schema must pin version to the literal 3: {schema}"
         );
     }
 

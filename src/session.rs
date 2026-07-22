@@ -5,8 +5,9 @@
 use crate::gitdiff::{AckReason, FileDiff};
 use crate::mapping::{HunkRef, Mapping, UnmappedLine, UNMAPPED_ID};
 use crate::model::{
-    derive_decision, Assurance, Comment, ConcernResult, ConcernsInput, ResultOutput, ReviewInfo,
-    Risk, Side, Verdict, Warning, OUTPUT_VERSION,
+    derive_decision, Acknowledgement, Assurance, BuildInfo, Comment, ConcernResult, ConcernsInput,
+    FileAudit, ResultOutput, ReviewInfo, Risk, Side, Verdict, Warning, WorktreeAudit,
+    OUTPUT_VERSION,
 };
 use crate::server::Outcome;
 use crate::snapshot::ReviewSnapshot;
@@ -126,6 +127,53 @@ impl<'a> From<&'a FileDiff> for FileView<'a> {
     }
 }
 
+/// Why `file`'s content was not rendered to the reviewer, when it wasn't —
+/// `None` means it was (an ordinary text change, or a hunk-less change with
+/// nothing to hide, e.g. a pure rename). A file can trip more than one of
+/// these (e.g. an LFS pointer that also fails UTF-8 decoding would not, but
+/// `content_kind` opacity and an LFS pointer both being true is
+/// contradictory by construction — LFS pointer text is always valid UTF-8);
+/// this picks a single dominant reason, checked in the order content
+/// opacity (the diff body itself couldn't show it) then LFS pointer (the
+/// diff body shows a pointer, not real data) then submodule (an existing
+/// gitlink's pointer moved — the nested diff is never shown).
+fn omission_reason(file: &FileDiff) -> Option<&'static str> {
+    match file.content_kind {
+        crate::gitdiff::ContentKind::Binary => return Some("binary"),
+        crate::gitdiff::ContentKind::NonUtf8 => return Some("non_utf8"),
+        crate::gitdiff::ContentKind::TooLarge => return Some("too_large"),
+        crate::gitdiff::ContentKind::Text => {}
+    }
+    if file.lfs_pointer {
+        return Some("lfs_pointer");
+    }
+    let gitlink_involved = file.old_type == Some(crate::gitdiff::FileType::Gitlink)
+        || file.new_type == Some(crate::gitdiff::FileType::Gitlink);
+    if gitlink_involved && file.old_oid != file.new_oid {
+        return Some("submodule");
+    }
+    None
+}
+
+impl From<&FileDiff> for FileAudit {
+    fn from(file: &FileDiff) -> Self {
+        let omission_reason = omission_reason(file);
+        FileAudit {
+            file_id: file.id(),
+            old_path: file.old_path.clone(),
+            new_path: file.new_path.clone(),
+            old_mode: file.old_mode.clone(),
+            new_mode: file.new_mode.clone(),
+            file_type: file.new_type.or(file.old_type),
+            old_oid: file.old_oid.clone(),
+            new_oid: file.new_oid.clone(),
+            content_kind: file.content_kind,
+            rendered: omission_reason.is_none(),
+            omission_reason: omission_reason.map(str::to_string),
+        }
+    }
+}
+
 /// Everything the UI needs, sent by `GET /api/{token}/session`.
 #[derive(Serialize)]
 pub struct SessionPayload<'a> {
@@ -158,6 +206,40 @@ pub struct ConcernView<'a> {
     pub hunks: &'a [HunkRef],
 }
 
+/// Worktree cleanliness captured once at session start (in `review::run`,
+/// or left at defaults for sessions with no dirty gate at all — demo, or
+/// `--dirty-policy ignore`). Kept separate from `model::WorktreeAudit`
+/// because the submit-time half of that audit
+/// (`checked_at_submit`/`clean_at_submit`) is only known once `build_result`
+/// actually runs the re-check, never at session construction.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeStartAudit {
+    /// Whether the worktree was actually queried at start. `false` under
+    /// `--dirty-policy ignore`, or when the query itself failed (a `Warn`
+    /// policy proceeds on git failure without ever getting a status).
+    pub checked: bool,
+    /// Meaningful only when `checked` is `true`.
+    pub clean: bool,
+    pub excluded_paths: Vec<String>,
+}
+
+/// Result of the submit-time worktree re-check `build_result` embeds in the
+/// result's `WorktreeAudit` — computed by the caller (an async context; the
+/// re-check itself needs to shell out to git) and handed in, since
+/// `build_result` itself stays synchronous.
+#[derive(Debug, Clone, Default)]
+pub struct WorktreeSubmitAudit {
+    /// Whether the re-check actually ran and succeeded.
+    pub checked: bool,
+    /// Meaningful only when `checked` is `true`.
+    pub clean: bool,
+    /// Set when the re-check was attempted but failed (git error): recorded
+    /// as a warning in the result rather than blocking the submit — the
+    /// approval itself is already protected by the `HEAD` pin, and worktree
+    /// cleanliness here is audit information, not a gate.
+    pub warning: Option<Warning>,
+}
+
 /// All state for one review session, shared behind an `Arc` across handlers.
 pub struct SessionState {
     pub title: String,
@@ -175,6 +257,19 @@ pub struct SessionState {
     /// sessions with no git repository behind them (demo), which skips the
     /// check.
     pub repo_root: Option<std::path::PathBuf>,
+    /// Wire name of the `--dirty-policy` in effect (`"error"`, `"warn"`, or
+    /// `"ignore"`), carried straight into the result's `WorktreeAudit`.
+    /// `"ignore"` for sessions with no dirty-worktree concept at all (demo).
+    pub dirty_policy: String,
+    /// Worktree cleanliness as captured once at session start; see
+    /// [`WorktreeStartAudit`].
+    pub worktree_start: WorktreeStartAudit,
+    /// Repo-relative path exempted from the dirty check (the concerns input
+    /// file, when present untracked at its own path) — re-applied at the
+    /// submit-time re-check so the audit is consistent between start and
+    /// submit. `None` when no exemption applies (including demo/no-repo
+    /// sessions).
+    pub worktree_exempt_path: Option<String>,
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// `started_at` + `--timeout`, if one was given; `None` for an
     /// untimed session. Computed once at session construction so every
@@ -437,8 +532,18 @@ impl SessionState {
     }
 
     /// Builds the final `ResultOutput` from a submitted draft. Callers must
-    /// have already verified every `required_ids()` entry has a verdict.
-    pub fn build_result(&self, draft: &Draft) -> ResultOutput {
+    /// have already verified every `required_ids()` entry has a verdict, and
+    /// every `draft.acknowledgements` entry is a known, ack-required file id
+    /// (both enforced by [`validate_draft`](Self::validate_draft)).
+    ///
+    /// `worktree_submit` is the submit-time worktree re-check — computed by
+    /// the caller (an async context able to shell out to git) and handed in
+    /// so this method itself stays synchronous.
+    pub fn build_result(
+        &self,
+        draft: &Draft,
+        worktree_submit: WorktreeSubmitAudit,
+    ) -> ResultOutput {
         let required = self.required_ids();
         let concerns: Vec<ConcernResult> = required
             .iter()
@@ -454,6 +559,35 @@ impl SessionState {
             })
             .collect();
         let decision = derive_decision(concerns.iter().map(|c| c.verdict));
+
+        let submitted_at = chrono::Utc::now();
+        let submitted_at_rfc3339 = submitted_at.to_rfc3339();
+
+        let files: Vec<FileAudit> = self.files.iter().map(FileAudit::from).collect();
+
+        // File order, not draft order (the draft's `acknowledgements` is
+        // effectively an unordered set on the wire) — deterministic and
+        // matches `files` above. Acknowledgement timestamps are not tracked
+        // per-ack (the draft is a scratchpad edited freely until submit);
+        // recording the submit instant is the only value that can't go
+        // stale relative to when the acknowledgement became final.
+        let acked: HashSet<&String> = draft.acknowledgements.iter().collect();
+        let acknowledgements: Vec<Acknowledgement> = self
+            .files
+            .iter()
+            .filter(|f| acked.contains(&f.id()))
+            .map(|f| Acknowledgement {
+                file_id: f.id(),
+                reasons: f.ack_reasons(),
+                acknowledged_at: submitted_at_rfc3339.clone(),
+            })
+            .collect();
+
+        let mut warnings = self.mapping.warnings.clone();
+        if let Some(w) = worktree_submit.warning {
+            warnings.push(w);
+        }
+
         ResultOutput {
             version: OUTPUT_VERSION,
             review: ReviewInfo {
@@ -470,9 +604,20 @@ impl SessionState {
             decision,
             concerns,
             general_comments: draft.general_comments.clone(),
-            warnings: self.mapping.warnings.clone(),
+            warnings,
+            files,
+            acknowledgements,
+            worktree: WorktreeAudit {
+                policy: self.dirty_policy.clone(),
+                checked_at_start: self.worktree_start.checked,
+                clean_at_start: self.worktree_start.clean,
+                checked_at_submit: worktree_submit.checked,
+                clean_at_submit: worktree_submit.clean,
+                excluded_paths: self.worktree_start.excluded_paths.clone(),
+            },
+            build: BuildInfo::current(),
             started_at: self.started_at.to_rfc3339(),
-            submitted_at: chrono::Utc::now().to_rfc3339(),
+            submitted_at: submitted_at_rfc3339,
         }
     }
 }

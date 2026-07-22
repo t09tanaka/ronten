@@ -1,8 +1,8 @@
 //! Token-protected localhost HTTP server exposing the review session.
 
 use crate::assets;
-use crate::model::ResultOutput;
-use crate::session::{Draft, SessionPayload, SessionState};
+use crate::model::{ResultOutput, Severity, Warning};
+use crate::session::{Draft, SessionPayload, SessionState, WorktreeSubmitAudit};
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
@@ -424,6 +424,50 @@ async fn check_head_freshness(state: &SessionState) -> Option<Response> {
     None
 }
 
+/// Re-checks worktree cleanliness at submit time, for the result's audit
+/// trail — best-effort and fail-open: a git failure here is recorded as a
+/// warning, never blocks the submit. The submit's validity is already
+/// protected by [`check_head_freshness`]'s `HEAD` pin; worktree cleanliness
+/// is audit information layered on top of that, not a second gate.
+///
+/// Skipped (returns the all-`false`/no-warning default) under
+/// `--dirty-policy ignore` and for sessions with no repository behind them
+/// (demo) — neither has a worktree concept to re-check.
+async fn recheck_worktree_at_submit(state: &SessionState) -> WorktreeSubmitAudit {
+    if state.dirty_policy == "ignore" {
+        return WorktreeSubmitAudit::default();
+    }
+    let Some(root) = state.repo_root.clone() else {
+        return WorktreeSubmitAudit::default();
+    };
+    let exempt = state.worktree_exempt_path.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        crate::gitdiff::worktree_status(&root).map(|mut status| {
+            if let Some(path) = &exempt {
+                status.untracked.retain(|p| p != path);
+            }
+            status.is_clean()
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Ok(clean)) => WorktreeSubmitAudit {
+            checked: true,
+            clean,
+            warning: None,
+        },
+        _ => WorktreeSubmitAudit {
+            checked: false,
+            clean: false,
+            warning: Some(Warning::new(
+                "WORKTREE_CHECK_FAILED",
+                Severity::Warning,
+                "could not re-verify worktree cleanliness at submit time".to_string(),
+            )),
+        },
+    }
+}
+
 async fn post_submit(
     State(state): State<Arc<SessionState>>,
     Path(token): Path<String>,
@@ -481,7 +525,8 @@ async fn post_submit(
     // gets the same draft-conflict refusal a stale save does — submitting
     // must not be a side door around it. Claimed only after full
     // validation, so a rejected submit never consumes the session.
-    let result = state.build_result(&draft);
+    let worktree_submit = recheck_worktree_at_submit(&state).await;
+    let result = state.build_result(&draft, worktree_submit);
     match state.try_finish_at_revision(
         Outcome::Submitted(Box::new(result)),
         body.revision,
@@ -645,6 +690,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -701,6 +749,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: Some(repo_root),
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -759,6 +810,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -826,6 +880,9 @@ index 1111111..2222222 100644
             session_id: "sessid".to_string(),
             snapshot,
             repo_root: None,
+            dirty_policy: "ignore".to_string(),
+            worktree_start: crate::session::WorktreeStartAudit::default(),
+            worktree_exempt_path: None,
             started_at: chrono::Utc::now(),
             deadline_at: None,
             phase: std::sync::Mutex::new(crate::session::Phase::Reviewing(
@@ -1716,7 +1773,7 @@ index 1111111..2222222 100644
         let outcome = state.finished_outcome().unwrap();
         match outcome {
             Outcome::Submitted(r) => {
-                assert_eq!(r.version, 2);
+                assert_eq!(r.version, 3);
                 assert_eq!(r.review.base_ref, "main");
                 assert!(r.review.base_oid.is_none(), "no git behind test sessions");
                 assert_eq!(r.concerns[0].comments.len(), 3);
