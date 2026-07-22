@@ -3409,10 +3409,25 @@ mod git_tests {
     /// (see the comment on `rev_parse_honors_short_deadline` below). Unlike
     /// `descendant_holding_pipe_does_not_wedge_past_deadline`, the
     /// backgrounded `sleep` here redirects its own stdout/stderr to
-    /// `/dev/null` (keeping only the *stdin* read end via `<&0`), so
+    /// `/dev/null` (keeping only the *stdin* read end), so
     /// `wait_with_timeout` returns `Ok` within milliseconds instead of
     /// waiting out the descendant too — isolating the writer-only wedge
     /// this test is about from the already-covered reader wedge.
+    ///
+    /// The stdin redirect is `exec 3<&0; sleep ... <&3 ...`, not a plain
+    /// `<&0` on the backgrounded command. POSIX says an asynchronous
+    /// command's stdin is redirected to something with `/dev/null`'s
+    /// properties *before* any explicit redirection in that command is
+    /// applied; on `dash` (Linux's `/bin/sh`) `sleep ... <&0 &` therefore
+    /// dups from the already-`/dev/null`'d fd 0, not the real pipe, so the
+    /// pipe's read end closes the moment `sh` exits and `write_all` gets a
+    /// fast `EPIPE` instead of blocking — silently defeating this test on
+    /// Linux CI while it passed locally under macOS's bash-backed `/bin/sh`
+    /// (which does not apply that redirect-before-async-default rule).
+    /// `exec 3<&0` runs synchronously in the parent shell, before the
+    /// async default can apply, so fd 3 is a real duplicate of the pipe's
+    /// read end that `sleep <&3` then inherits on both `dash` and `bash` —
+    /// verified locally against both.
     ///
     /// The whole check runs on a background thread with a generous
     /// `recv_timeout` on the main thread: if `join_writer_bounded`
@@ -3426,7 +3441,7 @@ mod git_tests {
             let result = std::panic::catch_unwind(|| {
                 let mut cmd = std::process::Command::new("sh");
                 cmd.arg("-c")
-                    .arg("sleep 5 <&0 >/dev/null 2>&1 & exit 0")
+                    .arg("exec 3<&0; sleep 5 <&3 >/dev/null 2>&1 & exit 0")
                     .stdin(std::process::Stdio::piped())
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::piped());
