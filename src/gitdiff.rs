@@ -3389,47 +3389,34 @@ mod git_tests {
         );
     }
 
-    /// The write-side twin of `descendant_holding_pipe_does_not_wedge_past_deadline`
-    /// above, and the regression test for the `cat_file_stdin` writer-join
-    /// bug: a direct child that backgrounds a descendant holding the stdin
-    /// *read* end open (without reading it) and then exits 0 makes
-    /// `wait_with_timeout` legitimately return `Ok` — the direct child
-    /// exited, stdout/stderr both EOF'd — well before any deadline. The old
-    /// `cat_file_stdin` then unconditionally `.join()`ed the stdin-writer
-    /// thread; with nothing left to drain a >pipe-buffer write, that join
-    /// never returned. A `--batch` request for a large diff is easily past
-    /// the ~64 KiB pipe buffer (see the doc comment on
-    /// `join_writer_bounded`), so this is reachable, not theoretical.
+    /// The regression test for the `cat_file_stdin` writer-join bug:
+    /// `join_writer_bounded` must not block past `grace` even when the
+    /// writer thread genuinely never finishes. In production this happens
+    /// when a tampered `git`'s direct child exits 0 (so `wait_with_timeout`
+    /// legitimately returns `Ok` — stdout/stderr both EOF'd) while a
+    /// descendant it spawned keeps the stdin *read* end open without ever
+    /// reading it; a `--batch` request for a large diff is easily past the
+    /// ~64 KiB pipe buffer (see the doc comment on `join_writer_bounded`),
+    /// so `write_all` blocks forever on the old unconditional `.join()`.
     ///
-    /// This exercises `join_writer_bounded` directly with `sh` standing in
-    /// for a tampered `git`, the same substitution the existing
-    /// `wait_with_timeout` regression tests above use — shadowing the real
-    /// `git` on `PATH` would be a process-wide mutation racing every other
-    /// test in this module that shells out to a real `git` concurrently
-    /// (see the comment on `rev_parse_honors_short_deadline` below). Unlike
-    /// `descendant_holding_pipe_does_not_wedge_past_deadline`, the
-    /// backgrounded `sleep` here redirects its own stdout/stderr to
-    /// `/dev/null` (keeping only the *stdin* read end), so
-    /// `wait_with_timeout` returns `Ok` within milliseconds instead of
-    /// waiting out the descendant too — isolating the writer-only wedge
-    /// this test is about from the already-covered reader wedge.
+    /// This constructs that "full pipe, nothing draining it" condition
+    /// directly with a raw `libc::pipe`, rather than via a shell descendant.
+    /// An earlier version of this test used `sh`/`sleep` to play the
+    /// tampered-git role, mirroring the existing `wait_with_timeout`
+    /// regression tests' style — but that turned out to be fragile in
+    /// practice for the write side specifically: getting a *descendant*
+    /// process to reliably retain a duplicated read end of the stdin pipe,
+    /// across dash vs bash, job-control, and `spawn_grouped`'s
+    /// `process_group(0)`, proved to not generalize the way the
+    /// already-existing reader-side tests do (a `dash`-as-`/bin/sh` fixture
+    /// that verified correct in isolation still failed the same way inside
+    /// the actual `Command`/`spawn_grouped` harness). A raw pipe removes
+    /// all of that: `read_fd` is simply never read from and never closed
+    /// until this test says so, so the writer is guaranteed to block once
+    /// the kernel pipe buffer (~64 KiB) fills, on every platform, with no
+    /// shell or subprocess involved at all.
     ///
-    /// The stdin redirect is `exec 3<&0; sleep ... <&3 ...`, not a plain
-    /// `<&0` on the backgrounded command. POSIX says an asynchronous
-    /// command's stdin is redirected to something with `/dev/null`'s
-    /// properties *before* any explicit redirection in that command is
-    /// applied; on `dash` (Linux's `/bin/sh`) `sleep ... <&0 &` therefore
-    /// dups from the already-`/dev/null`'d fd 0, not the real pipe, so the
-    /// pipe's read end closes the moment `sh` exits and `write_all` gets a
-    /// fast `EPIPE` instead of blocking — silently defeating this test on
-    /// Linux CI while it passed locally under macOS's bash-backed `/bin/sh`
-    /// (which does not apply that redirect-before-async-default rule).
-    /// `exec 3<&0` runs synchronously in the parent shell, before the
-    /// async default can apply, so fd 3 is a real duplicate of the pipe's
-    /// read end that `sleep <&3` then inherits on both `dash` and `bash` —
-    /// verified locally against both.
-    ///
-    /// The whole check runs on a background thread with a generous
+    /// The whole check still runs on a background thread with a generous
     /// `recv_timeout` on the main thread: if `join_writer_bounded`
     /// regresses back to an unbounded block, this test fails promptly
     /// instead of hanging the entire suite.
@@ -3439,30 +3426,28 @@ mod git_tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = std::panic::catch_unwind(|| {
-                let mut cmd = std::process::Command::new("sh");
-                cmd.arg("-c")
-                    .arg("exec 3<&0; sleep 5 <&3 >/dev/null 2>&1 & exit 0")
-                    .stdin(std::process::Stdio::piped())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                let mut child = spawn_grouped(&mut cmd).unwrap();
-                let mut stdin = child.stdin.take().unwrap();
+                use std::os::unix::io::FromRawFd;
+
+                let mut fds = [0 as libc::c_int; 2];
+                // SAFETY: `fds` is a valid, correctly-sized out-pointer for
+                // `pipe(2)`; the call either fills both slots with fresh
+                // fds or returns -1 (checked immediately below).
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                let read_fd = fds[0];
+                let write_fd = fds[1];
+                // SAFETY: `write_fd` was just returned by `pipe(2)` above,
+                // is open, and is not owned by anything else yet.
+                let mut w = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
                 // Comfortably larger than any real pipe buffer (typically
                 // 16-64 KiB) so `write_all` is guaranteed to block once the
-                // descendant stops draining it.
+                // kernel buffer fills, since `read_fd` is deliberately never
+                // read from below.
                 let payload = vec![b'x'; 8 * 1024 * 1024];
                 let writer = std::thread::spawn(move || -> std::io::Result<()> {
                     use std::io::Write;
-                    stdin.write_all(&payload)
+                    w.write_all(&payload)
                 });
-
-                let output =
-                    wait_with_timeout(child, GIT_TIMEOUT, DEFAULT_MAX_STDOUT_BYTES).unwrap();
-                assert!(
-                    output.status.success(),
-                    "the direct `sh` child must exit 0 for this to be the Ok-path regression \
-                     `join_writer_bounded` guards against"
-                );
 
                 let start = std::time::Instant::now();
                 let result = join_writer_bounded(writer, KILL_GRACE);
@@ -3477,6 +3462,15 @@ mod git_tests {
                     "join_writer_bounded must return by ~KILL_GRACE instead of blocking \
                      forever on the stuck writer: {elapsed:?}"
                 );
+
+                // `join_writer_bounded` already detached the writer thread
+                // (it never finished within `grace`); closing `read_fd` now
+                // makes its blocked `write_all` fail with EPIPE so that
+                // leaked thread unwinds instead of staying blocked for the
+                // life of the test process.
+                // SAFETY: `read_fd` is still open (never touched since the
+                // `pipe(2)` call above) and not aliased by anything else.
+                unsafe { libc::close(read_fd) };
             });
             let _ = tx.send(result);
         });
