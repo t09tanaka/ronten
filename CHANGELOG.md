@@ -48,6 +48,27 @@ project is pre-1.0 and minor versions may contain breaking changes.
   worktree paths and git error text are escaped to visible `⟨U+XXXX⟩`
   tokens on stderr; the review UI reveals the same ranges in paths and
   titles (and all but TAB in diff line content).
+- Result JSON output contract v3, so a result is auditable standalone
+  without re-deriving anything from the live session: `files[]` — every
+  file in the diff, with `content_kind` and, when its content wasn't
+  rendered, an `omission_reason` (`binary`/`lfs_pointer`/`too_large`/
+  `non_utf8`/`submodule`); `acknowledgements[]` — `file_id`, the
+  server-computed ack reasons, and an RFC3339 `acknowledged_at` (submit
+  time); `worktree` — the `--dirty-policy` in effect and whether the
+  worktree was checked/clean at session start and re-checked at submit
+  (fail-open: a git failure at the submit recheck is a warning, not a
+  blocker); `build` — `ronten_version` now, with
+  `source_commit`/`rust_version`/`target`/`profile`/`frontend_digest`
+  wired but `null` until a future build.rs change populates them. A
+  modified binary file now also emits a structured `BINARY_CONTENT`
+  warning instead of passing through silently.
+- New `ronten validate-concerns [FILE|-]` subcommand: validates a
+  concerns JSON document (file, stdin via `-`/omitted, or piped) with the
+  same structural parse and semantic checks `ronten review` runs at
+  startup, without needing a git repository or opening a session. Prints
+  `{"valid": true}` (exit 0) or `{"valid": false, "errors": [{"code",
+  "message", "concern_id"?}]}` (exit 10, the same code `review` uses for
+  invalid concerns).
 
 ### Changed
 - File acknowledgement is now server-authoritative and keyed by a stable,
@@ -67,8 +88,24 @@ project is pre-1.0 and minor versions may contain breaking changes.
   submit/abort/timeout race can lose an outcome, double-report, or let a
   late autosave rewrite a frozen draft. Graceful shutdown has a hard
   deadline; a second Ctrl-C force-exits.
-- Result JSON `version` is now `2`; `warnings` are structured objects. The
+- Result JSON `version` is now `3`; `warnings` are structured objects. The
   concerns *input* contract remains v1.
+- `ConcernsInput.version` and `ResultOutput.version` are now pinned via a
+  real JSON Schema `const` (was an approximating `min == max` range), and
+  `started_at`/`submitted_at`/`acknowledged_at` are marked `format:
+  date-time`. `mapping::validate_concerns` now returns every applicable
+  validation failure (not just the first), each with a stable
+  machine-readable `code`; `review`'s startup check and the new
+  `validate-concerns` subcommand share this one validator, so they can
+  never report different results for the same input.
+- Comment limits are now mutually consistent end to end: new review-wide
+  totals (1000 comments, 1,500,000 comment characters) guarantee a draft
+  satisfying every advertised per-field limit still fits the 8 MiB
+  request body cap; `PUT /draft` now enforces these caps too (422 "draft
+  exceeds limits"), not just submit. The browser measures draft byte size
+  (warns at 90%, blocks at 100% of the advertised max) and now
+  counts/truncates comment text by Unicode scalar instead of UTF-16 code
+  units, matching how the server counts characters.
 - The dirty-worktree gate's exemption is now category- and path-scoped:
   only the untracked concerns input file, matched by its exact
   repo-relative path (no symlink resolution), is exempt; tracked changes
@@ -88,6 +125,9 @@ project is pre-1.0 and minor versions may contain breaking changes.
   without virtualization.
 
 ### Fixed
+- The opaque-content ack card (binary/non-UTF-8/too-large) now also shows
+  any other applicable ack reasons (e.g. a mode change on the same file)
+  instead of only the generic "acknowledge without reviewing" checkbox.
 - Save, submit, and abort are serialized through a single mutation chain,
   and submit now flushes any in-flight or queued autosave before reading
   the revision to submit: previously submit only cancelled the pending

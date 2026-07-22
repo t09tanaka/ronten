@@ -126,6 +126,11 @@ visible instead of rendering as two identical-looking lines.
 | 17 | worktree not clean under `--dirty-policy error` (the default); commit/stash first or pass `--dirty-policy warn` |
 | 18 | the diff exceeds a hard resource budget (e.g. more than 2000 changed files); review it in smaller pieces |
 
+This table describes `ronten review` only. `ronten validate-concerns` has its own, narrower
+exit codes (0 valid / 10 invalid) — see the [`ronten validate-concerns`](#ronten-validate-concerns)
+section below; its exit 0 means "structurally and semantically valid concerns JSON", not "review
+approved".
+
 ### `ronten schema`
 
 ```sh
@@ -255,7 +260,7 @@ never a context line. An omitted `side` claims on *both* numbering schemes at on
 
 ```jsonc
 {
-  "version": 2,
+  "version": 3,
   "review": {
     "session_id": "9f2c…",
     "ronten_version": "0.1.0",
@@ -293,9 +298,72 @@ never a context line. An omitted `side` claims on *both* numbering schemes at on
       "concern_id": "auth-core"
     }
   ],
+  "files": [
+    {
+      "file_id": "3f9a2b7c1d4e5f60",
+      "old_path": "src/middleware/auth.ts",
+      "new_path": "src/middleware/auth.ts",
+      "old_mode": "100644",
+      "new_mode": "100644",
+      "file_type": "regular",
+      "old_oid": "1a2b3c…",
+      "new_oid": "4d5e6f…",
+      "content_kind": "text",
+      "rendered": true
+    },
+    {
+      "file_id": "8b1c4d2e9f0a3b7c",
+      "old_path": null,
+      "new_path": "assets/logo.png",
+      "old_mode": null,
+      "new_mode": "100644",
+      "file_type": "regular",
+      "old_oid": null,
+      "new_oid": "7e8f9a…",
+      "content_kind": "binary",
+      "rendered": false,
+      "omission_reason": "binary"
+    }
+  ],
+  "acknowledgements": [
+    {
+      "file_id": "8b1c4d2e9f0a3b7c",
+      "reasons": ["opaque-content"],
+      "acknowledged_at": "2026-07-22T04:32:10Z"
+    }
+  ],
+  "worktree": {
+    "policy": "error",
+    "checked_at_start": true,
+    "clean_at_start": true,
+    "checked_at_submit": true,
+    "clean_at_submit": true,
+    "excluded_paths": ["concerns.json"]
+  },
+  "build": {
+    "ronten_version": "0.1.0",
+    "source_commit": null,
+    "source_dirty": null,
+    "rust_version": null,
+    "target": null,
+    "profile": null,
+    "frontend_digest": null
+  },
   "started_at": "…", "submitted_at": "…"
 }
 ```
+
+`files` lists every file in the reviewed diff, including ones whose content was not shown
+(`rendered: false` with an `omission_reason` of `binary`, `lfs_pointer`, `too_large`,
+`non_utf8`, or `submodule`) — so a standalone reader of the JSON can reconstruct what was and
+wasn't shown to the reviewer without re-running the diff. `acknowledgements` lists every file
+the reviewer explicitly acknowledged before submit, keyed by the same `file_id` as `files`,
+with the server-computed reasons acknowledgement was required and the submit-time timestamp.
+`worktree` records the `--dirty-policy` in effect and whether the worktree was checked/clean
+at session start and re-checked at submit (`checked_at_*` is `false` under `--dirty-policy
+ignore`, or if the query itself failed). `build` identifies the binary that produced the
+result; `source_commit`/`source_dirty`/`rust_version`/`target`/`profile`/`frontend_digest` are
+`null` unless the build was compiled with the corresponding `build.rs`-injected env vars.
 
 `decision` is one of exactly two values, `approve` or `request-changes` — there is no `abort`
 decision — derived from the per-concern verdicts: any `request-changes` verdict makes the
