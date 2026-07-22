@@ -19,7 +19,7 @@ import { buildUnmappedSet, isUnmappedInSet } from './unmappedLines'
 
 export const SAVE_DEBOUNCE_MS = 500
 
-export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error'
+export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error' | 'outcome_unknown'
 
 /** UI phase for a server-reported ending. A timeout renders as the aborted
  * screen: from the reviewer's side both mean "this session ended without a
@@ -308,8 +308,44 @@ export class ReviewState {
       this.#revision = result.revision
       this.saveState = 'saved'
     } catch {
-      // The next scheduleSave (triggered by any draft change) retries.
-      this.saveState = 'error'
+      // Both attempts (the original and its one same-id retry, above) lost
+      // their response. Query the server rather than assume failure — see
+      // #recoverFromLostResponse.
+      const outcome = await this.#recoverFromLostResponse()
+      if (outcome === 'unknown') {
+        this.phase = 'outcome_unknown'
+        this.saveState = 'error'
+      } else if (outcome === 'review') {
+        // Still reviewing server-side: the save never landed. The next
+        // scheduleSave (triggered by any draft change) retries.
+        this.saveState = 'error'
+      } else {
+        this.phase = outcome
+        this.saveState = 'idle'
+      }
+    }
+  }
+
+  /** After a save/submit's fetch outright fails — the 40s client timeout's
+   * AbortError, or a network error; never a clean HTTP error response
+   * (409/422/413), which `saveDraft`/`submit` return as a value instead of
+   * throwing — the outcome server-side is genuinely ambiguous: the mutation
+   * may have gone through even though this tab never saw the response.
+   * Rather than assume failure, a single `GET /session` tells us which:
+   * `finished: 'submitted'`/`'aborted'`/`'timeout'` means the session
+   * already ended server-side (the mutation is durable, possibly already
+   * written to --out) and this tab should just join that terminal state;
+   * still `Reviewing` means the mutation never landed and is safe to retry
+   * (submit is idempotent per mutation id — Task 2.2). If the query itself
+   * also fails, the outcome truly can't be determined from here — the
+   * caller falls back to an "outcome unknown" banner rather than looping.
+   */
+  async #recoverFromLostResponse(): Promise<Phase | 'unknown'> {
+    try {
+      const session = await fetchSession()
+      return phaseForFinished(session.finished)
+    } catch {
+      return 'unknown'
     }
   }
 
@@ -370,10 +406,23 @@ export class ReviewState {
       // Make sure the latest draft still gets persisted now that the
       // submit didn't go through.
       this.scheduleSave()
-    } catch (e) {
-      this.submitError = e instanceof Error ? e.message : 'Submit failed'
-      this.#actionLocked = false
-      this.scheduleSave()
+    } catch {
+      // The submit's fetch itself failed (client timeout/network error, not
+      // a clean HTTP error response) — see #recoverFromLostResponse.
+      const outcome = await this.#recoverFromLostResponse()
+      if (outcome === 'unknown') {
+        this.phase = 'outcome_unknown'
+      } else if (outcome === 'review') {
+        // The submit never landed server-side; safe to retry (submit is
+        // idempotent per mutation id).
+        this.submitError = 'Save/submit failed — you can retry.'
+        this.#actionLocked = false
+        this.scheduleSave()
+      } else {
+        // 'submitted' or 'aborted': the session already ended server-side —
+        // join that terminal state instead of reporting failure.
+        this.phase = outcome
+      }
     } finally {
       this.submitting = false
       this.#actionLocked = false

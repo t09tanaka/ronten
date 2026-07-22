@@ -12,9 +12,18 @@ function apiUrl(path: string): string {
   return `/api/${getToken()}${path}`
 }
 
-const FETCH_TIMEOUT_MS = 15_000
+/** Client fetch timeout. Part of the submit timeout hierarchy — internal
+ * deadline < server request timeout < client timeout — so the browser never
+ * gives up before the server (and the git rev-parse it runs server-side)
+ * could have: `check_head_freshness`'s rev-parse deadline is 10s
+ * (`HEAD_FRESHNESS_TIMEOUT` in `src/server.rs`) and the server's own request
+ * timeout is 30s (`REQUEST_TIMEOUT`), so this must exceed both. Without that
+ * ordering a submit could succeed server-side (or terminally fail) after the
+ * client already aborted and told the user it failed — an ambiguous
+ * completion `state.svelte.ts`'s outcome-unknown recovery exists to catch. */
+const FETCH_TIMEOUT_MS = 40_000
 
-/** fetch with a 15s abort timeout — a stalled request must not leave the
+/** fetch with a 40s abort timeout — a stalled request must not leave the
  * UI stuck in a saving/submitting state forever. */
 async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
   const controller = new AbortController()

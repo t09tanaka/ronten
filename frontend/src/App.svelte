@@ -72,6 +72,11 @@
     if (rs.phase === 'submitted') {
       showSubmitConfirm = false
       closeTabSoon()
+    } else if (rs.phase === 'outcome_unknown') {
+      // Close the confirm dialog so the outcome-unknown banner (rendered
+      // behind it) becomes visible instead of being hidden by the dialog's
+      // top-layer backdrop.
+      showSubmitConfirm = false
     }
   }
 
@@ -184,8 +189,12 @@
 
   // Warn before leaving while draft changes may not be persisted yet
   // (debounced save pending, save in flight, or last save failed).
+  // outcome_unknown counts too — a lost save response leaves saveState
+  // 'error' there just like an ordinary retryable failure, and the user
+  // must not be able to navigate away from unsaved work while confused
+  // about whether their last action even landed.
   function handleBeforeUnload(e: BeforeUnloadEvent): void {
-    if (rs.phase !== 'review') return
+    if (rs.phase !== 'review' && rs.phase !== 'outcome_unknown') return
     if (!rs.hasUnsavedChanges) return
     e.preventDefault()
   }
@@ -236,6 +245,21 @@
         <span>
           This review was edited in another tab. Changes made here are no longer being saved —
           reload the page to continue.
+        </span>
+        <button type="button" class="btn-ghost conflict-banner-copy" onclick={copyDraftJson}>
+          {draftCopyState === 'copied'
+            ? 'Copied'
+            : draftCopyState === 'error'
+              ? 'Copy failed'
+              : 'Copy draft JSON'}
+        </button>
+      </div>
+    {/if}
+    {#if rs.phase === 'outcome_unknown'}
+      <div class="conflict-banner" role="alert">
+        <span>
+          Result unknown — we lost the connection and couldn't confirm whether your last action
+          went through. Check the CLI output or --out file, or retry below.
         </span>
         <button type="button" class="btn-ghost conflict-banner-copy" onclick={copyDraftJson}>
           {draftCopyState === 'copied'

@@ -268,3 +268,55 @@ describe('mutation id idempotency', () => {
     expect(secondId).not.toBe(firstId)
   })
 })
+
+describe('outcome-unknown recovery', () => {
+  it('submit_failure_queries_session_and_recovers_to_submitted', async () => {
+    const rs = await loadedState()
+
+    // The submit's fetch itself fails (client timeout/network error, not a
+    // clean HTTP error response) — the browser never saw the response, but
+    // the server may have already committed it.
+    submitMock.mockRejectedValueOnce(new Error('network error'))
+    // The recovery query finds the session already finished server-side:
+    // this tab should join that terminal state rather than report failure.
+    fetchSessionMock.mockResolvedValueOnce({ ...makeSession(), finished: 'submitted' })
+
+    await rs.submitReview()
+
+    expect(fetchSessionMock).toHaveBeenCalledTimes(2) // load() + the recovery query
+    expect(rs.phase).toBe('submitted')
+  })
+
+  it('submit_failure_with_session_query_failing_shows_outcome_unknown', async () => {
+    const rs = await loadedState()
+
+    submitMock.mockRejectedValueOnce(new Error('network error'))
+    // The recovery query also fails — the outcome truly can't be determined
+    // from here; a single query, then a banner, no retry loop.
+    fetchSessionMock.mockRejectedValueOnce(new Error('network error'))
+
+    await rs.submitReview()
+
+    expect(rs.phase).toBe('outcome_unknown')
+    // The local draft must survive so the user can still copy it out.
+    expect(rs.draft).toEqual({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
+  })
+
+  it('submit_failure_with_session_still_reviewing_shows_retryable_error', async () => {
+    const rs = await loadedState()
+
+    submitMock.mockRejectedValueOnce(new Error('network error'))
+    fetchSessionMock.mockResolvedValueOnce(makeSession()) // finished: null — still reviewing
+
+    await rs.submitReview()
+
+    expect(rs.phase).toBe('review')
+    expect(rs.submitError).toMatch(/retry/i)
+
+    // Idempotent per Task 2.2: a retry after outcome-unknown/retryable-error
+    // is safe, so the action must not still be locked.
+    submitMock.mockResolvedValueOnce({ ok: true })
+    await rs.submitReview()
+    expect(rs.phase).toBe('submitted')
+  })
+})

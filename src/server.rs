@@ -89,6 +89,18 @@ pub enum Outcome {
 /// outcome, stall graceful shutdown until the shutdown deadline kills it.
 pub const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Deadline for the single `rev-parse HEAD` `check_head_freshness` runs on
+/// the submit path. Timeout hierarchy for a submit must be internal deadline
+/// < server request timeout < client timeout — a wedged rev-parse here has
+/// to fail well before [`REQUEST_TIMEOUT`] (30s), which in turn must resolve
+/// before the frontend's own fetch timeout (40s), so a slow submit is never
+/// silently killed by the client while the server is still committing it
+/// (the ambiguous-completion bug this hierarchy exists to close). The 60s
+/// [`crate::gitdiff::GIT_TIMEOUT`] default is intentionally NOT reused here —
+/// it's sized for the initial (potentially large) diff computation, not this
+/// single cheap rev-parse.
+const HEAD_FRESHNESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Middleware bounding each request by the timeout passed as state (the
 /// production router uses [`REQUEST_TIMEOUT`]). A request that overruns gets
 /// `408 Request Timeout` instead of hanging its connection.
@@ -367,8 +379,10 @@ async fn check_head_freshness(state: &SessionState) -> Option<Response> {
         (Some(root), Some(expected)) => (root.clone(), expected.clone()),
         _ => return None,
     };
-    let resolved =
-        tokio::task::spawn_blocking(move || crate::gitdiff::rev_parse_commit(&root, "HEAD")).await;
+    let resolved = tokio::task::spawn_blocking(move || {
+        crate::gitdiff::rev_parse_commit_with_deadline(&root, "HEAD", HEAD_FRESHNESS_TIMEOUT)
+    })
+    .await;
     let current = match resolved {
         Ok(Ok(oid)) => oid,
         Ok(Err(_)) | Err(_) => {
@@ -2006,5 +2020,67 @@ index 1111111..2222222 100644
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"], "request timed out");
+    }
+
+    /// The timeout hierarchy for a submit must be internal deadline < server
+    /// request timeout < client fetch timeout: otherwise a client can give
+    /// up and show "failed" while the server (and the rev-parse
+    /// `check_head_freshness` spawn_blocking's onto it) is still working,
+    /// which can commit the submit server-side after the browser already
+    /// told the user it didn't happen. `HEAD_FRESHNESS_TIMEOUT` is the
+    /// deadline `check_head_freshness` now passes to
+    /// `rev_parse_commit_with_deadline` instead of the 60s
+    /// `gitdiff::GIT_TIMEOUT` default (see that function's call site above);
+    /// the client's matching value is `frontend/src/lib/api.ts`'s
+    /// `FETCH_TIMEOUT_MS = 40_000`, which isn't reachable from a Rust test,
+    /// so it's asserted here as a documented literal instead.
+    #[test]
+    fn submit_timeout_hierarchy_is_internal_lt_server_lt_client() {
+        const CLIENT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40);
+        assert!(
+            HEAD_FRESHNESS_TIMEOUT < REQUEST_TIMEOUT,
+            "rev-parse deadline must resolve before the server gives up on the whole request"
+        );
+        assert!(
+            REQUEST_TIMEOUT < CLIENT_FETCH_TIMEOUT,
+            "server request timeout must resolve before the client's fetch abort, or the \
+             browser gives up first and can show failure for a submit the server still commits"
+        );
+    }
+
+    /// `check_head_freshness` must resolve `HEAD` correctly using the short
+    /// deadline, not just fail fast — a real (fast) rev-parse under 10s
+    /// still succeeds and lets a matching submit through. This is the same
+    /// repo/state setup `submit_same_id_replays_200_even_after_head_moved`
+    /// uses (a real `repo_root` is required; `check_head_freshness` is a
+    /// no-op without one).
+    #[tokio::test]
+    async fn check_head_freshness_short_deadline_still_resolves_matching_head() {
+        let td = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git")
+                .current_dir(td.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                st.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&st.stderr)
+            );
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(td.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "base"]);
+        let head_oid = crate::gitdiff::rev_parse_commit(td.path(), "HEAD").unwrap();
+
+        let state = build_state_with_repo(td.path().to_path_buf(), head_oid);
+        assert!(
+            check_head_freshness(&state).await.is_none(),
+            "a matching HEAD must not be refused under the short deadline"
+        );
     }
 }

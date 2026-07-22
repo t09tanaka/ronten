@@ -72,7 +72,7 @@ describe('saveDraft', () => {
     await expect(saveDraft(draft, 3, 'mutation-a')).rejects.toThrow('saveDraft failed: 413')
   })
 
-  it('aborts a stalled request after the 15s timeout', async () => {
+  it('aborts a stalled request after the 40s timeout', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.fn(
       (_url: string, init?: RequestInit) =>
@@ -86,7 +86,7 @@ describe('saveDraft', () => {
 
     const pending = saveDraft(draft, 3, 'mutation-a')
     const assertion = expect(pending).rejects.toThrow(/abort/i)
-    await vi.advanceTimersByTimeAsync(15_000)
+    await vi.advanceTimersByTimeAsync(40_000)
     await assertion
   })
 })
