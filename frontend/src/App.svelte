@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { rs } from './lib/state.svelte'
+  import { GENERAL_BUFFER_KEY, rs } from './lib/state.svelte'
   import ConcernList from './lib/ConcernList.svelte'
   import DiffView from './lib/DiffView.svelte'
   import VerdictBar from './lib/VerdictBar.svelte'
@@ -38,7 +38,9 @@
 
   let showSubmitConfirm = $state(false)
   let showAbortConfirm = $state(false)
-  let generalCommentText = $state('')
+  // Backed by the central store (not local $state) so in-progress text
+  // survives navigation within the page — see Task 2.5 / P1-5.
+  const generalCommentText = $derived(rs.editorBuffer(GENERAL_BUFFER_KEY))
   let warningsDismissed = $state(false)
 
   // Native <dialog> elements driven by the show* flags. showModal()/close()
@@ -112,7 +114,7 @@
 
   function addGeneralComment(): void {
     rs.addGeneralComment(generalCommentText)
-    generalCommentText = ''
+    rs.clearEditorBuffer(GENERAL_BUFFER_KEY)
   }
 
   let draftCopyState = $state<'idle' | 'copied' | 'error'>('idle')
@@ -380,7 +382,7 @@
           <h3>General comments</h3>
           <textarea
             id="general-comment-textarea"
-            bind:value={generalCommentText}
+            bind:value={() => generalCommentText, (v) => rs.setEditorBuffer(GENERAL_BUFFER_KEY, v)}
             placeholder="Add a general comment…"
             rows="3"
             maxlength={maxCommentChars}

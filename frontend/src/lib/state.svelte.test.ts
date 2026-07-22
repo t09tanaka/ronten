@@ -9,7 +9,7 @@ vi.mock('./api', () => ({
 }))
 
 import { abortSession, fetchSession, saveDraft, submit } from './api'
-import { phaseForFinished, ReviewState, SAVE_DEBOUNCE_MS } from './state.svelte'
+import { GENERAL_BUFFER_KEY, phaseForFinished, ReviewState, SAVE_DEBOUNCE_MS } from './state.svelte'
 
 const fetchSessionMock = vi.mocked(fetchSession)
 const saveDraftMock = vi.mocked(saveDraft)
@@ -50,6 +50,17 @@ async function loadedState(): Promise<ReviewState> {
   return rs
 }
 
+/** Two concerns so `select` can move away from index 0. */
+function sessionWithConcerns(): Session {
+  return {
+    ...makeSession(),
+    concerns: [
+      { id: 'c1', title: 'Concern 1', description: null, risk: null, unmapped: false, hunks: [] },
+      { id: 'c2', title: 'Concern 2', description: null, risk: null, unmapped: false, hunks: [] },
+    ],
+  }
+}
+
 beforeEach(() => {
   vi.useFakeTimers()
 })
@@ -57,6 +68,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers()
   vi.clearAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('draft revision tracking', () => {
@@ -314,6 +326,58 @@ describe('mutation id idempotency', () => {
     const secondId = saveDraftMock.mock.calls[1][2]
 
     expect(secondId).not.toBe(firstId)
+  })
+})
+
+describe('editor buffers (Task 2.5 / P1-5)', () => {
+  it('editor_buffer_survives_concern_switch', async () => {
+    fetchSessionMock.mockResolvedValue(sessionWithConcerns())
+    const rs = new ReviewState()
+    await rs.load()
+
+    rs.setEditorBuffer(GENERAL_BUFFER_KEY, 'in progress')
+    rs.setEditorBuffer('src/a.ts:new:5', 'inline draft')
+
+    rs.select(1)
+
+    expect(rs.editorBuffer(GENERAL_BUFFER_KEY)).toBe('in progress')
+    expect(rs.editorBuffer('src/a.ts:new:5')).toBe('inline draft')
+  })
+
+  it('has_unsaved_changes_includes_nonempty_editor_buffer', async () => {
+    const rs = await loadedState()
+
+    expect(rs.hasUnsavedChanges).toBe(false)
+
+    rs.setEditorBuffer(GENERAL_BUFFER_KEY, '   ')
+    expect(rs.hasUnsavedChanges).toBe(false)
+
+    rs.setEditorBuffer(GENERAL_BUFFER_KEY, '  hello  ')
+    expect(rs.hasUnsavedChanges).toBe(true)
+
+    rs.clearEditorBuffer(GENERAL_BUFFER_KEY)
+    expect(rs.hasUnsavedChanges).toBe(false)
+  })
+
+  it('submit_blocks_when_editor_buffer_nonempty', async () => {
+    const rs = await loadedState()
+    rs.setEditorBuffer(GENERAL_BUFFER_KEY, 'unfinished thought')
+
+    // The test environment has no `window`/`confirm` global (vitest runs in
+    // node, not jsdom) — vi.stubGlobal installs one that can be swapped
+    // between test cases and always cleaned up in afterEach.
+    const confirmMock = vi.fn().mockReturnValue(false)
+    vi.stubGlobal('confirm', confirmMock)
+
+    await rs.submitReview()
+    expect(submitMock).not.toHaveBeenCalled()
+    expect(rs.phase).toBe('review')
+
+    confirmMock.mockReturnValue(true)
+    submitMock.mockResolvedValueOnce({ ok: true })
+    await rs.submitReview()
+    expect(submitMock).toHaveBeenCalledTimes(1)
+    expect(rs.phase).toBe('submitted')
   })
 })
 

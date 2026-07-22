@@ -1,5 +1,6 @@
 // Single shared review store (Svelte 5 runes).
 
+import { SvelteMap } from 'svelte/reactivity'
 import { abortSession, fetchSession, saveDraft, submit } from './api'
 import { isVerdictConfirmed } from './confirmation'
 import { requiresAck } from './opaque'
@@ -59,6 +60,16 @@ export interface CommentTarget {
   line: number
 }
 
+/** Key for the general-comment box's entry in `editorBuffers`. */
+export const GENERAL_BUFFER_KEY = 'general'
+
+/** Key for an inline comment editor's entry in `editorBuffers` — one per
+ * (path, side, line), matching how `pendingCommentTarget` identifies a
+ * comment location. */
+export function commentTargetKey(t: CommentTarget): string {
+  return `${t.path}:${t.side}:${t.line}`
+}
+
 export class ReviewState {
   session = $state<Session | null>(null)
   draft = $state<Draft>({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
@@ -67,6 +78,15 @@ export class ReviewState {
   submitting = $state(false)
   submitError = $state<string | null>(null)
   pendingCommentTarget = $state<CommentTarget | null>(null)
+  /** In-progress comment text keyed by `GENERAL_BUFFER_KEY` (the general
+   * comment box) or `commentTargetKey(...)` (an inline comment editor).
+   * Lives here rather than in component-local state so it survives concern
+   * switches and editor open/close — only a committed `addComment`/
+   * `addGeneralComment` (or an explicit discard) clears an entry. A
+   * `SvelteMap` (not a plain `$state`-wrapped `Map`) is required for
+   * fine-grained reactivity: Svelte 5's `$state` proxy only recurses into
+   * plain objects/arrays, not built-ins like `Map`. */
+  editorBuffers = new SvelteMap<string, string>()
   saveState = $state<SaveState>('idle')
   /** True once a save was refused because another tab saved first. Saving
    * stays off until the user reloads — retrying would overwrite that tab's
@@ -170,6 +190,29 @@ export class ReviewState {
     this.select(this.selectedIdx + delta)
   }
 
+  editorBuffer(key: string): string {
+    return this.editorBuffers.get(key) ?? ''
+  }
+
+  setEditorBuffer(key: string, value: string): void {
+    this.editorBuffers.set(key, value)
+  }
+
+  clearEditorBuffer(key: string): void {
+    this.editorBuffers.delete(key)
+  }
+
+  /** True if any editor buffer (general or inline) holds text beyond
+   * whitespace — used by `hasUnsavedChanges` (beforeunload) and the submit
+   * guard. Whitespace-only text (e.g. an editor opened and closed without
+   * typing) must not count as unsaved. */
+  #hasNonEmptyEditorBuffer(): boolean {
+    for (const v of this.editorBuffers.values()) {
+      if (v.trim()) return true
+    }
+    return false
+  }
+
   /** True once the review has been finalized (submitted or aborted), or
    * while a submit/abort is actively in flight — mutations and saves are
    * inert in either case. */
@@ -249,9 +292,17 @@ export class ReviewState {
     }
   }
 
-  /** True while the latest draft may not be persisted on the server. */
+  /** True while the latest draft may not be persisted on the server, OR
+   * while an editor buffer holds text that was never committed via
+   * `addComment`/`addGeneralComment` — that text lives only in this store
+   * and would otherwise vanish silently on navigation. */
   get hasUnsavedChanges(): boolean {
-    return this.#saveTimer != null || this.saveState === 'saving' || this.saveState === 'error'
+    return (
+      this.#saveTimer != null ||
+      this.saveState === 'saving' ||
+      this.saveState === 'error' ||
+      this.#hasNonEmptyEditorBuffer()
+    )
   }
 
   scheduleSave(): void {
@@ -396,6 +447,16 @@ export class ReviewState {
     // server would refuse it anyway, and locally it would look like a
     // transient error rather than the standing "reload" condition.
     if (this.#locked || this.submitting || this.draftConflict) return
+    // Unsent editor text (a comment box with text that was never committed
+    // via addComment/addGeneralComment) would otherwise be silently dropped
+    // by submitting — ask before discarding it. Buffers are intentionally
+    // NOT auto-committed: the user may have left them mid-thought.
+    if (this.#hasNonEmptyEditorBuffer()) {
+      const proceed = globalThis.confirm(
+        "You have unsaved comment text that hasn't been added. Discard and submit?",
+      )
+      if (!proceed) return
+    }
     this.#cancelPendingSave()
     this.submitting = true
     // Locks editing/autosave for the duration of the submit, closing the

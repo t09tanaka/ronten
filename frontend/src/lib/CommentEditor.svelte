@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { rs } from './state.svelte'
+  import { commentTargetKey, rs } from './state.svelte'
   import type { Side } from './types'
 
   interface Props {
@@ -11,7 +11,11 @@
 
   let { concernId, path, side, line }: Props = $props()
 
-  let body = $state('')
+  // Backed by the central store (not local $state) so the in-progress text
+  // survives a concern switch or the editor being closed and reopened —
+  // see Task 2.5 / P1-5.
+  const key = $derived(commentTargetKey({ path, side, line }))
+  const body = $derived(rs.editorBuffer(key))
 
   const maxChars = $derived(rs.limits?.max_comment_chars)
 
@@ -19,6 +23,7 @@
     const trimmed = body.trim()
     if (!trimmed) return
     rs.addComment(concernId, { path, side, line, body: trimmed })
+    rs.clearEditorBuffer(key)
     rs.pendingCommentTarget = null
   }
 
@@ -30,7 +35,7 @@
 <div class="comment-editor">
   <!-- svelte-ignore a11y_autofocus -->
   <textarea
-    bind:value={body}
+    bind:value={() => body, (v) => rs.setEditorBuffer(key, v)}
     placeholder="Add a comment…"
     rows="3"
     maxlength={maxChars}
