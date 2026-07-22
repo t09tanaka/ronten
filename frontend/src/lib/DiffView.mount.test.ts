@@ -15,7 +15,7 @@
 // enforce. The fix wraps the per-concern render in
 // `{#key rs.selected.id}...{/key}` so switching concerns always remounts.
 import { tick } from 'svelte'
-import { render } from '@testing-library/svelte'
+import { fireEvent, render } from '@testing-library/svelte'
 import { afterEach, describe, expect, it } from 'vitest'
 import DiffView from './DiffView.svelte'
 import { rs } from './state.svelte'
@@ -42,6 +42,50 @@ function makeHunk(lineCount: number): Hunk {
 
 function ref(file: number, hunk: number): HunkRef {
   return { file, hunk }
+}
+
+function baseSession(): Omit<Session, 'files' | 'concerns'> {
+  return {
+    title: 'session',
+    summary: null,
+    warnings: [],
+    draft: { concerns: {}, general_comments: [], acknowledged_opaque: [] },
+    draft_revision: 0,
+    limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
+    finished: null,
+    unmapped_lines: [],
+  }
+}
+
+/** One file, one hunk, one concern owning it — the minimal fixture for
+ * exercising a single hunk's own collapse behavior in isolation. */
+function singleHunkSession(lineCount: number): Session {
+  const hunk = makeHunk(lineCount)
+  const file: FileDiff = {
+    old_path: 'a.txt',
+    new_path: 'a.txt',
+    change_kind: 'modified',
+    content_kind: 'text',
+    old_mode: null,
+    new_mode: null,
+    old_type: 'regular',
+    new_type: 'regular',
+    old_oid: 'a',
+    new_oid: 'b',
+    old_size: 100,
+    new_size: 100,
+    lfs_pointer: false,
+    hunks: [hunk],
+  }
+  const concern: ConcernView = {
+    id: 'only',
+    title: 'Only concern',
+    description: null,
+    risk: null,
+    unmapped: false,
+    hunks: [ref(0, 0)],
+  }
+  return { ...baseSession(), files: [file], concerns: [concern] }
 }
 
 const B_ONLY_HUNK_COUNT = 50
@@ -129,5 +173,85 @@ describe('DiffView force-collapse survives a concern switch', () => {
       b.textContent?.includes('click to expand'),
     )
     expect(expandButtons).toHaveLength(B_ONLY_HUNK_COUNT + 1)
+  })
+})
+
+describe('DiffView hunk collapse fundamentals', () => {
+  it('a concern whose hunks total over 1000 lines initializes every hunk collapsed on first mount', async () => {
+    // 51 x 20 = 1,020 lines, all in one concern — no prior selection/switch
+    // involved, isolating the "total exceeds threshold" rule from the
+    // remount-on-switch behavior covered above.
+    const hunks = Array.from({ length: 51 }, () => makeHunk(20))
+    const file: FileDiff = {
+      old_path: 'a.txt',
+      new_path: 'a.txt',
+      change_kind: 'modified',
+      content_kind: 'text',
+      old_mode: null,
+      new_mode: null,
+      old_type: 'regular',
+      new_type: 'regular',
+      old_oid: 'a',
+      new_oid: 'b',
+      old_size: 100,
+      new_size: 100,
+      lfs_pointer: false,
+      hunks,
+    }
+    const concern: ConcernView = {
+      id: 'big',
+      title: 'Big concern',
+      description: null,
+      risk: null,
+      unmapped: false,
+      hunks: hunks.map((_, i) => ref(0, i)),
+    }
+    rs.session = { ...baseSession(), files: [file], concerns: [concern] }
+    rs.selectedIdx = 0
+    rs.phase = 'review'
+
+    const { container } = render(DiffView)
+    await tick()
+
+    expect(container.querySelector('.hunk-table')).toBeNull()
+    const expandButtons = [...container.querySelectorAll('.collapse-toggle')].filter((b) =>
+      b.textContent?.includes('click to expand'),
+    )
+    expect(expandButtons).toHaveLength(51)
+  })
+
+  it('a single hunk over 200 lines starts collapsed even though its concern is well under the total threshold', async () => {
+    rs.session = singleHunkSession(250)
+    rs.selectedIdx = 0
+    rs.phase = 'review'
+
+    const { container } = render(DiffView)
+    await tick()
+
+    expect(container.querySelector('.hunk-table')).toBeNull()
+    const toggle = container.querySelector('.collapse-toggle')
+    expect(toggle?.textContent).toContain('250 lines — click to expand')
+  })
+
+  it('the collapse toggle expands and re-collapses a hunk on click', async () => {
+    rs.session = singleHunkSession(250)
+    rs.selectedIdx = 0
+    rs.phase = 'review'
+
+    const { container } = render(DiffView)
+    await tick()
+
+    const expandButton = container.querySelector('.collapse-toggle') as HTMLButtonElement
+    expect(expandButton.textContent).toContain('click to expand')
+    await fireEvent.click(expandButton)
+
+    expect(container.querySelector('.hunk-table')).not.toBeNull()
+    const collapseButton = container.querySelector('.collapse-toggle') as HTMLButtonElement
+    expect(collapseButton.textContent).toBe('Collapse')
+
+    await fireEvent.click(collapseButton)
+
+    expect(container.querySelector('.hunk-table')).toBeNull()
+    expect(container.querySelector('.collapse-toggle')?.textContent).toContain('click to expand')
   })
 })
