@@ -21,6 +21,20 @@ export const SAVE_DEBOUNCE_MS = 500
 
 export type Phase = 'loading' | 'review' | 'submitted' | 'aborted' | 'error' | 'outcome_unknown'
 
+/** True only for the errors that mean "we genuinely don't know whether this
+ * reached the server": the AbortController firing on `apiFetch`'s 40s
+ * timeout (a `DOMException` named `AbortError`) or a network failure (fetch
+ * itself rejects with a `TypeError` — offline, DNS failure, connection
+ * reset). A clean HTTP error response is a KNOWN outcome, not an ambiguous
+ * one, and must not trigger outcome-unknown recovery: `submit()` never
+ * throws for one (it parses the JSON body regardless of status), and while
+ * `saveDraft()` does throw a plain `Error` for a handful of non-2xx/non-409
+ * statuses (e.g. a clean 413/422), that's still a confirmed server
+ * response, not a lost one. */
+function isAmbiguousFetchError(e: unknown): boolean {
+  return (e instanceof DOMException && e.name === 'AbortError') || e instanceof TypeError
+}
+
 /** UI phase for a server-reported ending. A timeout renders as the aborted
  * screen: from the reviewer's side both mean "this session ended without a
  * decision". */
@@ -307,10 +321,18 @@ export class ReviewState {
       }
       this.#revision = result.revision
       this.saveState = 'saved'
-    } catch {
+    } catch (e) {
+      if (!isAmbiguousFetchError(e)) {
+        // A confirmed server response (saveDraft throws a plain Error for a
+        // clean non-2xx/non-409 status, e.g. 413/422) — known, not
+        // ambiguous. Recovery must not run; same handling as before
+        // outcome-unknown recovery existed.
+        this.saveState = 'error'
+        return
+      }
       // Both attempts (the original and its one same-id retry, above) lost
-      // their response. Query the server rather than assume failure — see
-      // #recoverFromLostResponse.
+      // their response (AbortError/network error). Query the server rather
+      // than assume failure — see #recoverFromLostResponse.
       const outcome = await this.#recoverFromLostResponse()
       if (outcome === 'unknown') {
         this.phase = 'outcome_unknown'
@@ -406,22 +428,33 @@ export class ReviewState {
       // Make sure the latest draft still gets persisted now that the
       // submit didn't go through.
       this.scheduleSave()
-    } catch {
-      // The submit's fetch itself failed (client timeout/network error, not
-      // a clean HTTP error response) — see #recoverFromLostResponse.
-      const outcome = await this.#recoverFromLostResponse()
-      if (outcome === 'unknown') {
-        this.phase = 'outcome_unknown'
-      } else if (outcome === 'review') {
-        // The submit never landed server-side; safe to retry (submit is
-        // idempotent per mutation id).
-        this.submitError = 'Save/submit failed — you can retry.'
+    } catch (e) {
+      // submit() never throws for a clean HTTP error response — it always
+      // parses the JSON body regardless of status — so this guard is
+      // currently always true here. It's kept anyway so the two catch
+      // paths (this one and #runSave's) stay uniform and future-proof
+      // against submit() ever growing a status-based throw the way
+      // saveDraft() has.
+      if (!isAmbiguousFetchError(e)) {
+        this.submitError = e instanceof Error ? e.message : 'Submit failed'
         this.#actionLocked = false
         this.scheduleSave()
       } else {
-        // 'submitted' or 'aborted': the session already ended server-side —
-        // join that terminal state instead of reporting failure.
-        this.phase = outcome
+        const outcome = await this.#recoverFromLostResponse()
+        if (outcome === 'unknown') {
+          this.phase = 'outcome_unknown'
+        } else if (outcome === 'review') {
+          // The submit never landed server-side; safe to retry (submit is
+          // idempotent per mutation id).
+          this.submitError = 'Save/submit failed — you can retry.'
+          this.#actionLocked = false
+          this.scheduleSave()
+        } else {
+          // 'submitted' or 'aborted': the session already ended
+          // server-side — join that terminal state instead of reporting
+          // failure.
+          this.phase = outcome
+        }
       }
     } finally {
       this.submitting = false

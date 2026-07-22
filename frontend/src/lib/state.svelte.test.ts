@@ -16,6 +16,18 @@ const saveDraftMock = vi.mocked(saveDraft)
 const submitMock = vi.mocked(submit)
 const abortSessionMock = vi.mocked(abortSession)
 
+/** What `apiFetch`'s AbortController throws when the 40s client timeout
+ * fires — the ambiguous case outcome-unknown recovery must react to. */
+function abortError(): DOMException {
+  return new DOMException('The operation was aborted.', 'AbortError')
+}
+
+/** What `fetch` itself rejects with on a network failure (offline, DNS,
+ * connection reset) — the other ambiguous case. */
+function networkError(): TypeError {
+  return new TypeError('Failed to fetch')
+}
+
 function makeSession(): Session {
   return {
     title: 'session',
@@ -276,7 +288,7 @@ describe('outcome-unknown recovery', () => {
     // The submit's fetch itself fails (client timeout/network error, not a
     // clean HTTP error response) — the browser never saw the response, but
     // the server may have already committed it.
-    submitMock.mockRejectedValueOnce(new Error('network error'))
+    submitMock.mockRejectedValueOnce(networkError())
     // The recovery query finds the session already finished server-side:
     // this tab should join that terminal state rather than report failure.
     fetchSessionMock.mockResolvedValueOnce({ ...makeSession(), finished: 'submitted' })
@@ -290,7 +302,8 @@ describe('outcome-unknown recovery', () => {
   it('submit_failure_with_session_query_failing_shows_outcome_unknown', async () => {
     const rs = await loadedState()
 
-    submitMock.mockRejectedValueOnce(new Error('network error'))
+    // The 40s client-timeout abort, this time — the other ambiguous case.
+    submitMock.mockRejectedValueOnce(abortError())
     // The recovery query also fails — the outcome truly can't be determined
     // from here; a single query, then a banner, no retry loop.
     fetchSessionMock.mockRejectedValueOnce(new Error('network error'))
@@ -305,7 +318,7 @@ describe('outcome-unknown recovery', () => {
   it('submit_failure_with_session_still_reviewing_shows_retryable_error', async () => {
     const rs = await loadedState()
 
-    submitMock.mockRejectedValueOnce(new Error('network error'))
+    submitMock.mockRejectedValueOnce(networkError())
     fetchSessionMock.mockResolvedValueOnce(makeSession()) // finished: null — still reviewing
 
     await rs.submitReview()
@@ -318,5 +331,26 @@ describe('outcome-unknown recovery', () => {
     submitMock.mockResolvedValueOnce({ ok: true })
     await rs.submitReview()
     expect(rs.phase).toBe('submitted')
+  })
+
+  it('save_clean_413_does_not_trigger_outcome_unknown_recovery', async () => {
+    const rs = await loadedState()
+
+    // saveDraft throws a plain Error for a clean non-2xx/non-409 response
+    // (e.g. a confirmed 413 payload-too-large) — a KNOWN server outcome,
+    // not a lost one. Both the original attempt and its one same-id retry
+    // hit this, matching #runSave's retry-once-on-any-throw behavior.
+    saveDraftMock.mockRejectedValueOnce(new Error('saveDraft failed: 413'))
+    saveDraftMock.mockRejectedValueOnce(new Error('saveDraft failed: 413'))
+
+    rs.addGeneralComment('too big maybe')
+    await vi.runAllTimersAsync()
+
+    // Recovery must not run for a confirmed HTTP error — no extra
+    // GET /session beyond the one `load()` already made, and no
+    // outcome_unknown banner for what was actually a clean, known failure.
+    expect(fetchSessionMock).toHaveBeenCalledTimes(1) // load() only
+    expect(rs.phase).toBe('review')
+    expect(rs.saveState).toBe('error')
   })
 })
