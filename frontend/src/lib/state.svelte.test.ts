@@ -9,7 +9,13 @@ vi.mock('./api', () => ({
 }))
 
 import { abortSession, fetchSession, saveDraft, submit } from './api'
-import { GENERAL_BUFFER_KEY, phaseForFinished, ReviewState, SAVE_DEBOUNCE_MS } from './state.svelte'
+import {
+  commentTargetKey,
+  GENERAL_BUFFER_KEY,
+  phaseForFinished,
+  ReviewState,
+  SAVE_DEBOUNCE_MS,
+} from './state.svelte'
 
 const fetchSessionMock = vi.mocked(fetchSession)
 const saveDraftMock = vi.mocked(saveDraft)
@@ -327,6 +333,58 @@ describe('mutation id idempotency', () => {
 
     expect(secondId).not.toBe(firstId)
   })
+
+  it('save_retry_reuses_identical_payload_under_same_id', async () => {
+    const rs = await loadedState()
+
+    // The first attempt is left pending (a controllable deferred) so the
+    // store can be mutated to "draft B" before it settles — simulating the
+    // user typing more while the request for "draft A" is still in flight.
+    // Edits aren't locked during autosave, so this is possible even though
+    // #runSave itself never yields between taking its snapshot and firing
+    // the first request.
+    let rejectFirst: ((e: unknown) => void) | undefined
+    saveDraftMock.mockImplementationOnce(
+      () =>
+        new Promise<SaveDraftResult>((_resolve, reject) => {
+          rejectFirst = reject
+        }),
+    )
+    saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 4 })
+
+    rs.addGeneralComment('draft A')
+    await vi.advanceTimersByTimeAsync(SAVE_DEBOUNCE_MS)
+    expect(saveDraftMock).toHaveBeenCalledTimes(1)
+    const [firstDraft, firstRevision, firstId] = saveDraftMock.mock.calls[0]
+    expect(firstDraft.general_comments).toEqual(['draft A'])
+
+    // Mutate the store directly to "draft B" (bypassing addGeneralComment's
+    // own scheduleSave/debounce, which isn't what's under test here) while
+    // the first attempt is still on the wire.
+    rs.draft.general_comments.push('draft B')
+
+    // The first attempt's response is lost (network/timeout) even though
+    // the server actually applied draft A.
+    rejectFirst?.(new Error('network error'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(saveDraftMock).toHaveBeenCalledTimes(2)
+    const [secondDraft, secondRevision, secondId] = saveDraftMock.mock.calls[1]
+    // Same mutation id...
+    expect(secondId).toBe(firstId)
+    // ...and the SAME payload as the first attempt (draft A) — not the
+    // store's current state (draft A + draft B). Same id must mean same
+    // bytes, or the server's "already applied" replay silently drops B.
+    expect(secondDraft).toEqual(firstDraft)
+    expect(secondDraft.general_comments).toEqual(['draft A'])
+    expect(secondRevision).toBe(firstRevision)
+    expect(rs.saveState).toBe('saved')
+    // The retry's success only confirms draft A was persisted; draft B is
+    // still live in the store, unsaved, waiting for the next debounced save
+    // (a new mutation id) to pick it up — this is not asserted further
+    // here, it's the documented, correct follow-up behavior.
+    expect(rs.draft.general_comments).toEqual(['draft A', 'draft B'])
+  })
 })
 
 describe('editor buffers (Task 2.5 / P1-5)', () => {
@@ -378,6 +436,24 @@ describe('editor buffers (Task 2.5 / P1-5)', () => {
     await rs.submitReview()
     expect(submitMock).toHaveBeenCalledTimes(1)
     expect(rs.phase).toBe('submitted')
+  })
+
+  it('inline_buffer_is_scoped_per_concern', () => {
+    // One hunk line can belong to more than one concern (see hunkOwners),
+    // so the inline buffer key must include the concern id — otherwise
+    // in-progress text typed under concern A would leak into (and commit
+    // under) the editor opened on the same line under concern B.
+    const target = { path: 'src/a.ts', side: 'new' as const, line: 5 }
+    const keyA = commentTargetKey('concernA', target)
+    const keyB = commentTargetKey('concernB', target)
+    expect(keyA).not.toBe(keyB)
+
+    const rs = new ReviewState()
+    rs.setEditorBuffer(keyA, 'typed under concern A')
+
+    expect(rs.editorBuffer(keyA)).toBe('typed under concern A')
+    // Same (path, side, line) under a different concern reads empty.
+    expect(rs.editorBuffer(keyB)).toBe('')
   })
 })
 
@@ -452,5 +528,46 @@ describe('outcome-unknown recovery', () => {
     expect(fetchSessionMock).toHaveBeenCalledTimes(1) // load() only
     expect(rs.phase).toBe('review')
     expect(rs.saveState).toBe('error')
+  })
+
+  it('retrying submit from outcome_unknown actually submits instead of silently no-oping', async () => {
+    const rs = await loadedState()
+
+    // Drive phase to outcome_unknown via a save whose both attempts and
+    // whose recovery query are all lost.
+    saveDraftMock.mockRejectedValueOnce(networkError())
+    saveDraftMock.mockRejectedValueOnce(networkError())
+    fetchSessionMock.mockRejectedValueOnce(new Error('network error'))
+    rs.addGeneralComment('x')
+    await vi.runAllTimersAsync()
+    expect(rs.phase).toBe('outcome_unknown')
+
+    // Before the fix, submitReview's post-flush guard bailed whenever
+    // phase !== 'review', so this would resolve without ever calling
+    // submit() — a silent no-op behind a confirm dialog.
+    submitMock.mockResolvedValueOnce({ ok: true })
+    await rs.submitReview()
+    expect(submitMock).toHaveBeenCalledTimes(1)
+    expect(rs.phase).toBe('submitted')
+  })
+
+  it('restores phase to review when an autosave succeeds while outcome_unknown', async () => {
+    const rs = await loadedState()
+
+    saveDraftMock.mockRejectedValueOnce(networkError())
+    saveDraftMock.mockRejectedValueOnce(networkError())
+    fetchSessionMock.mockRejectedValueOnce(new Error('network error'))
+    rs.addGeneralComment('x')
+    await vi.runAllTimersAsync()
+    expect(rs.phase).toBe('outcome_unknown')
+
+    // A later autosave landing is live proof the session is alive — the
+    // sticky banner must clear on its own, without a manual reload.
+    saveDraftMock.mockResolvedValueOnce({ ok: true, revision: 5 })
+    rs.addGeneralComment('y')
+    await vi.runAllTimersAsync()
+
+    expect(rs.phase).toBe('review')
+    expect(rs.saveState).toBe('saved')
   })
 })

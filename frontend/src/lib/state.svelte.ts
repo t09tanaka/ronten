@@ -64,10 +64,12 @@ export interface CommentTarget {
 export const GENERAL_BUFFER_KEY = 'general'
 
 /** Key for an inline comment editor's entry in `editorBuffers` — one per
- * (path, side, line), matching how `pendingCommentTarget` identifies a
- * comment location. */
-export function commentTargetKey(t: CommentTarget): string {
-  return `${t.path}:${t.side}:${t.line}`
+ * (concernId, path, side, line). The concernId is required because a single
+ * hunk line can belong to more than one concern (see `hunkOwners`): without
+ * it, in-progress text typed under concern A would appear in — and commit
+ * under — the editor opened on the same line under concern B. */
+export function commentTargetKey(concernId: string, t: CommentTarget): string {
+  return `${concernId}:${t.path}:${t.side}:${t.line}`
 }
 
 export class ReviewState {
@@ -360,12 +362,23 @@ export class ReviewState {
     // recognizes the retry as the same mutation instead of double-applying
     // it or 409ing on a revision the retry never learned advanced.
     const mutationId = crypto.randomUUID()
+    // Snapshot the draft (and the revision it was taken against) ONCE,
+    // before the first attempt, and reuse that identical payload for the
+    // one-shot retry below. The retry can fire up to ~40s after the first
+    // attempt started, and edits aren't locked during autosave — re-reading
+    // `this.draft` for the retry could send a DIFFERENT payload under the
+    // SAME mutation id. The server would then replay its "already applied"
+    // response for the id, the client would mark it saved, and whatever
+    // changed between the two attempts would be silently lost. Same id must
+    // always mean same bytes.
+    const draftSnapshot = structuredClone(this.draft)
+    const revisionSnapshot = this.#revision
     try {
       let result: SaveDraftResult
       try {
-        result = await saveDraft(this.draft, this.#revision, mutationId)
+        result = await saveDraft(draftSnapshot, revisionSnapshot, mutationId)
       } catch {
-        result = await saveDraft(this.draft, this.#revision, mutationId)
+        result = await saveDraft(draftSnapshot, revisionSnapshot, mutationId)
       }
       if (!result.ok) {
         if (result.error === 'session finished') {
@@ -385,6 +398,12 @@ export class ReviewState {
       }
       this.#revision = result.revision
       this.saveState = 'saved'
+      // A successful save is proof the session is alive: if a prior lost
+      // response had left us showing the outcome-unknown banner, this
+      // autosave landing is live evidence that wasn't true (or is no longer
+      // true) — drop back to 'review' so the sticky banner clears instead
+      // of requiring a manual reload.
+      if (this.phase === 'outcome_unknown') this.phase = 'review'
     } catch (e) {
       if (!isAmbiguousFetchError(e)) {
         // A confirmed server response (saveDraft throws a plain Error for a
@@ -402,8 +421,12 @@ export class ReviewState {
         this.phase = 'outcome_unknown'
         this.saveState = 'error'
       } else if (outcome === 'review') {
-        // Still reviewing server-side: the save never landed. The next
-        // scheduleSave (triggered by any draft change) retries.
+        // Still reviewing server-side: the save never landed, but the
+        // query itself is live evidence the session is alive — same
+        // reasoning as the successful-save case above, so also clear a
+        // standing outcome-unknown banner here. The next scheduleSave
+        // (triggered by any draft change) retries the save itself.
+        this.phase = 'review'
         this.saveState = 'error'
       } else {
         this.phase = outcome
@@ -474,7 +497,11 @@ export class ReviewState {
       await this.#flushSave()
       // The flushed save may have surfaced a conflict, or ended the session
       // from elsewhere; either way there's nothing left for us to submit.
-      if (this.draftConflict || this.phase !== 'review') return
+      // `outcome_unknown` is treated like `review` here: submit is
+      // idempotent per mutation id (Task 2.2), so retrying from a lost-
+      // response state the flushed save may have just left us in is safe —
+      // without this the banner's "retry below" would be a silent no-op.
+      if (this.draftConflict || (this.phase !== 'review' && this.phase !== 'outcome_unknown')) return
       const mutationId = crypto.randomUUID()
       const result = await this.#enqueueMutation(() => submit(this.draft, this.#revision, mutationId))
       if ('ok' in result) {
@@ -546,7 +573,9 @@ export class ReviewState {
       // Same reasoning as submit: don't race an in-flight save — let it
       // land first so abort isn't chasing a PUT that's still on the wire.
       await this.#flushSave()
-      if (this.phase !== 'review') return
+      // Same `outcome_unknown` allowance as submitReview above — abort is
+      // safe to retry from a lost-response state too.
+      if (this.phase !== 'review' && this.phase !== 'outcome_unknown') return
       await this.#enqueueMutation(() => abortSession())
       this.phase = 'aborted'
     } catch (e) {

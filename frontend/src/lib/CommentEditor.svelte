@@ -14,7 +14,7 @@
   // Backed by the central store (not local $state) so the in-progress text
   // survives a concern switch or the editor being closed and reopened —
   // see Task 2.5 / P1-5.
-  const key = $derived(commentTargetKey({ path, side, line }))
+  const key = $derived(commentTargetKey(concernId, { path, side, line }))
   const body = $derived(rs.editorBuffer(key))
 
   const maxChars = $derived(rs.limits?.max_comment_chars)
