@@ -3,7 +3,6 @@
 import { SvelteMap } from 'svelte/reactivity'
 import { abortSession, fetchSession, saveDraft, submit } from './api'
 import { isVerdictConfirmed } from './confirmation'
-import { requiresAck } from './opaque'
 import type {
   Comment,
   ConcernDraft,
@@ -74,7 +73,7 @@ export function commentTargetKey(concernId: string, t: CommentTarget): string {
 
 export class ReviewState {
   session = $state<Session | null>(null)
-  draft = $state<Draft>({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
+  draft = $state<Draft>({ concerns: {}, general_comments: [], acknowledgements: [] })
   selectedIdx = $state(0)
   phase = $state<Phase>('loading')
   submitting = $state(false)
@@ -153,24 +152,25 @@ export class ReviewState {
     return this.session != null && this.reviewedCount === this.session.concerns.length
   }
 
-  isAcked(fileIndex: number): boolean {
-    return this.draft.acknowledged_opaque.includes(fileIndex)
+  isAcked(fileId: string): boolean {
+    return this.draft.acknowledgements.includes(fileId)
   }
 
-  toggleAck(fileIndex: number): void {
+  toggleAck(fileId: string): void {
     if (this.#locked) return
-    const i = this.draft.acknowledged_opaque.indexOf(fileIndex)
-    if (i >= 0) this.draft.acknowledged_opaque.splice(i, 1)
-    else this.draft.acknowledged_opaque.push(fileIndex)
+    const i = this.draft.acknowledgements.indexOf(fileId)
+    if (i >= 0) this.draft.acknowledgements.splice(i, 1)
+    else this.draft.acknowledgements.push(fileId)
     this.scheduleSave()
   }
 
   /** Files that can't be judged from the rendered diff body alone (opaque
-   * content, gitlink, mode change — see requiresAck) need an explicit ack
-   * instead of a verdict-driven confirmation. */
-  get allOpaqueAcked(): boolean {
+   * content, gitlink, mode change, added/deleted symlink, new executable,
+   * LFS pointer — see `FileDiff.ack_reasons`, server-computed) need an
+   * explicit ack instead of a verdict-driven confirmation. */
+  get allAcked(): boolean {
     if (!this.session) return true
-    return this.session.files.every((f, i) => !requiresAck(f) || this.isAcked(i))
+    return this.session.files.every((f) => !f.ack_required || this.isAcked(f.id))
   }
 
   /** `'file:hunk'` -> owning concern ids, built once per session load rather
@@ -290,19 +290,17 @@ export class ReviewState {
     try {
       const session = await fetchSession()
       this.session = session
-      // Older drafts predate acknowledged_opaque — default it so allOpaqueAcked
-      // and toggleAck can assume the array always exists. The lenient PUT
+      // Older drafts predate acknowledgements — default it so allAcked and
+      // toggleAck can assume the array always exists. The lenient PUT
       // /draft endpoint can also have persisted unknown/stale/duplicate
-      // indices (e.g. from a stale client); normalize to the set of file
-      // indices that actually require an ack so the UI can't get stuck
-      // unrecoverable on bad saved state.
-      const ackIdx = new Set(
-        session.files.map((f, i) => (requiresAck(f) ? i : -1)).filter((i) => i >= 0),
+      // ids (e.g. from a stale client); normalize to the set of file ids
+      // the server currently reports as requiring an ack so the UI can't
+      // get stuck unrecoverable on bad saved state.
+      const ackIds = new Set(session.files.filter((f) => f.ack_required).map((f) => f.id))
+      const acked = [...new Set(session.draft.acknowledgements ?? [])].filter((id) =>
+        ackIds.has(id),
       )
-      const acked = [...new Set(session.draft.acknowledged_opaque ?? [])].filter((i) =>
-        ackIdx.has(i),
-      )
-      this.draft = { ...session.draft, acknowledged_opaque: acked }
+      this.draft = { ...session.draft, acknowledgements: acked }
       this.#revision = session.draft_revision
       this.selectedIdx = 0
       this.phase = phaseForFinished(session.finished)

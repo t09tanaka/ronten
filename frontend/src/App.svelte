@@ -204,7 +204,7 @@
         e.preventDefault()
         if (showSubmitConfirm) {
           void confirmSubmit()
-        } else if (!confirmOpen && rs.allReviewed && rs.allOpaqueAcked) {
+        } else if (!confirmOpen && rs.allReviewed && rs.allAcked) {
           openSubmitConfirm()
         }
         break
@@ -228,7 +228,7 @@
   const submitTitle = $derived(
     !rs.allReviewed
       ? `Every concern needs a verdict — request changes also needs a comment (${(rs.session?.concerns.length ?? 0) - rs.reviewedCount} remaining)`
-      : !rs.allOpaqueAcked
+      : !rs.allAcked
         ? 'Acknowledge all flagged changes (undisplayed contents, mode or submodule changes) to submit'
         : 'Submit review',
   )
@@ -340,7 +340,7 @@
           <button
             type="button"
             class="btn-primary"
-            disabled={!rs.allReviewed || !rs.allOpaqueAcked || rs.draftConflict}
+            disabled={!rs.allReviewed || !rs.allAcked || rs.draftConflict}
             title={submitTitle}
             onclick={openSubmitConfirm}>Submit review</button
           >

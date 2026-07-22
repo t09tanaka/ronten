@@ -223,7 +223,11 @@ async fn get_session(
     let payload = SessionPayload {
         title: &state.title,
         summary: state.summary.as_deref(),
-        files: &state.files,
+        files: state
+            .files
+            .iter()
+            .map(crate::session::FileView::from)
+            .collect(),
         concerns,
         unmapped_lines: &state.mapping.unmapped_lines,
         warnings: &state.mapping.warnings,
@@ -1114,9 +1118,10 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn draft_roundtrip_acknowledged_opaque() {
+    async fn draft_roundtrip_acknowledgements() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
+        let file_id = state.files[1].id();
 
         let draft_body = json!({
             "revision": 0,
@@ -1124,19 +1129,22 @@ index 1111111..2222222 100644
             "draft": {
                 "concerns": {},
                 "general_comments": [],
-                "acknowledged_opaque": [1]
+                "acknowledgements": [file_id]
             }
         });
         let (status, body) = call(
             app.clone(),
-            put_json(&format!("/api/{TOKEN}/draft"), draft_body),
+            put_json(&format!("/api/{TOKEN}/draft"), draft_body.clone()),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body: {body}");
 
         let (status, body) = call(app, get(&format!("/api/{TOKEN}/session"))).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["draft"]["acknowledged_opaque"], json!([1]));
+        assert_eq!(
+            body["draft"]["acknowledgements"],
+            draft_body["draft"]["acknowledgements"]
+        );
     }
 
     /// A save whose response was lost (client timed out, but the server
@@ -1759,7 +1767,7 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn submit_without_opaque_ack_422() {
+    async fn submit_without_acking_required_file_422() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
         let draft = json!({
@@ -1776,13 +1784,14 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn submit_with_opaque_ack_succeeds() {
+    async fn submit_with_all_acks_succeeds() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
+        let file_id = state.files[1].id();
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": [],
-            "acknowledged_opaque": [1]
+            "acknowledgements": [file_id]
         });
         let (status, body) = call(
             app,
@@ -1797,13 +1806,16 @@ index 1111111..2222222 100644
     }
 
     #[tokio::test]
-    async fn submit_ack_on_non_opaque_file_422() {
+    async fn ack_on_non_required_file_422() {
         let state = build_opaque_state();
         let app = build_router(state.clone());
+        // files[0] is a plain text file — it never requires an ack.
+        let non_required_id = state.files[0].id();
+        let required_id = state.files[1].id();
         let draft = json!({
             "concerns": { "c1": { "verdict": "approve", "comments": [] } },
             "general_comments": [],
-            "acknowledged_opaque": [0, 1, 99]
+            "acknowledgements": [non_required_id, required_id]
         });
         let (status, body) = call(
             app,
@@ -1811,6 +1823,24 @@ index 1111111..2222222 100644
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn ack_unknown_file_id_422() {
+        let state = build_opaque_state();
+        let app = build_router(state.clone());
+        let draft = json!({
+            "concerns": { "c1": { "verdict": "approve", "comments": [] } },
+            "general_comments": [],
+            "acknowledgements": ["not-a-real-file-id"]
+        });
+        let (status, body) = call(
+            app,
+            post_json(&format!("/api/{TOKEN}/submit"), submit_body(draft)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "body: {body}");
+        assert!(body["details"].to_string().contains("unknown file id"));
     }
 
     /// Regression test for the embedded-asset 404 bug: the wildcard

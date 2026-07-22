@@ -1,9 +1,18 @@
 import { describe, expect, it } from 'vitest'
-import { contentNote, fileNotices, modeChangeBadge, opaqueDetails, requiresAck, typeChangeBadge } from './opaque'
+import {
+  ackReasonLabels,
+  contentNote,
+  fileNotices,
+  modeChangeBadge,
+  oneSidedModeBadge,
+  opaqueDetails,
+  typeChangeBadge,
+} from './opaque'
 import type { FileDiff } from './types'
 
 function makeFile(overrides: Partial<FileDiff> = {}): FileDiff {
   return {
+    id: 'file-id',
     old_path: 'a.bin',
     new_path: 'a.bin',
     change_kind: 'modified',
@@ -18,6 +27,8 @@ function makeFile(overrides: Partial<FileDiff> = {}): FileDiff {
     new_size: null,
     lfs_pointer: false,
     hunks: [],
+    ack_required: false,
+    ack_reasons: [],
     ...overrides,
   }
 }
@@ -100,85 +111,89 @@ describe('opaqueDetails', () => {
   })
 })
 
-// Must mirror the server's FileDiff::requires_ack() (gitdiff.rs) exactly —
-// validate_draft rejects submissions with missing acks under this condition.
-describe('requiresAck', () => {
-  it('requires an ack for opaque content kinds', () => {
-    expect(requiresAck(makeFile({ content_kind: 'binary' }))).toBe(true)
-    expect(requiresAck(makeFile({ content_kind: 'non-utf8' }))).toBe(true)
-    expect(requiresAck(makeFile({ content_kind: 'too-large' }))).toBe(true)
+// ack_required/ack_reasons are server-computed (FileDiff::ack_reasons in
+// gitdiff.rs) and sent verbatim in the payload — the frontend must not
+// recompute this policy (P0-5). These tests only exercise the presentation
+// helpers that turn the server's reasons into UI text.
+describe('ackReasonLabels', () => {
+  it('is empty when the file has no ack reasons', () => {
+    expect(ackReasonLabels(makeFile({ ack_reasons: [] }))).toEqual([])
   })
 
-  it('does not require an ack for a plain text change', () => {
-    expect(requiresAck(makeFile({ content_kind: 'text' }))).toBe(false)
-  })
-
-  it('requires an ack when a gitlink pointer actually moves', () => {
+  it('renders a human label per server-supplied reason, in order', () => {
     expect(
-      requiresAck(
+      ackReasonLabels(makeFile({ ack_reasons: ['opaque-content', 'mode-changed'] })),
+    ).toEqual([
+      'Content not rendered — the summary below is all that is shown',
+      'File mode changed',
+    ])
+  })
+
+  it('renders a label for every AckReason variant', () => {
+    expect(
+      ackReasonLabels(
         makeFile({
-          content_kind: 'text',
-          old_type: 'gitlink',
-          new_type: 'gitlink',
-          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          ack_reasons: [
+            'opaque-content',
+            'gitlink-changed',
+            'mode-changed',
+            'added-symlink',
+            'deleted-symlink',
+            'added-executable',
+            'regular-to-symlink',
+            'lfs-pointer',
+            'submodule-pointer',
+          ],
         }),
       ),
-    ).toBe(true)
-    // Added / deleted gitlink: one oid side is null, so the pointer moved.
+    ).toHaveLength(9)
+  })
+})
+
+describe('oneSidedModeBadge', () => {
+  it('renders "added symlink <mode>" for a newly added symlink', () => {
     expect(
-      requiresAck(
-        makeFile({
-          content_kind: 'text',
-          old_type: 'gitlink',
-          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        }),
+      oneSidedModeBadge(
+        makeFile({ change_kind: 'added', new_type: 'symlink', new_mode: '120000' }),
       ),
-    ).toBe(true)
-    expect(
-      requiresAck(
-        makeFile({
-          content_kind: 'text',
-          new_type: 'gitlink',
-          new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-        }),
-      ),
-    ).toBe(true)
+    ).toBe('added symlink 120000')
   })
 
-  it('does not require an ack for a same-oid pure rename of a gitlink', () => {
+  it('renders "added executable <mode>" for a newly added executable', () => {
     expect(
-      requiresAck(
-        makeFile({
-          content_kind: 'text',
-          old_type: 'gitlink',
-          new_type: 'gitlink',
-          old_mode: '160000',
-          new_mode: '160000',
-          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          new_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-        }),
+      oneSidedModeBadge(
+        makeFile({ change_kind: 'added', new_type: 'executable', new_mode: '100755' }),
       ),
-    ).toBe(false)
+    ).toBe('added executable 100755')
   })
 
-  it('requires an ack for a mode change with both sides present', () => {
+  it('renders "deleted symlink <mode>" for a deleted symlink', () => {
     expect(
-      requiresAck(makeFile({ content_kind: 'text', old_mode: '100644', new_mode: '100755' })),
-    ).toBe(true)
-    expect(
-      requiresAck(makeFile({ content_kind: 'text', old_mode: '100644', new_mode: '120000' })),
-    ).toBe(true)
+      oneSidedModeBadge(
+        makeFile({ change_kind: 'deleted', old_type: 'symlink', old_mode: '120000' }),
+      ),
+    ).toBe('deleted symlink 120000')
   })
 
-  it('does not require an ack when the mode is unchanged or one-sided', () => {
+  it('is null for a plain added/deleted regular file', () => {
     expect(
-      requiresAck(makeFile({ content_kind: 'text', old_mode: '100644', new_mode: '100644' })),
-    ).toBe(false)
-    // Added/deleted files have only one side; their kind is already the
-    // headline of the change.
-    expect(requiresAck(makeFile({ content_kind: 'text', new_mode: '100755' }))).toBe(false)
-    expect(requiresAck(makeFile({ content_kind: 'text', old_mode: '100755' }))).toBe(false)
+      oneSidedModeBadge(
+        makeFile({ change_kind: 'added', new_type: 'regular', new_mode: '100644' }),
+      ),
+    ).toBeNull()
+    expect(
+      oneSidedModeBadge(
+        makeFile({ change_kind: 'deleted', old_type: 'regular', old_mode: '100644' }),
+      ),
+    ).toBeNull()
+  })
+
+  it('is null for a two-sided change (modified)', () => {
+    expect(
+      oneSidedModeBadge(
+        makeFile({ change_kind: 'modified', old_type: 'regular', new_type: 'symlink' }),
+      ),
+    ).toBeNull()
   })
 })
 
@@ -209,50 +224,52 @@ describe('typeChangeBadge', () => {
   })
 })
 
+// fileNotices is derived purely from the server-supplied `ack_reasons` list
+// now (not recomputed from old_type/old_oid) — these tests exercise that
+// filtering/mapping, not the ack policy itself (see gitdiff.rs for that).
 describe('fileNotices', () => {
-  it('is empty for an ordinary file', () => {
-    expect(fileNotices(makeFile())).toEqual([])
+  it('is empty for an ordinary file with no ack reasons', () => {
+    expect(fileNotices(makeFile({ ack_reasons: [] }))).toEqual([])
   })
 
-  it('flags a submodule pointer change only when the pointer moves', () => {
-    expect(
-      fileNotices(
-        makeFile({ old_type: 'gitlink', old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }),
-      ),
-    ).toEqual(['Submodule pointer change — nested diff not shown'])
-    expect(
-      fileNotices(
-        makeFile({ new_type: 'gitlink', new_oid: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }),
-      ),
-    ).toEqual(['Submodule pointer change — nested diff not shown'])
-    // Same-oid pure rename: nothing hidden, no notice.
+  it('is empty for ack reasons that already have their own header badge (opaque/mode/symlink/executable)', () => {
     expect(
       fileNotices(
         makeFile({
-          old_type: 'gitlink',
-          new_type: 'gitlink',
-          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          new_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          ack_reasons: [
+            'opaque-content',
+            'mode-changed',
+            'added-symlink',
+            'deleted-symlink',
+            'added-executable',
+            'regular-to-symlink',
+          ],
         }),
       ),
     ).toEqual([])
   })
 
+  it('flags a gitlink pointer change', () => {
+    expect(fileNotices(makeFile({ ack_reasons: ['gitlink-changed'] }))).toEqual([
+      'Submodule pointer change — nested diff not shown',
+    ])
+  })
+
+  it('flags a submodule reference added or removed', () => {
+    expect(fileNotices(makeFile({ ack_reasons: ['submodule-pointer'] }))).toEqual([
+      'Submodule reference added or removed — nested diff not shown',
+    ])
+  })
+
   it('flags an LFS pointer', () => {
-    expect(fileNotices(makeFile({ lfs_pointer: true }))).toEqual([
+    expect(fileNotices(makeFile({ ack_reasons: ['lfs-pointer'] }))).toEqual([
       'Git LFS pointer — actual content not shown',
     ])
   })
 
-  it('stacks both notices for an LFS-pointer gitlink combination', () => {
+  it('stacks notices, in server-supplied order', () => {
     expect(
-      fileNotices(
-        makeFile({
-          old_type: 'gitlink',
-          old_oid: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          lfs_pointer: true,
-        }),
-      ),
+      fileNotices(makeFile({ ack_reasons: ['gitlink-changed', 'lfs-pointer'] })),
     ).toEqual([
       'Submodule pointer change — nested diff not shown',
       'Git LFS pointer — actual content not shown',

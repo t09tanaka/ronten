@@ -41,7 +41,7 @@ function makeSession(): Session {
     files: [],
     concerns: [],
     warnings: [],
-    draft: { concerns: {}, general_comments: [], acknowledged_opaque: [] },
+    draft: { concerns: {}, general_comments: [], acknowledgements: [] },
     draft_revision: 3,
     limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
     finished: null,
@@ -488,7 +488,7 @@ describe('outcome-unknown recovery', () => {
 
     expect(rs.phase).toBe('outcome_unknown')
     // The local draft must survive so the user can still copy it out.
-    expect(rs.draft).toEqual({ concerns: {}, general_comments: [], acknowledged_opaque: [] })
+    expect(rs.draft).toEqual({ concerns: {}, general_comments: [], acknowledgements: [] })
   })
 
   it('submit_failure_with_session_still_reviewing_shows_retryable_error', async () => {

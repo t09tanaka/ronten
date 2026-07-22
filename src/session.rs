@@ -2,7 +2,7 @@
 //! immutable diff/mapping/concerns data it's reviewing, and the plumbing to
 //! turn a submitted draft into a `ResultOutput`.
 
-use crate::gitdiff::FileDiff;
+use crate::gitdiff::{AckReason, FileDiff};
 use crate::mapping::{HunkRef, Mapping, UnmappedLine, UNMAPPED_ID};
 use crate::model::{
     derive_decision, Assurance, Comment, ConcernResult, ConcernsInput, ResultOutput, ReviewInfo,
@@ -79,12 +79,16 @@ pub struct Draft {
     pub concerns: HashMap<String, ConcernDraft>,
     #[serde(default)]
     pub general_comments: Vec<String>,
-    /// 明示 acknowledge が必要な変更（FileDiff::requires_ack — opaque な
-    /// content に加えて gitlink pointer 変更・mode 変更）への acknowledge。
-    /// 値は session payload の files[] における index。フィールド名は当初の
-    /// opaque 専用時代のままだが、対象は requires_ack 全体。
+    /// `FileDiff::id()` of every file the reviewer explicitly acknowledged
+    /// — required for every file whose `FileDiff::ack_reasons()` is
+    /// non-empty (opaque content, gitlink pointer change, mode change, an
+    /// added/deleted symlink, a new executable, a regular-to-symlink type
+    /// change, an LFS pointer — see `AckReason`). ID-based rather than
+    /// index-based: an index into `files[]` is fragile (a stale client, or
+    /// the file list being rebuilt, could silently point the ack at the
+    /// wrong file); a stable id derived from the file's own identity cannot.
     #[serde(default)]
-    pub acknowledged_opaque: Vec<usize>,
+    pub acknowledgements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -95,12 +99,39 @@ pub struct ConcernDraft {
     pub comments: Vec<Comment>,
 }
 
+/// Wire view of one file's diff, plus the server-computed ack requirement
+/// for it (see `FileDiff::ack_reasons`). Flattens `FileDiff`'s own fields
+/// together with `id`/`ack_required`/`ack_reasons` so the frontend gets one
+/// flat object per file; it reads `ack_required`/`ack_reasons` here rather
+/// than recomputing the policy itself — the duplication that used to drift
+/// between Rust and TypeScript (P0-5).
+#[derive(Serialize)]
+pub struct FileView<'a> {
+    #[serde(flatten)]
+    pub file: &'a FileDiff,
+    pub id: String,
+    pub ack_required: bool,
+    pub ack_reasons: Vec<AckReason>,
+}
+
+impl<'a> From<&'a FileDiff> for FileView<'a> {
+    fn from(file: &'a FileDiff) -> Self {
+        let ack_reasons = file.ack_reasons();
+        FileView {
+            id: file.id(),
+            ack_required: !ack_reasons.is_empty(),
+            ack_reasons,
+            file,
+        }
+    }
+}
+
 /// Everything the UI needs, sent by `GET /api/{token}/session`.
 #[derive(Serialize)]
 pub struct SessionPayload<'a> {
     pub title: &'a str,
     pub summary: Option<&'a str>,
-    pub files: &'a [FileDiff],
+    pub files: Vec<FileView<'a>>,
     pub concerns: Vec<ConcernView<'a>>,
     pub unmapped_lines: &'a [UnmappedLine],
     pub warnings: &'a [Warning],
@@ -361,39 +392,39 @@ impl SessionState {
             }
         }
 
-        let ack_required_indices: HashSet<usize> = self
+        // Id-keyed, not index-keyed (P0-5): a file's identity survives the
+        // diff being rebuilt or reordered, an array index does not.
+        let id_lookup: HashMap<String, &FileDiff> =
+            self.files.iter().map(|f| (f.id(), f)).collect();
+        let ack_required_ids: HashSet<String> = self
             .files
             .iter()
-            .enumerate()
-            .filter(|(_, f)| f.requires_ack())
-            .map(|(i, _)| i)
+            .filter(|f| f.ack_required())
+            .map(FileDiff::id)
             .collect();
-        let acknowledged: HashSet<usize> = draft.acknowledged_opaque.iter().copied().collect();
-        let mut acked: Vec<usize> = acknowledged.iter().copied().collect();
-        acked.sort_unstable();
-        for i in acked {
-            let Some(file) = self.files.get(i) else {
-                violations.push(format!("acknowledged_opaque: unknown file index {i}"));
+        let acknowledged: HashSet<String> = draft.acknowledgements.iter().cloned().collect();
+        let mut acked: Vec<&String> = acknowledged.iter().collect();
+        acked.sort();
+        for id in acked {
+            let Some(file) = id_lookup.get(id) else {
+                violations.push(format!("acknowledgements: unknown file id {id:?}"));
                 continue;
             };
-            if !ack_required_indices.contains(&i) {
+            if !ack_required_ids.contains(id) {
                 let path = file
                     .new_path
                     .as_deref()
                     .or(file.old_path.as_deref())
                     .unwrap_or("");
                 violations.push(format!(
-                    "acknowledged_opaque: file {path} does not require acknowledgement"
+                    "acknowledgements: file {path} does not require acknowledgement"
                 ));
             }
         }
-        let mut missing_ack: Vec<usize> = ack_required_indices
-            .difference(&acknowledged)
-            .copied()
-            .collect();
-        missing_ack.sort_unstable();
-        for i in missing_ack {
-            let file = &self.files[i];
+        let mut missing_ack: Vec<&String> = ack_required_ids.difference(&acknowledged).collect();
+        missing_ack.sort();
+        for id in missing_ack {
+            let file = id_lookup[id];
             let path = file
                 .new_path
                 .as_deref()

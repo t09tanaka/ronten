@@ -1,5 +1,6 @@
 use crate::model::{Severity, Warning};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -50,6 +51,67 @@ fn file_type_of_mode(mode: &str) -> Option<FileType> {
     })
 }
 
+/// Why a file requires an explicit reviewer acknowledgement before submit,
+/// as computed by [`FileDiff::ack_reasons`] — the ONE place this policy is
+/// defined. Previously this lived as a `bool` (`FileDiff::requires_ack`)
+/// duplicated verbatim in TypeScript (`opaque.ts`'s `requiresAck`); the two
+/// could — and did — drift (P0-5). The frontend now only displays these
+/// server-computed reasons, never recomputes them.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum AckReason {
+    /// Content not rendered in the diff body (binary / non-utf8 / too-large).
+    OpaqueContent,
+    /// An existing gitlink's (submodule) pointer moved — both sides present,
+    /// different oids. The nested diff is never shown.
+    GitlinkChanged,
+    /// File mode changed with both sides present (e.g. a permission bit),
+    /// other than a regular file becoming a symlink (see
+    /// [`AckReason::RegularToSymlink`]).
+    ModeChanged,
+    /// A new symlink was added (`change_kind` added, mode `120000`).
+    AddedSymlink,
+    /// A symlink was deleted (`change_kind` deleted, mode `120000`).
+    DeletedSymlink,
+    /// A new executable file was added (`change_kind` added, mode `100755`).
+    AddedExecutable,
+    /// A regular file became a symlink (both sides present).
+    RegularToSymlink,
+    /// Either side is a Git LFS pointer blob; the diff shows the pointer,
+    /// not the actual content.
+    LfsPointer,
+    /// A submodule reference was added or removed (one oid side absent) —
+    /// distinct from [`AckReason::GitlinkChanged`], which is a pointer move
+    /// on an existing gitlink.
+    SubmodulePointer,
+}
+
+/// Stable, index-independent identifier for a `FileDiff`, derived purely
+/// from the values that identify "this same file change" — never its
+/// position in the file list. SHA-256 of `old_path\0new_path\0old_oid\0
+/// new_oid\0old_mode\0new_mode` (absent components as empty strings),
+/// truncated to the first 16 hex chars (64 bits): collisions are
+/// astronomically unlikely for one diff's file set. This is what lets the
+/// client's acknowledgement list survive being keyed by something other
+/// than an array index, which a stale client (or a reordered/rebuilt file
+/// list) could otherwise point at the wrong file.
+fn compute_file_id(
+    old_path: Option<&str>,
+    new_path: Option<&str>,
+    old_oid: Option<&str>,
+    new_oid: Option<&str>,
+    old_mode: Option<&str>,
+    new_mode: Option<&str>,
+) -> String {
+    let mut hasher = Sha256::new();
+    for part in [old_path, new_path, old_oid, new_oid, old_mode, new_mode] {
+        hasher.update(part.unwrap_or("").as_bytes());
+        hasher.update([0u8]);
+    }
+    let digest = hasher.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileDiff {
     pub old_path: Option<String>,
@@ -81,24 +143,80 @@ impl FileDiff {
         self.content_kind != ContentKind::Text
     }
 
-    /// submit 時に明示 acknowledge が必要な変更。内容が描画されないもの
-    /// （opaque）に加えて、レビュー画面の本文だけでは重大さが伝わらない
-    /// 変更 — gitlink の pointer 変更（submodule pointer だけで中身の diff は
-    /// 表示されない）、mode 変更（実行属性の付与・symlink 化など）— を含む。
-    /// gitlink の同一 oid の pure rename は pointer が動いていないので対象外。
-    pub fn requires_ack(&self) -> bool {
+    /// Stable, index-independent identifier for this file — see
+    /// [`compute_file_id`]. Computed on demand (not cached) so it can never
+    /// go stale relative to the fields it's derived from.
+    pub fn id(&self) -> String {
+        compute_file_id(
+            self.old_path.as_deref(),
+            self.new_path.as_deref(),
+            self.old_oid.as_deref(),
+            self.new_oid.as_deref(),
+            self.old_mode.as_deref(),
+            self.new_mode.as_deref(),
+        )
+    }
+
+    /// Every reason submit requires an explicit acknowledgement of this
+    /// file before it can be considered reviewed — content that isn't
+    /// rendered (opaque), or a change whose severity the diff body alone
+    /// under-communicates (gitlink pointer move, mode change, a symlink or
+    /// executable appearing/disappearing, an LFS pointer standing in for
+    /// real data). A file can carry more than one reason (e.g. opaque
+    /// content AND a mode change); acknowledging the file once covers all
+    /// of them. Empty means no acknowledgement is required — see
+    /// [`FileDiff::ack_required`].
+    ///
+    /// This is the single, server-authoritative definition of the ack
+    /// policy (P0-5): the frontend only displays these reasons, it must
+    /// never recompute them.
+    pub fn ack_reasons(&self) -> Vec<AckReason> {
+        let mut reasons = Vec::new();
         if self.is_opaque() {
-            return true;
+            reasons.push(AckReason::OpaqueContent);
         }
         let gitlink_involved =
             self.old_type == Some(FileType::Gitlink) || self.new_type == Some(FileType::Gitlink);
-        if gitlink_involved && self.old_oid != self.new_oid {
-            return true;
+        if gitlink_involved {
+            match (&self.old_oid, &self.new_oid) {
+                (Some(o), Some(n)) if o != n => reasons.push(AckReason::GitlinkChanged),
+                // One side absent: a submodule reference was added or
+                // removed outright, not "changed" on an existing one.
+                (None, Some(_)) | (Some(_), None) => reasons.push(AckReason::SubmodulePointer),
+                _ => {}
+            }
         }
-        // Mode change with both sides present (e.g. 100644 -> 100755, or a
-        // regular file becoming a symlink). Added/deleted files have only
-        // one side and their kind is already the headline of the change.
-        matches!((&self.old_mode, &self.new_mode), (Some(o), Some(n)) if o != n)
+        // Mode change with both sides present (e.g. 100644 -> 100755).
+        // Added/deleted files have only one side; their one-sided badges
+        // (added-symlink/deleted-symlink/added-executable below) already
+        // headline the change instead.
+        if matches!((&self.old_mode, &self.new_mode), (Some(o), Some(n)) if o != n) {
+            if self.old_type == Some(FileType::Regular) && self.new_type == Some(FileType::Symlink)
+            {
+                reasons.push(AckReason::RegularToSymlink);
+            } else {
+                reasons.push(AckReason::ModeChanged);
+            }
+        }
+        if self.change_kind == ChangeKind::Added && self.new_type == Some(FileType::Symlink) {
+            reasons.push(AckReason::AddedSymlink);
+        }
+        if self.change_kind == ChangeKind::Deleted && self.old_type == Some(FileType::Symlink) {
+            reasons.push(AckReason::DeletedSymlink);
+        }
+        if self.change_kind == ChangeKind::Added && self.new_type == Some(FileType::Executable) {
+            reasons.push(AckReason::AddedExecutable);
+        }
+        if self.lfs_pointer {
+            reasons.push(AckReason::LfsPointer);
+        }
+        reasons
+    }
+
+    /// Whether submit requires an explicit acknowledgement of this file —
+    /// `true` iff [`FileDiff::ack_reasons`] is non-empty.
+    pub fn ack_required(&self) -> bool {
+        !self.ack_reasons().is_empty()
     }
 }
 
@@ -404,14 +522,50 @@ mod tests {
             ..file_diff_with_content_kind(ContentKind::Text)
         };
         // Pointer moved -> ack; same-oid pure rename -> nothing hidden.
-        assert!(gitlink("aaaa", "bbbb").requires_ack());
-        assert!(!gitlink("aaaa", "aaaa").requires_ack());
-        // Added gitlink: one side absent counts as a pointer move.
+        assert!(gitlink("aaaa", "bbbb")
+            .ack_reasons()
+            .contains(&AckReason::GitlinkChanged));
+        assert!(gitlink("aaaa", "aaaa").ack_reasons().is_empty());
+        // Added gitlink: one side absent is a submodule add/remove, not a
+        // pointer "change" on an existing one.
         let added = FileDiff {
             old_oid: None,
             ..gitlink("aaaa", "bbbb")
         };
-        assert!(added.requires_ack());
+        assert!(added.ack_reasons().contains(&AckReason::SubmodulePointer));
+        assert!(added.ack_required());
+    }
+
+    #[test]
+    fn file_id_is_stable_and_index_independent() {
+        let make = |path: &str| FileDiff {
+            old_path: Some(path.to_string()),
+            new_path: Some(path.to_string()),
+            old_oid: Some("aaaa".to_string()),
+            new_oid: Some("bbbb".to_string()),
+            old_mode: Some("100644".to_string()),
+            new_mode: Some("100644".to_string()),
+            ..file_diff_with_content_kind(ContentKind::Text)
+        };
+        let a = make("a.txt");
+
+        // Same components -> same id, even from a fresh construction.
+        assert_eq!(a.id(), make("a.txt").id());
+        // 16 lowercase hex chars.
+        assert_eq!(a.id().len(), 16);
+        assert!(a
+            .id()
+            .bytes()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        // Different components -> different id.
+        assert_ne!(a.id(), make("b.txt").id());
+
+        // Index-independent: the same file's id does not depend on where it
+        // sits in a Vec alongside other files.
+        let order1 = [make("a.txt"), make("b.txt")];
+        let order2 = [make("b.txt"), make("a.txt")];
+        assert_eq!(order1[0].id(), order2[1].id());
+        assert_eq!(order1[1].id(), order2[0].id());
     }
 
     #[test]
@@ -520,6 +674,14 @@ rename to new_name.rs
         assert_eq!(f.old_path.as_deref(), Some("old_name.rs"));
         assert_eq!(f.new_path.as_deref(), Some("new_name.rs"));
         assert!(f.hunks.is_empty());
+    }
+
+    #[test]
+    fn pure_rename_same_oid_does_not_require_ack() {
+        let f = &parse_unified_diff(RENAME_NO_CHANGE)[0];
+        assert_eq!(f.change_kind, ChangeKind::Renamed);
+        assert!(f.ack_reasons().is_empty());
+        assert!(!f.ack_required());
     }
 
     const BINARY: &str = "\
@@ -2079,7 +2241,7 @@ fn file_type_name(t: FileType) -> &'static str {
 /// mode changes (e.g. the executable bit appearing), file type changes
 /// (regular ↔ symlink and the like), gitlink (submodule pointer) changes
 /// whose nested diff is not shown, and LFS pointers standing in for real
-/// data. These pair with `FileDiff::requires_ack`, which forces an explicit
+/// data. These pair with `FileDiff::ack_reasons`, which forces an explicit
 /// acknowledgement for the same categories.
 fn push_shape_warnings(
     warnings: &mut Vec<Warning>,
@@ -3152,9 +3314,10 @@ mod git_tests {
         assert_eq!(f.old_type, Some(FileType::Regular));
         assert_eq!(f.new_type, Some(FileType::Executable));
         assert!(
-            f.requires_ack(),
+            f.ack_required(),
             "a mode change must require explicit acknowledgement"
         );
+        assert!(f.ack_reasons().contains(&AckReason::ModeChanged));
         // The executable bit is part of the file *type* taxonomy here, so
         // the flip surfaces as FILE_TYPE_CHANGED (regular -> executable).
         assert!(
@@ -3168,7 +3331,7 @@ mod git_tests {
 
     #[cfg(unix)]
     #[test]
-    fn regular_to_symlink_reports_type_change() {
+    fn regular_to_symlink_requires_ack() {
         let td = base_repo();
         let d = td.path();
         std::fs::remove_file(d.join("a.txt")).unwrap();
@@ -3180,12 +3343,99 @@ mod git_tests {
         let f = find(&out.files, "a.txt");
         assert_eq!(f.old_type, Some(FileType::Regular));
         assert_eq!(f.new_type, Some(FileType::Symlink));
-        assert!(f.requires_ack());
+        assert!(f.ack_reasons().contains(&AckReason::RegularToSymlink));
+        assert!(f.ack_required());
         assert!(
             out.warnings.iter().any(|w| w.code == "FILE_TYPE_CHANGED"),
             "missing FILE_TYPE_CHANGED warning: {:?}",
             out.warnings
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_symlink_requires_ack() {
+        let td = base_repo();
+        let d = td.path();
+        std::os::unix::fs::symlink("a.txt", d.join("link.txt")).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "add symlink"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "link.txt");
+        assert_eq!(f.change_kind, ChangeKind::Added);
+        assert_eq!(f.new_type, Some(FileType::Symlink));
+        assert_eq!(
+            f.new_mode.as_deref(),
+            Some("120000"),
+            "the mode must be visible for a one-sided symlink add"
+        );
+        assert!(f.ack_reasons().contains(&AckReason::AddedSymlink));
+        assert!(f.ack_required());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleted_symlink_requires_ack() {
+        let td = base_repo();
+        let d = td.path();
+        std::os::unix::fs::symlink("a.txt", d.join("link.txt")).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "add symlink"]);
+        git(d, &["rm", "link.txt"]);
+        git(d, &["commit", "-m", "remove symlink"]);
+
+        // Diff the two feature commits directly — `main` never had the
+        // symlink, so diffing against it would show nothing at all here.
+        let out = compute_diff(d, "HEAD~1").unwrap();
+        let f = out
+            .files
+            .iter()
+            .find(|f| f.old_path.as_deref() == Some("link.txt"))
+            .unwrap_or_else(|| panic!("no file with old_path link.txt: {:?}", out.files));
+        assert_eq!(f.change_kind, ChangeKind::Deleted);
+        assert_eq!(f.old_type, Some(FileType::Symlink));
+        assert_eq!(f.new_path, None);
+        assert!(f.ack_reasons().contains(&AckReason::DeletedSymlink));
+        assert!(f.ack_required());
+    }
+
+    #[test]
+    fn new_executable_requires_ack_and_shows_mode() {
+        let td = base_repo();
+        let d = td.path();
+        std::fs::write(d.join("run.sh"), "#!/bin/sh\necho hi\n").unwrap();
+        git(d, &["add", "run.sh"]);
+        git(d, &["update-index", "--chmod=+x", "run.sh"]);
+        git(d, &["commit", "-m", "add executable"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "run.sh");
+        assert_eq!(f.change_kind, ChangeKind::Added);
+        assert_eq!(f.new_type, Some(FileType::Executable));
+        assert_eq!(
+            f.new_mode.as_deref(),
+            Some("100755"),
+            "the mode must be visible for a one-sided executable add"
+        );
+        assert!(f.ack_reasons().contains(&AckReason::AddedExecutable));
+        assert!(f.ack_required());
+    }
+
+    #[test]
+    fn lfs_pointer_requires_ack() {
+        let td = base_repo();
+        let d = td.path();
+        let pointer = "version https://git-lfs.github.com/spec/v1\noid sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nsize 12345\n";
+        std::fs::write(d.join("model.bin"), pointer).unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "lfs pointer"]);
+
+        let out = compute_diff(d, "main").unwrap();
+        let f = find(&out.files, "model.bin");
+        assert!(f.lfs_pointer);
+        assert!(f.ack_reasons().contains(&AckReason::LfsPointer));
+        assert!(f.ack_required());
     }
 
     #[test]
@@ -3291,7 +3541,7 @@ mod git_tests {
         let f = find(&out.files, "many.txt");
         assert_eq!(f.content_kind, ContentKind::TooLarge);
         assert!(f.hunks.is_empty());
-        assert!(f.requires_ack(), "degraded file must require an ack");
+        assert!(f.ack_required(), "degraded file must require an ack");
         assert!(out.warnings.iter().any(|w| w.code == "FILE_TOO_MANY_LINES"));
     }
 

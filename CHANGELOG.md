@@ -50,6 +50,19 @@ project is pre-1.0 and minor versions may contain breaking changes.
   titles (and all but TAB in diff line content).
 
 ### Changed
+- File acknowledgement is now server-authoritative and keyed by a stable,
+  index-independent `file_id` (SHA-256 of path/oid/mode) instead of an
+  array index: `Draft.acknowledged_opaque: Vec<usize>` is now
+  `Draft.acknowledgements: Vec<String>`. The session payload carries a
+  computed `ack_required`/`ack_reasons` per file — the frontend only
+  displays these, it no longer recomputes the policy itself (previously
+  duplicated in `opaque.ts`'s `requiresAck`, which could drift). The ack
+  policy also grew: a newly added or deleted symlink, a newly added
+  executable, a regular file becoming a symlink, and an LFS pointer now
+  require acknowledgement (previously only opaque content, a gitlink
+  pointer move, and a both-sided mode change did); one-sided mode/type
+  badges (`added symlink 120000`, `added executable 100755`, `deleted
+  symlink 120000`) are always shown in the file header.
 - Terminal state, outcome, and the editable draft are one atomic value: no
   submit/abort/timeout race can lose an outcome, double-report, or let a
   late autosave rewrite a frozen draft. Graceful shutdown has a hard

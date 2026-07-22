@@ -49,7 +49,7 @@ function baseSession(): Omit<Session, 'files' | 'concerns'> {
     title: 'session',
     summary: null,
     warnings: [],
-    draft: { concerns: {}, general_comments: [], acknowledged_opaque: [] },
+    draft: { concerns: {}, general_comments: [], acknowledgements: [] },
     draft_revision: 0,
     limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
     finished: null,
@@ -62,6 +62,7 @@ function baseSession(): Omit<Session, 'files' | 'concerns'> {
 function singleHunkSession(lineCount: number): Session {
   const hunk = makeHunk(lineCount)
   const file: FileDiff = {
+    id: 'file-a',
     old_path: 'a.txt',
     new_path: 'a.txt',
     change_kind: 'modified',
@@ -76,6 +77,8 @@ function singleHunkSession(lineCount: number): Session {
     new_size: 100,
     lfs_pointer: false,
     hunks: [hunk],
+    ack_required: false,
+    ack_reasons: [],
   }
   const concern: ConcernView = {
     id: 'only',
@@ -100,6 +103,7 @@ function makeSession(): Session {
   const sharedHunk = makeHunk(20)
   const bOnlyHunks = Array.from({ length: B_ONLY_HUNK_COUNT }, () => makeHunk(20))
   const file: FileDiff = {
+    id: 'file-a',
     old_path: 'a.txt',
     new_path: 'a.txt',
     change_kind: 'modified',
@@ -114,6 +118,8 @@ function makeSession(): Session {
     new_size: 100,
     lfs_pointer: false,
     hunks: [sharedHunk, ...bOnlyHunks],
+    ack_required: false,
+    ack_reasons: [],
   }
   const concernA: ConcernView = {
     id: 'A',
@@ -137,7 +143,7 @@ function makeSession(): Session {
     files: [file],
     concerns: [concernA, concernB],
     warnings: [],
-    draft: { concerns: {}, general_comments: [], acknowledged_opaque: [] },
+    draft: { concerns: {}, general_comments: [], acknowledgements: [] },
     draft_revision: 0,
     limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
     finished: null,
@@ -183,6 +189,7 @@ describe('DiffView hunk collapse fundamentals', () => {
     // remount-on-switch behavior covered above.
     const hunks = Array.from({ length: 51 }, () => makeHunk(20))
     const file: FileDiff = {
+      id: 'file-a',
       old_path: 'a.txt',
       new_path: 'a.txt',
       change_kind: 'modified',
@@ -197,6 +204,8 @@ describe('DiffView hunk collapse fundamentals', () => {
       new_size: 100,
       lfs_pointer: false,
       hunks,
+      ack_required: false,
+      ack_reasons: [],
     }
     const concern: ConcernView = {
       id: 'big',
@@ -253,5 +262,65 @@ describe('DiffView hunk collapse fundamentals', () => {
 
     expect(container.querySelector('.hunk-table')).toBeNull()
     expect(container.querySelector('.collapse-toggle')?.textContent).toContain('click to expand')
+  })
+})
+
+describe('ack_reasons_render_and_gate_submission', () => {
+  it('renders the server-supplied ack reasons and the id-keyed checkbox gates allAcked', async () => {
+    // A newly added executable: content_kind stays 'text' (the script body
+    // itself renders fine), but the server still requires an ack because a
+    // brand-new executable is not something the diff body alone flags.
+    const file: FileDiff = {
+      id: 'exe-file-id',
+      old_path: null,
+      new_path: 'run.sh',
+      change_kind: 'added',
+      content_kind: 'text',
+      old_mode: null,
+      new_mode: '100755',
+      old_type: null,
+      new_type: 'executable',
+      old_oid: null,
+      new_oid: 'b',
+      old_size: null,
+      new_size: 20,
+      lfs_pointer: false,
+      hunks: [],
+      ack_required: true,
+      ack_reasons: ['added-executable'],
+    }
+    const concern: ConcernView = {
+      id: 'only',
+      title: 'Only concern',
+      description: null,
+      risk: null,
+      unmapped: false,
+      hunks: [{ file: 0, hunk: null }],
+    }
+    rs.session = { ...baseSession(), files: [file], concerns: [concern] }
+    rs.draft = { concerns: {}, general_comments: [], acknowledgements: [] }
+    rs.selectedIdx = 0
+    rs.phase = 'review'
+
+    // Not yet acknowledged: submission must stay gated.
+    expect(rs.allAcked).toBe(false)
+
+    const { container } = render(DiffView)
+    await tick()
+
+    // The one-sided mode badge and the server's ack-reason label both render
+    // without the frontend ever recomputing the policy itself.
+    expect(container.textContent).toContain('added executable 100755')
+    expect(container.textContent).toContain('New executable file added')
+
+    const checkbox = container.querySelector('.opaque-ack input') as HTMLInputElement
+    expect(checkbox).not.toBeNull()
+    expect(checkbox.checked).toBe(false)
+
+    await fireEvent.click(checkbox)
+
+    // toggleAck is keyed by the stable file id, not an array index.
+    expect(rs.isAcked('exe-file-id')).toBe(true)
+    expect(rs.allAcked).toBe(true)
   })
 })
