@@ -391,6 +391,10 @@ pub async fn run(args: ReviewArgs) -> u8 {
             eprintln!("review too large: {msg}");
             return exitcode::REVIEW_TOO_LARGE;
         }
+        Err(GitError::OutputOverflow(msg)) => {
+            eprintln!("git failed: {}", sanitize(msg.trim()));
+            return exitcode::GIT_FAILED;
+        }
     };
     let files = diff_output.files;
     let diff_warnings = diff_output.warnings;
@@ -439,7 +443,8 @@ pub async fn run(args: ReviewArgs) -> u8 {
             }
             Err(GitError::BadBase(msg))
             | Err(GitError::GitFailed(msg))
-            | Err(GitError::BudgetExceeded(msg)) => {
+            | Err(GitError::BudgetExceeded(msg))
+            | Err(GitError::OutputOverflow(msg)) => {
                 // The gate cannot run at all. Under the (default) Error
                 // policy an unverifiable worktree must not silently pass;
                 // under Warn the review proceeds with a notice.
