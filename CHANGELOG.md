@@ -63,6 +63,37 @@ project is pre-1.0 and minor versions may contain breaking changes.
   longer exempt either.
 - On submit, the result is written to `--out` before stdout; a broken
   stdout pipe no longer aborts the process or skips the `--out` write.
+- Review timeout now has its own terminal screen instead of being folded
+  into the aborted screen; the session payload includes a UTC
+  `deadline_at` when `--timeout` is set, and the review screen shows a
+  live countdown to it.
+
+### Fixed
+- Save, submit, and abort are serialized through a single mutation chain,
+  and submit now flushes any in-flight or queued autosave before reading
+  the revision to submit: previously submit only cancelled the pending
+  debounce timer, so editing during an autosave could get a spurious
+  `409 draft conflict` and lose the newer text on the forced reload.
+- Save and submit requests carry a client-generated `mutation_id`; a
+  repeat request with the same id replays the original result instead of
+  re-applying the save or 409ing the submit, so a lost HTTP response can
+  be retried without double-applying a save or a false conflict — a
+  repeat submit with the same id returns the original outcome even if
+  `HEAD` has since moved.
+- Corrected the submit timeout hierarchy: the `HEAD` freshness check now
+  uses its own 10s deadline, the server request timeout is 30s, and the
+  browser fetch timeout is 40s (was 15s), so internal < server < client
+  and the browser no longer gives up before the server could have
+  finished. On an ambiguous submit/save failure (an aborted request or
+  network error, not a clean HTTP rejection), the UI now queries the
+  session once and either recovers to the submitted state, shows a
+  retryable error, or shows a distinct "result unknown" state, instead
+  of assuming failure.
+- In-progress inline and general comment text is now held in the shared
+  review state instead of component-local state, so it survives
+  switching concerns or closing the editor and is covered by the
+  unsaved-changes warning instead of silently disappearing; submitting
+  with unsent comment text now prompts for confirmation.
 
 ## [0.1.0] - 2026-07
 
