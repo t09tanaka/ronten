@@ -543,6 +543,41 @@ fn result_v3_worktree_rechecked_at_submit() {
     assert_eq!(worktree["clean_at_submit"], false);
 }
 
+/// Task 5.4 (P1-9 middle / P1-12 identity): `build.rs` embeds enough about
+/// the specific binary that produced a result (source commit, dirty flag,
+/// frontend digest, rustc version, target triple, build profile) that two
+/// builds both claiming `ronten_version` 0.1.0 stay distinguishable.
+/// `target`/`profile` come from the `TARGET`/`PROFILE` build-script env vars,
+/// which cargo always sets, so they must be populated for *any* build of
+/// this test binary. `source_commit` needs a git checkout, which this repo
+/// (the tree the test binary is built from) always is.
+#[test]
+fn result_v3_build_identity_is_populated() {
+    let td = fixture_repo();
+    let (child, url) = spawn_review(td.path(), &[]);
+
+    let (status, _) = submit_raw(&url, full_draft("approve"));
+    assert_eq!(status, 200);
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let build = &result["build"];
+    assert_eq!(build["ronten_version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        build["target"].is_string(),
+        "target must always be set from the TARGET build-script env: {build}"
+    );
+    assert!(
+        build["profile"].is_string(),
+        "profile must always be set from the PROFILE build-script env: {build}"
+    );
+    assert!(
+        build["source_commit"].is_string(),
+        "this repo is a git checkout, so source_commit must be populated: {build}"
+    );
+}
+
 /// Posts `draft` to `/submit` and returns `(status, body)` without treating
 /// non-2xx as a transport error.
 fn submit_raw(url: &str, draft: serde_json::Value) -> (u16, serde_json::Value) {
