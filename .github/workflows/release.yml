@@ -141,7 +141,8 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           name="ronten-${version}-${{ matrix.target }}"
           mkdir "$name"
-          cp "target/${{ matrix.target }}/release/ronten" README.md LICENSE "$name/"
+          cp "target/${{ matrix.target }}/release/ronten" \
+            README.md LICENSE THIRD_PARTY_NOTICES.md "$name/"
           tar -czf "$name.tar.gz" "$name"
       - name: Extract the archive for artifact smoke tests
         # From here on, every check runs against the binary as it will

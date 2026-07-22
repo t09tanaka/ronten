@@ -84,6 +84,50 @@ jobs:
       - name: RustSec advisories (cargo audit)
         run: cargo audit
 
+  third-party-notices:
+    # THIRD_PARTY_NOTICES.md is committed (it ships in the crate and in every
+    # release tarball), so it can silently fall behind a dependency bump.
+    # Regenerating it here and diffing makes a stale file a CI failure rather
+    # than a license-compliance gap discovered after a release.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.22.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: taiki-e/install-action@a6b2e2dcd845ddd7f509ce4f3ed3d922b80cc5d9 # v2.84.0
+        with:
+          # Pinned: the generator's output format is a function of the
+          # cargo-about version, so an unpinned tool would make the diff
+          # below fail on an unrelated upstream release.
+          tool: cargo-about@0.9.1
+      - name: Install frontend dependencies
+        # Only for the license texts of the bundled JS packages; the frontend
+        # is not built here.
+        run: npm ci
+        working-directory: frontend
+      - name: Fetch crate sources
+        # The generator runs cargo-about with --frozen (offline), so every
+        # dependency's source — where its license text lives — must already
+        # be unpacked locally.
+        run: cargo fetch --locked
+      - name: Regenerate notices
+        run: ./scripts/gen-third-party.sh
+      - name: Committed notices must be current
+        run: |
+          if ! git diff --quiet -- THIRD_PARTY_NOTICES.md; then
+            echo 'THIRD_PARTY_NOTICES.md is stale. Run ./scripts/gen-third-party.sh and commit the result.' >&2
+            git diff -- THIRD_PARTY_NOTICES.md >&2
+            exit 1
+          fi
+
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -119,6 +163,7 @@ jobs:
           grep -q '^frontend/dist/assets/.*\.css$' /tmp/package-files.txt
           grep -q '^frontend/dist/shippori-mincho-OFL\.txt$' /tmp/package-files.txt
           grep -q '^frontend/dist/highlight-js-BSD-3-Clause\.txt$' /tmp/package-files.txt
+          grep -q '^THIRD_PARTY_NOTICES\.md$' /tmp/package-files.txt
           if grep -q 'node_modules' /tmp/package-files.txt; then
             echo 'node_modules leaked into the crate' >&2; exit 1
           fi

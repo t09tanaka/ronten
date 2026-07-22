@@ -1,0 +1,36 @@
+# cargo-about configuration for generating THIRD_PARTY_NOTICES.md.
+#
+# Run via `scripts/gen-third-party.sh`; CI re-runs that script and fails if
+# the committed notices file drifts from what the lockfiles imply.
+
+# Same allow-list as deny.toml's `[licenses] allow`. cargo-deny is the gate
+# that rejects a new license outright; this list makes the notices generator
+# fail loudly for the same reason instead of silently emitting a license the
+# project has not reviewed.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+
+# Exactly the targets the release workflow builds (.github/workflows/release.yml).
+# Pinning them keeps the output identical no matter which OS the generator
+# runs on — otherwise the CI drift check would fail purely because a
+# contributor generated on macOS and CI regenerates on Linux.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+# Build- and dev-dependencies are compiled on the build machine or by the
+# test harness; neither ends up linked into the distributed binary, so they
+# are not part of what a user receives.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

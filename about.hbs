@@ -1,0 +1,17 @@
+{{!-- Triple braces everywhere: the output is Markdown, not HTML, so
+      handlebars' HTML escaping would corrupt license texts (quotes and
+      angle brackets appear in nearly all of them). --}}
+{{#each licenses}}
+### {{{name}}}
+
+Used by:
+
+{{#each used_by}}
+- {{{crate.name}}} {{{crate.version}}}
+{{/each}}
+
+```text
+{{{text}}}
+```
+
+{{/each}}
