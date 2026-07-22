@@ -602,6 +602,12 @@ pub enum GitError {
     /// one session would be meaningless (byte/line budgets never produce
     /// this error — they degrade individual files to `TooLarge` instead).
     BudgetExceeded(String),
+    /// A git subprocess's stdout exceeded its per-call cap (see
+    /// [`wait_with_timeout`]) and was killed rather than read without
+    /// bound. Distinct from [`GitError::GitFailed`] so callers can tell
+    /// "git misbehaved/was killed for a resource reason" apart from an
+    /// ordinary failure, though both currently exit with the same code.
+    OutputOverflow(String),
 }
 
 /// Hard deadline for any single git subprocess this module spawns. Git on a
@@ -611,81 +617,409 @@ pub enum GitError {
 /// review process open.
 pub const GIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Waits for `child` (spawned with piped stdout/stderr) up to `timeout`,
-/// draining both pipes from helper threads so a chatty child can't deadlock
-/// against a full pipe. On deadline the child is killed and reaped — no git
-/// subprocess outlives the review process by more than the poll interval.
+/// Extra time given to a subprocess (and its process group) to actually die
+/// and be reaped after [`wait_with_timeout`] sends the kill signal. This is
+/// not part of the caller-visible deadline budget — it bounds how long the
+/// *kill itself* is allowed to take. If the direct child hasn't been
+/// reaped within this window of a successful kill signal, something is
+/// badly wrong (e.g. an uninterruptible D-state process) and that is
+/// reported as a fatal error rather than silently retried forever.
+const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Default stdout cap for git subprocess calls whose output is inherently
+/// small (rev-parse, ls-files, merge-base, current-branch, cat-file
+/// --batch-check, ...). Generous headroom over anything legitimate; exists
+/// so a wedged or hostile `git` can't grow this process's memory without
+/// bound while its output is buffered.
+const DEFAULT_MAX_STDOUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// `git status --porcelain=v2 -z --untracked-files=all` can legitimately
+/// list many thousands of paths in a large, messy worktree.
+const STATUS_MAX_STDOUT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Entry-count cap for [`parse_status_v2_z`], well above what any normal
+/// (even very messy) worktree produces. Bounds the number of `String`s the
+/// dirty gate allocates and enumerates; paired with
+/// [`STATUS_MAX_STDOUT_BYTES`], which bounds the raw buffer those entries
+/// are parsed from. On overflow the worktree is reported dirty (never
+/// clean) with a summary instead of enumerating every path — see
+/// [`WorktreeStatus::overflow`].
+const STATUS_MAX_ENTRIES: usize = 10_000;
+
+/// `git diff-tree --raw` lists every changed path plus both blob
+/// oids/modes — the largest legitimate output of any call this module
+/// makes, and the one bound tightly by `budget.max_files` rather than by
+/// content size.
+const DIFF_TREE_RAW_MAX_STDOUT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Ring-buffer cap for stderr: git errors are almost always at the end of
+/// the message, so on overflow the *tail* is kept, not the head.
+const STDERR_CAP: usize = 8 * 1024;
+
+/// Spawns `cmd`, placing it in its own process group on unix
+/// (`process_group(0)`, i.e. pgid = the child's own pid) *before* the fork
+/// happens. This must be set at spawn time — a [`std::process::Child`]
+/// can't be moved into a new group after the fact — so every call site that
+/// eventually hands its child to [`wait_with_timeout`] must spawn through
+/// this (or set the option itself) for that function's process-group kill
+/// to reach the right processes. On non-unix this is a plain `cmd.spawn()`;
+/// there is no portable process-group API, so timeout kills there stay
+/// limited to the direct child (see [`kill_child_group`]).
+fn spawn_grouped(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.spawn()
+}
+
+/// Result of the bounded stdout reader thread in [`wait_with_timeout`].
+struct CappedRead {
+    data: Vec<u8>,
+    /// `true` if more than `cap` bytes arrived — reading stopped at `cap`
+    /// rather than continuing, so `data.len() == cap` in that case.
+    overflowed: bool,
+    /// `Some` if the read loop stopped because of a genuine I/O error
+    /// (anything other than a clean `Ok(0)` EOF or a retried
+    /// `ErrorKind::Interrupted`). `data` in that case is a SHORT read, not
+    /// a complete one, and [`wait_with_timeout`] must not treat it as a
+    /// successful, complete `Output` — see the doc comment on
+    /// [`read_stdout_capped`].
+    read_error: Option<std::io::Error>,
+}
+
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Reads `pipe` to EOF, capped at `cap` bytes. Reads in fixed-size chunks
+/// (rather than `read_to_end`) so the cap can be enforced without ever
+/// buffering more than `cap + READ_CHUNK_BYTES` bytes, and stops the moment
+/// the cap is exceeded instead of draining the rest of a hostile/runaway
+/// stream.
+///
+/// `ErrorKind::Interrupted` (`EINTR`) is retried in place, matching what
+/// `read_to_end` used to do before this loop replaced it. Any OTHER read
+/// error is reported via `read_error` rather than silently treated as EOF:
+/// a short buffer from a genuine error is not a complete, trustworthy
+/// response, and returning it as one would silently truncate the diff
+/// (contradicting this module's "nothing is silently truncated"
+/// guarantee) — see [`wait_with_timeout`], which fails the whole call
+/// instead of returning a truncated success when `read_error` is set.
+fn read_stdout_capped(pipe: Option<std::process::ChildStdout>, cap: usize) -> CappedRead {
+    use std::io::Read;
+    let mut data = Vec::new();
+    let mut overflowed = false;
+    let mut read_error = None;
+    if let Some(mut pipe) = pipe {
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = cap.saturating_sub(data.len());
+                    if n <= room {
+                        data.extend_from_slice(&chunk[..n]);
+                    } else {
+                        data.extend_from_slice(&chunk[..room]);
+                        overflowed = true;
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    CappedRead {
+        data,
+        overflowed,
+        read_error,
+    }
+}
+
+/// Result of the bounded stderr reader thread in [`wait_with_timeout`]. See
+/// [`CappedRead::read_error`] — the same "a genuine read error is not EOF"
+/// rule applies here.
+struct CappedStderr {
+    data: Vec<u8>,
+    read_error: Option<std::io::Error>,
+}
+
+/// Reads `pipe` to EOF into a ring buffer capped at `cap` bytes, keeping the
+/// *tail* (most recent bytes) rather than the head — git error messages are
+/// almost always at the end of stderr, so on overflow that's what's worth
+/// keeping. Unlike [`read_stdout_capped`] this never stops early on a full
+/// buffer: stderr has no success-path consumer waiting on it, so draining
+/// it fully (memory bounded, unlike the old unbounded `Vec`) is simplest
+/// and lets the pipe's write end close normally.
+///
+/// As in [`read_stdout_capped`], `ErrorKind::Interrupted` is retried and
+/// any other read error is reported via `read_error` instead of being
+/// treated as a clean EOF.
+fn read_stderr_tail(pipe: Option<std::process::ChildStderr>, cap: usize) -> CappedStderr {
+    use std::io::Read;
+    let mut ring: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(cap);
+    let mut read_error = None;
+    if let Some(mut pipe) = pipe {
+        let mut chunk = [0u8; READ_CHUNK_BYTES];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    for &b in &chunk[..n] {
+                        if ring.len() == cap {
+                            ring.pop_front();
+                        }
+                        ring.push_back(b);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    read_error = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    CappedStderr {
+        data: ring.into_iter().collect(),
+        read_error,
+    }
+}
+
+/// Kills `child`'s whole process group with `SIGKILL` on unix (relies on
+/// the child having been spawned via [`spawn_grouped`], so its pgid equals
+/// its own pid) so a descendant that has escaped `wait_with_timeout`'s
+/// direct-child tracking — e.g. a shell backgrounding a process that
+/// inherits and holds a pipe open — dies too, instead of being left to wedge
+/// the reader threads forever. `ESRCH` (group already empty — everything in
+/// it already exited) is not an error; any other failure is propagated
+/// rather than swallowed, per the "kill failures are fatal, not ignored"
+/// requirement. Never signals pid 0 or a negative pid (which `kill(2)`
+/// interprets as "every process this user can reach" / "every process in
+/// this group" respectively) — `child.id()` is always a real positive pid
+/// for a process we just spawned, but the guard is kept explicit rather
+/// than relying on that invariant silently.
+#[cfg(unix)]
+fn kill_child_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    let pid = child.id();
+    if pid <= 1 {
+        return Ok(());
+    }
+    // SAFETY: `kill` with a negative pid targets the process group whose
+    // id is the pid's absolute value; no memory is touched, only a signal
+    // is sent. `pid` was validated `> 1` above and fits in `libc::pid_t`
+    // because it came from `Child::id`.
+    let ret = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+/// No portable process-group API outside unix; best-effort direct-child
+/// kill only, matching this module's pre-existing non-unix behavior.
+#[cfg(not(unix))]
+fn kill_child_group(child: &mut std::process::Child) -> std::io::Result<()> {
+    child.kill()
+}
+
+/// Reaps `child`, waiting up to `until` for it to actually exit after being
+/// killed. A kill signal is not synchronous — the kernel schedules the
+/// death — so this still polls rather than assuming the next `try_wait`
+/// succeeds. If `child` is not reaped by `until`, that is treated as a
+/// fatal condition (the process refused to die, e.g. stuck in
+/// uninterruptible I/O) rather than retried indefinitely.
+fn reap_child(
+    child: &mut std::process::Child,
+    until: std::time::Instant,
+) -> std::io::Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= until {
+            return Err(std::io::Error::other(format!(
+                "git subprocess did not exit within {}s of being killed",
+                KILL_GRACE.as_secs()
+            )));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Waits for `child` (spawned via [`spawn_grouped`], with piped stdout and
+/// stderr) up to `timeout`, draining both pipes from helper threads so a
+/// chatty child can't deadlock against a full pipe.
+///
+/// This has to satisfy two guarantees the old join-after-wait structure
+/// didn't: (1) stdout is bounded at `max_stdout_bytes`, and (2) the *whole
+/// call* returns within `timeout` (plus the bounded [`KILL_GRACE`] a kill
+/// needs to land) even if a descendant of `child` — not `child` itself —
+/// is still holding a pipe open, which is exactly the scenario where the
+/// old code's unconditional `.join()` on the reader threads could block
+/// forever. The single poll loop below checks child-exited, stdout-ready,
+/// and stderr-ready every 5ms via non-blocking `try_wait`/`try_recv` (never
+/// a blocking join) and breaks the moment all three are satisfied, the
+/// stdout cap is exceeded, or `timeout` elapses. Anything other than "all
+/// three satisfied, no overflow" falls through to the kill path: the whole
+/// process group is killed (reaching a pipe-holding descendant even though
+/// only the direct `child` is tracked), the direct child is reaped under a
+/// bounded secondary grace period, and a descriptive error is returned —
+/// never partial success, so callers can't mistake a killed run for a
+/// complete one. That includes a genuine pipe read error (anything but a
+/// retried `ErrorKind::Interrupted`): [`read_stdout_capped`] and
+/// [`read_stderr_tail`] report those via `read_error` rather than treating
+/// them as EOF, and this loop breaks out on that exactly like it does on
+/// overflow, so a `read_error` can never be mistaken for a complete,
+/// successful `Output`.
 fn wait_with_timeout(
     mut child: std::process::Child,
     timeout: std::time::Duration,
+    max_stdout_bytes: usize,
 ) -> std::io::Result<std::process::Output> {
-    use std::io::Read;
     let stdout_pipe = child.stdout.take();
     let stderr_pipe = child.stderr.take();
-    let drain = |pipe: Option<std::process::ChildStdout>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let drain_err = |pipe: Option<std::process::ChildStderr>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let out_handle = drain(stdout_pipe);
-    let err_handle = drain_err(stderr_pipe);
+
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = stdout_tx.send(read_stdout_capped(stdout_pipe, max_stdout_bytes));
+    });
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = stderr_tx.send(read_stderr_tail(stderr_pipe, STDERR_CAP));
+    });
+
     let deadline = std::time::Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait()? {
-            Some(status) => break status,
-            None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "git subprocess exceeded {}s and was killed",
-                        timeout.as_secs()
-                    ),
-                ));
-            }
-            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+    let mut status: Option<std::process::ExitStatus> = None;
+    let mut stdout_read: Option<CappedRead> = None;
+    let mut stderr_read: Option<CappedStderr> = None;
+    let mut overflowed = false;
+    let mut read_failed = false;
+    loop {
+        if status.is_none() {
+            status = child.try_wait()?;
         }
-    };
-    Ok(std::process::Output {
-        status,
-        stdout: out_handle.join().unwrap_or_default(),
-        stderr: err_handle.join().unwrap_or_default(),
-    })
+        if stdout_read.is_none() {
+            if let Ok(r) = stdout_rx.try_recv() {
+                overflowed = r.overflowed;
+                read_failed |= r.read_error.is_some();
+                stdout_read = Some(r);
+            }
+        }
+        if stderr_read.is_none() {
+            if let Ok(r) = stderr_rx.try_recv() {
+                read_failed |= r.read_error.is_some();
+                stderr_read = Some(r);
+            }
+        }
+        if overflowed || read_failed {
+            break;
+        }
+        match (status, stdout_read.take(), stderr_read.take()) {
+            (Some(status), Some(stdout_read), Some(stderr_read)) => {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: stdout_read.data,
+                    stderr: stderr_read.data,
+                });
+            }
+            // Not all three are ready yet: put back whichever ones `take`
+            // pulled out so the next iteration doesn't lose them.
+            (_, taken_stdout, taken_stderr) => {
+                stdout_read = taken_stdout;
+                stderr_read = taken_stderr;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    // Something is still outstanding at `deadline` (the child itself, a
+    // descendant holding a pipe open, or the stdout cap was hit): kill the
+    // whole group and reap the direct child within a bounded grace period.
+    // Reader threads are deliberately not waited on here — the group kill
+    // closes the pipes almost immediately, they'll finish on their own,
+    // and this call must not block past `deadline + KILL_GRACE` either way.
+    kill_child_group(&mut child)?;
+    if status.is_none() {
+        let reap_deadline = std::time::Instant::now() + KILL_GRACE;
+        reap_child(&mut child, reap_deadline)?;
+    }
+    if overflowed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("git subprocess stdout exceeded {max_stdout_bytes} bytes and was killed"),
+        ));
+    }
+    if read_failed {
+        // A short buffer from a genuine read error must never be reported
+        // as a complete, successful `Output` — see the doc comment above
+        // and on `CappedRead::read_error`. Prefer the stdout error detail
+        // when both pipes failed; either is enough to explain the failure.
+        let detail = stdout_read
+            .and_then(|r| r.read_error)
+            .or_else(|| stderr_read.and_then(|r| r.read_error))
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown read error".to_string());
+        return Err(std::io::Error::other(format!(
+            "git subprocess pipe read failed before EOF, output cannot be trusted: {detail}"
+        )));
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "git subprocess exceeded {}s and was killed",
+            timeout.as_secs()
+        ),
+    ))
 }
 
 /// Runs `cmd` to completion under a caller-supplied `timeout`, with stdin
-/// closed. Shared by [`timed_output`] (the [`GIT_TIMEOUT`] default, used by
-/// every plumbing call in this module except the one below) and
-/// [`rev_parse_commit_with_deadline`] (a shorter, caller-chosen deadline for
-/// the submit-path freshness check, which must fail fast enough to stay
-/// under the server's own request timeout).
+/// closed and stdout capped at `max_stdout_bytes` (stderr is always capped
+/// at [`STDERR_CAP`], see [`wait_with_timeout`]). Shared by [`timed_output`]
+/// (the [`GIT_TIMEOUT`] default, used by every plumbing call in this module
+/// except the one below) and [`rev_parse_commit_with_deadline`] (a shorter,
+/// caller-chosen deadline for the submit-path freshness check, which must
+/// fail fast enough to stay under the server's own request timeout).
 fn timed_output_with_deadline(
     mut cmd: std::process::Command,
     timeout: std::time::Duration,
+    max_stdout_bytes: usize,
 ) -> std::io::Result<std::process::Output> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    wait_with_timeout(cmd.spawn()?, timeout)
+    wait_with_timeout(spawn_grouped(&mut cmd)?, timeout, max_stdout_bytes)
 }
 
-/// Runs `cmd` to completion under [`GIT_TIMEOUT`] with stdin closed.
-fn timed_output(cmd: std::process::Command) -> std::io::Result<std::process::Output> {
-    timed_output_with_deadline(cmd, GIT_TIMEOUT)
+/// Runs `cmd` to completion under [`GIT_TIMEOUT`] with stdin closed and
+/// stdout capped at `max_stdout_bytes`.
+fn timed_output(
+    cmd: std::process::Command,
+    max_stdout_bytes: usize,
+) -> std::io::Result<std::process::Output> {
+    timed_output_with_deadline(cmd, GIT_TIMEOUT, max_stdout_bytes)
+}
+
+/// Maps a [`wait_with_timeout`]/[`timed_output`] I/O error to a [`GitError`],
+/// distinguishing the stdout-overflow case (`ErrorKind::FileTooLarge`, see
+/// [`wait_with_timeout`]) from every other failure (spawn error, timeout,
+/// fatal kill/reap failure), which all become [`GitError::GitFailed`].
+fn map_wait_err(e: std::io::Error) -> GitError {
+    if e.kind() == std::io::ErrorKind::FileTooLarge {
+        GitError::OutputOverflow(e.to_string())
+    } else {
+        GitError::GitFailed(e.to_string())
+    }
 }
 
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
@@ -695,7 +1029,7 @@ pub fn repo_root() -> Result<std::path::PathBuf, GitError> {
     // Only a clean non-zero exit means "not a repository"; a spawn failure
     // or a killed-at-deadline git is a git problem and must not be
     // misreported as "run this from inside a repo".
-    let output = timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let output = timed_output(cmd, DEFAULT_MAX_STDOUT_BYTES).map_err(map_wait_err)?;
     if !output.status.success() {
         return Err(GitError::NotARepo);
     }
@@ -719,11 +1053,20 @@ pub struct WorktreeStatus {
     pub tracked_changes: Vec<String>,
     pub untracked: Vec<String>,
     pub submodules_dirty: Vec<String>,
+    /// Set when [`parse_status_v2_z`] stopped early because the entry count
+    /// exceeded [`STATUS_MAX_ENTRIES`], instead of enumerating every
+    /// remaining path. When set, the three lists above are a **partial**
+    /// enumeration (only the entries seen before the cap) — their absence
+    /// of an item must never be read as "not dirty". `is_clean` always
+    /// returns `false` while this is set: fail-closed, never a false
+    /// "clean" from a status report that was cut short.
+    pub overflow: Option<String>,
 }
 
 impl WorktreeStatus {
     pub fn is_clean(&self) -> bool {
-        self.tracked_changes.is_empty()
+        self.overflow.is_none()
+            && self.tracked_changes.is_empty()
             && self.untracked.is_empty()
             && self.submodules_dirty.is_empty()
     }
@@ -748,7 +1091,7 @@ pub fn worktree_status(root: &std::path::Path) -> Result<WorktreeStatus, GitErro
         "--untracked-files=all",
         "--ignore-submodules=none",
     ]);
-    let output = timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let output = timed_output(cmd, STATUS_MAX_STDOUT_BYTES).map_err(map_wait_err)?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -774,7 +1117,21 @@ fn parse_status_v2_z(bytes: &[u8]) -> Result<WorktreeStatus, GitError> {
         .split(|&b| b == 0)
         .filter(|t| !t.is_empty())
         .peekable();
+    let mut entry_count: usize = 0;
     while let Some(token) = tokens.next() {
+        // Checked before this record's fields are parsed at all, so a
+        // worktree with an enormous number of entries stops doing work at
+        // the cap instead of first parsing/allocating every path and only
+        // then discovering the gate can't enumerate them all. A rename's
+        // second (`origPath`) token is consumed as part of the same
+        // logical entry below and does not bump this counter again.
+        entry_count += 1;
+        if entry_count > STATUS_MAX_ENTRIES {
+            status.overflow = Some(format!(
+                "git status reports more than {STATUS_MAX_ENTRIES} entries; worktree treated as dirty without enumerating every path"
+            ));
+            return Ok(status);
+        }
         let text = std::str::from_utf8(token)
             .map_err(|_| GitError::GitFailed("non-UTF-8 git status entry".to_string()))?;
         let malformed = || GitError::GitFailed(format!("unparseable git status entry: {text:?}"));
@@ -836,7 +1193,7 @@ fn parse_status_v2_z(bytes: &[u8]) -> Result<WorktreeStatus, GitError> {
 pub fn current_branch(root: &std::path::Path) -> String {
     let mut cmd = git_cmd(root);
     cmd.args(["rev-parse", "--abbrev-ref", "HEAD"]);
-    match timed_output(cmd) {
+    match timed_output(cmd, DEFAULT_MAX_STDOUT_BYTES) {
         Ok(output) if output.status.success() => {
             let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if branch.is_empty() {
@@ -883,6 +1240,21 @@ pub struct ResourceBudget {
     /// Total rendered diff lines across the whole review; files past the
     /// budget degrade to `TooLarge` (bounds the session JSON and the DOM).
     pub max_total_lines: usize,
+    /// Total claimed changed-line registrations across every concern's
+    /// resolved locations (`mapping::resolve_mapping`). Changed lines
+    /// themselves are already bounded by `max_total_lines`, but a concern
+    /// can re-claim the same large file's lines, and up to 200 concerns can
+    /// each do so — this bounds that cross-concern multiplication. Once
+    /// exceeded the review refuses to start (`GitError::BudgetExceeded`)
+    /// rather than building an oversized session.
+    pub max_resolved_edges: usize,
+    /// Total `HunkRef` entries across every concern's displayed hunks
+    /// (`mapping::resolve_mapping`). Bounds the size of the mapping (and the
+    /// session JSON it feeds) independent of `max_resolved_edges`, since a
+    /// concern's hunk list is deduplicated per `(file, hunk)` pair but still
+    /// scales with distinct hunks touched across up to 200 concerns. Once
+    /// exceeded the review refuses to start (`GitError::BudgetExceeded`).
+    pub max_hunk_refs: usize,
 }
 
 impl Default for ResourceBudget {
@@ -894,6 +1266,8 @@ impl Default for ResourceBudget {
             max_file_lines: 50_000,
             max_line_bytes: 64 * 1024,
             max_total_lines: 200_000,
+            max_resolved_edges: 1_000_000,
+            max_hunk_refs: 100_000,
         }
     }
 }
@@ -1004,10 +1378,14 @@ fn git_cmd(root: &std::path::Path) -> std::process::Command {
     cmd
 }
 
-fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output, GitError> {
+fn run_git(
+    root: &std::path::Path,
+    args: &[&str],
+    max_stdout_bytes: usize,
+) -> Result<std::process::Output, GitError> {
     let mut cmd = git_cmd(root);
     cmd.args(args);
-    timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))
+    timed_output(cmd, max_stdout_bytes).map_err(map_wait_err)
 }
 
 /// Canonicalized, absolute paths of the repository's git directory and (for a
@@ -1024,7 +1402,11 @@ fn run_git(root: &std::path::Path, args: &[&str]) -> Result<std::process::Output
 /// containment check, and a dropped entry only means that one entry can't
 /// reject anything (the other entry, if canonicalizable, still can).
 pub(crate) fn git_dirs(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>, GitError> {
-    let output = run_git(root, &["rev-parse", "--git-dir", "--git-common-dir"])?;
+    let output = run_git(
+        root,
+        &["rev-parse", "--git-dir", "--git-common-dir"],
+        DEFAULT_MAX_STDOUT_BYTES,
+    )?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -1054,7 +1436,11 @@ pub(crate) fn git_dirs(root: &std::path::Path) -> Result<Vec<std::path::PathBuf>
 /// tracked in the index, via `git ls-files --error-unmatch`: success (exit 0)
 /// means tracked.
 pub(crate) fn is_tracked(root: &std::path::Path, rel_path: &str) -> Result<bool, GitError> {
-    let output = run_git(root, &["ls-files", "--error-unmatch", "--", rel_path])?;
+    let output = run_git(
+        root,
+        &["ls-files", "--error-unmatch", "--", rel_path],
+        DEFAULT_MAX_STDOUT_BYTES,
+    )?;
     Ok(output.status.success())
 }
 
@@ -1089,7 +1475,7 @@ pub(crate) fn rev_parse_commit_with_deadline(
         &format!("{rev}^{{commit}}"),
     ]);
     let output =
-        timed_output_with_deadline(cmd, timeout).map_err(|e| GitError::GitFailed(e.to_string()))?;
+        timed_output_with_deadline(cmd, timeout, DEFAULT_MAX_STDOUT_BYTES).map_err(map_wait_err)?;
     if !output.status.success() {
         return Err(GitError::BadBase(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -1128,7 +1514,29 @@ fn utf8_path(token: &[u8], malformed: &impl Fn(&str) -> GitError) -> Result<Stri
 /// Paths are NUL-delimited so they arrive verbatim (no quoting/escaping).
 /// Any structurally malformed record is a hard error: this parser feeds the
 /// review gate, so partial success is worse than failing the whole diff.
+///
+/// Unbounded: used only by tests that exercise the field-level parsing
+/// directly. Production code goes through [`parse_raw_z_capped`], which adds
+/// the file-count early-exit.
+#[cfg(test)]
 fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
+    parse_raw_z_impl(bytes, None)
+}
+
+/// [`parse_raw_z`], but bails out with [`GitError::BudgetExceeded`] the
+/// moment a `max_entries + 1`th record would start, instead of parsing the
+/// whole raw stream and checking the count afterward. This bounds both the
+/// parse work and the `Vec<RawEntry>` allocation to `max_entries` records
+/// regardless of how many more the raw `-z` stream actually contains — the
+/// stream itself is separately bounded by
+/// [`DIFF_TREE_RAW_MAX_STDOUT_BYTES`], but without this a diff touching
+/// millions of files would still fully parse (and allocate a `RawEntry` for
+/// every one of them) before being refused.
+fn parse_raw_z_capped(bytes: &[u8], max_entries: usize) -> Result<Vec<RawEntry>, GitError> {
+    parse_raw_z_impl(bytes, Some(max_entries))
+}
+
+fn parse_raw_z_impl(bytes: &[u8], max_entries: Option<usize>) -> Result<Vec<RawEntry>, GitError> {
     let malformed =
         |detail: &str| GitError::GitFailed(format!("unexpected diff-tree output: {detail}"));
     let mut tokens = bytes.split(|&b| b == 0).peekable();
@@ -1142,6 +1550,17 @@ fn parse_raw_z(bytes: &[u8]) -> Result<Vec<RawEntry>, GitError> {
                 return Err(malformed("unexpected empty token before end of output"));
             }
             continue;
+        }
+        // Checked before any field parsing of this record so a diff with
+        // millions of changed files stops doing work at the boundary
+        // instead of fully validating/allocating every record first and
+        // only then discovering it's over budget.
+        if let Some(max_entries) = max_entries {
+            if entries.len() >= max_entries {
+                return Err(GitError::BudgetExceeded(format!(
+                    "diff touches more than {max_entries} files; review it in smaller pieces (narrower --base or split the change)"
+                )));
+            }
         }
         let meta = String::from_utf8_lossy(token).to_string();
         let Some(meta) = meta.strip_prefix(':') else {
@@ -1270,6 +1689,63 @@ mod raw_tests {
         let raw = b":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 R90\0ok.txt\0\x81new\0";
         assert!(parse_raw_z(raw).is_err());
     }
+
+    /// Builds `n` well-formed `M` (modify) raw records with distinct paths.
+    fn valid_records(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for i in 0..n {
+            buf.extend_from_slice(
+                format!(":100644 100644 1111111111111111111111111111111111111111 2222222222222222222222222222222222222222 M\0file{i}.txt\0")
+                    .as_bytes(),
+            );
+        }
+        buf
+    }
+
+    #[test]
+    fn diff_tree_exactly_at_budget_passes() {
+        // The boundary case: a diff touching exactly `max_files` files must
+        // not be refused, only one strictly over the limit.
+        let raw = valid_records(2000);
+        let entries = parse_raw_z_capped(&raw, 2000).unwrap();
+        assert_eq!(entries.len(), 2000);
+    }
+
+    #[test]
+    fn diff_tree_refuses_at_2001_without_parsing_all() {
+        // 2000 valid records followed by one that is structurally garbage.
+        // If the capped parser fully parsed every record before checking
+        // the count, it would trip over the garbage record and return
+        // `GitFailed`. Getting `BudgetExceeded` instead proves parsing
+        // stopped at the 2001st record without ever looking at its
+        // contents.
+        let mut raw = valid_records(2000);
+        raw.extend_from_slice(b"not-a-valid-record\0trailing.txt\0");
+        match parse_raw_z_capped(&raw, 2000) {
+            Err(GitError::BudgetExceeded(msg)) => {
+                assert!(msg.contains("2000"), "unexpected message: {msg}");
+            }
+            other => panic!("expected BudgetExceeded (early bail), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diff_tree_capped_parse_is_bounded_not_just_the_final_check() {
+        // A much larger stream (10x the cap) still bails promptly rather
+        // than allocating a `RawEntry` for every record; this is a
+        // regression guard on the *mechanism* (checked per-record, not
+        // only compared against `entries.len()` at the very end).
+        let raw = valid_records(20_000);
+        let entries = match parse_raw_z_capped(&raw, 2000) {
+            Err(GitError::BudgetExceeded(_)) => return,
+            Ok(entries) => entries,
+            Err(other) => panic!("unexpected error: {other:?}"),
+        };
+        panic!(
+            "expected BudgetExceeded, got Ok with {} entries",
+            entries.len()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1345,29 +1821,79 @@ fn entry_change_kind(entry: &RawEntry) -> ChangeKind {
     }
 }
 
+/// Joins `writer` (the stdin-writing helper thread started by
+/// [`cat_file_stdin`]) without ever blocking past `grace` from the moment
+/// this is called. A plain, unconditional `.join()` here would reintroduce
+/// exactly the bug `wait_with_timeout`'s process-group kill was written to
+/// avoid, from the write side instead of the read side: a tampered `git`
+/// can exit 0 (so `wait_with_timeout` legitimately returns `Ok` — the
+/// direct child exited, stdout/stderr both EOF'd) while a descendant it
+/// spawned keeps the stdin *read* end open without ever reading it. On
+/// that success path nothing kills the process group, so `write_all` on a
+/// full pipe blocks forever and a `--batch` request for a large diff
+/// (tens to hundreds of KB of oids, past the OS pipe buffer) reaches that
+/// exact deadlock.
+///
+/// Instead this polls [`std::thread::JoinHandle::is_finished`] on a short
+/// interval — mirroring the non-blocking `try_wait`/`try_recv` poll loop in
+/// [`wait_with_timeout`] — and if the writer still hasn't finished by
+/// `grace`, drops the handle (detaching the thread, the same policy
+/// `wait_with_timeout` already applies to its own reader threads on its
+/// timeout path: they are never joined, only left to finish or die on
+/// their own once whatever was blocking them goes away) and reports a
+/// failure instead of blocking further. On the normal fast path — the
+/// writer already finished by the time `wait_with_timeout` returns, which
+/// is the overwhelmingly common case since a cat-file request is at most a
+/// few hundred KB — `is_finished()` is true on the very first check, so
+/// this returns immediately, same as the old unconditional join.
+fn join_writer_bounded(
+    writer: std::thread::JoinHandle<std::io::Result<()>>,
+    grace: std::time::Duration,
+) -> Result<std::io::Result<()>, GitError> {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if writer.is_finished() {
+            return writer.join().map_err(|_| {
+                GitError::GitFailed("cat-file stdin writer thread panicked".to_string())
+            });
+        }
+        if std::time::Instant::now() >= deadline {
+            drop(writer);
+            return Err(GitError::GitFailed(
+                "git cat-file stdin writer did not drain within deadline".to_string(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 /// Runs `git cat-file <flag>` feeding `input` (one oid per line) on stdin
-/// and returning raw stdout. Stdin is written from a helper thread so a
-/// large response can't deadlock against a full stdin pipe. A write failure
-/// (e.g. git exiting early) means the response git did produce is for a
-/// truncated request, not a complete one, so it must not be trusted.
-fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec<u8>, GitError> {
+/// and returning raw stdout, capped at `max_stdout_bytes`. Stdin is written
+/// from a helper thread so a large response can't deadlock against a full
+/// stdin pipe. A write failure (e.g. git exiting early) means the response
+/// git did produce is for a truncated request, not a complete one, so it
+/// must not be trusted. The writer thread is joined via
+/// [`join_writer_bounded`], not a raw blocking `.join()` — see its doc
+/// comment for why an unbounded join here is itself a hang bug.
+fn cat_file_stdin(
+    root: &std::path::Path,
+    flag: &str,
+    input: &str,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>, GitError> {
     use std::io::Write;
-    let mut child = git_cmd(root)
-        .args(["cat-file", flag])
+    let mut cmd = git_cmd(root);
+    cmd.args(["cat-file", flag])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| GitError::GitFailed(e.to_string()))?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = spawn_grouped(&mut cmd).map_err(map_wait_err)?;
     let mut stdin = child.stdin.take().expect("stdin was piped");
     let input = input.to_string();
     let writer =
         std::thread::spawn(move || -> std::io::Result<()> { stdin.write_all(input.as_bytes()) });
-    let output =
-        wait_with_timeout(child, GIT_TIMEOUT).map_err(|e| GitError::GitFailed(e.to_string()))?;
-    let write_result = writer
-        .join()
-        .map_err(|_| GitError::GitFailed("cat-file stdin writer thread panicked".to_string()))?;
+    let output = wait_with_timeout(child, GIT_TIMEOUT, max_stdout_bytes).map_err(map_wait_err)?;
+    let write_result = join_writer_bounded(writer, KILL_GRACE)?;
     if !output.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -1378,8 +1904,16 @@ fn cat_file_stdin(root: &std::path::Path, flag: &str, input: &str) -> Result<Vec
     Ok(output.stdout)
 }
 
+/// Headroom, per requested oid, added to a `cat-file` stdout cap on top of
+/// the content-size budget the caller already tracks — covers the
+/// `<oid> <type> <size>\n` header git prepends to every object (batch) or
+/// emits per line (batch-check), which isn't counted against that budget.
+const CAT_FILE_HEADER_HEADROOM_PER_OID: usize = 128;
+
 /// Object sizes via `git cat-file --batch-check`. Oids reported `missing`
-/// are simply absent from the map (callers treat that as an error).
+/// are simply absent from the map (callers treat that as an error). The
+/// response is one short header line per oid, so the cap only needs to
+/// scale with the request size, not with any content budget.
 fn blob_sizes(
     root: &std::path::Path,
     oids: &[String],
@@ -1390,7 +1924,11 @@ fn blob_sizes(
     }
     let mut input = oids.join("\n");
     input.push('\n');
-    let out = cat_file_stdin(root, "--batch-check", &input)?;
+    let cap = oids
+        .len()
+        .saturating_mul(CAT_FILE_HEADER_HEADROOM_PER_OID)
+        .max(DEFAULT_MAX_STDOUT_BYTES);
+    let out = cat_file_stdin(root, "--batch-check", &input, cap)?;
     for line in String::from_utf8_lossy(&out).lines() {
         let parts: Vec<&str> = line.split(' ').collect();
         if parts.len() == 3 {
@@ -1403,10 +1941,16 @@ fn blob_sizes(
 }
 
 /// Blob contents via `git cat-file --batch`: for each requested oid the
-/// response is `<oid> <type> <size>\n<content>\n`.
+/// response is `<oid> <type> <size>\n<content>\n`. `max_content_bytes` is
+/// the caller's own running content budget (`ResourceBudget::max_total_bytes`)
+/// — the requested oids were already chosen to fit under it, so the stdout
+/// cap here is that budget plus per-oid header headroom, not an independent
+/// number: it exists to bound a *misbehaving* git (or an object that lied
+/// about its size to `--batch-check`), not to re-enforce the budget itself.
 fn blob_contents(
     root: &std::path::Path,
     oids: &[String],
+    max_content_bytes: usize,
 ) -> Result<std::collections::HashMap<String, Vec<u8>>, GitError> {
     let mut contents = std::collections::HashMap::new();
     if oids.is_empty() {
@@ -1414,7 +1958,10 @@ fn blob_contents(
     }
     let mut input = oids.join("\n");
     input.push('\n');
-    let buf = cat_file_stdin(root, "--batch", &input)?;
+    let cap = max_content_bytes
+        .saturating_add(oids.len().saturating_mul(CAT_FILE_HEADER_HEADROOM_PER_OID))
+        .max(DEFAULT_MAX_STDOUT_BYTES);
+    let buf = cat_file_stdin(root, "--batch", &input, cap)?;
     let mut pos = 0;
     while pos < buf.len() {
         let nl = buf[pos..]
@@ -1723,7 +2270,11 @@ pub fn compute_diff_with_budget(
         other => other,
     })?;
 
-    let out = run_git(root, &["merge-base", &base_oid, &head_oid])?;
+    let out = run_git(
+        root,
+        &["merge-base", &base_oid, &head_oid],
+        DEFAULT_MAX_STDOUT_BYTES,
+    )?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(GitError::GitFailed(format!(
@@ -1756,20 +2307,19 @@ pub fn compute_diff_with_budget(
             &merge_base,
             &head_oid,
         ],
+        DIFF_TREE_RAW_MAX_STDOUT_BYTES,
     )?;
     if !out.status.success() {
         return Err(GitError::GitFailed(
             String::from_utf8_lossy(&out.stderr).to_string(),
         ));
     }
-    let entries = parse_raw_z(&out.stdout)?;
-    if entries.len() > budget.max_files {
-        return Err(GitError::BudgetExceeded(format!(
-            "diff touches {} files (limit {}); review it in smaller pieces (narrower --base or split the change)",
-            entries.len(),
-            budget.max_files
-        )));
-    }
+    // Bounded parse: bails at the `max_files + 1`th record instead of
+    // parsing/allocating the entire raw stream and checking the count only
+    // afterward (see `parse_raw_z_capped`). `DIFF_TREE_RAW_MAX_STDOUT_BYTES`
+    // already bounds the raw byte buffer (Task 3.1); this bounds the parsed
+    // `RawEntry` structure count and the work spent building it.
+    let entries = parse_raw_z_capped(&out.stdout, budget.max_files)?;
 
     // Sizes first (--batch-check), so oversized blobs are never ingested.
     // Gitlink sides are excluded: their oid is a commit in a submodule repo,
@@ -1869,7 +2419,7 @@ pub fn compute_diff_with_budget(
         plans.push(Plan::Content);
     }
 
-    let contents = blob_contents(root, &need_oids)?;
+    let contents = blob_contents(root, &need_oids, budget.max_total_bytes)?;
 
     let mut files = Vec::with_capacity(entries.len());
     let mut total_lines: usize = 0;
@@ -2710,7 +3260,16 @@ mod git_tests {
         };
         match compute_diff_with_budget(d, "main", &budget) {
             Err(GitError::BudgetExceeded(msg)) => {
-                assert!(msg.contains("2 files"), "unexpected message: {msg}");
+                // The early-exit parse bails at the (max_files + 1)th
+                // record without ever discovering the true total, so the
+                // message reports the limit rather than an exact count.
+                // Assert the exact boundary substring rather than a bare
+                // '1' (which would also match stray digits anywhere in
+                // the message and not actually verify the limit).
+                assert!(
+                    msg.contains("more than 1 files"),
+                    "unexpected message: {msg}"
+                );
             }
             other => panic!("expected BudgetExceeded, got {other:?}"),
         }
@@ -2773,13 +3332,212 @@ mod git_tests {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         let start = std::time::Instant::now();
-        let err = wait_with_timeout(cmd.spawn().unwrap(), std::time::Duration::from_millis(100))
-            .unwrap_err();
+        // Spawned via `spawn_grouped` (not a plain `cmd.spawn()`): the
+        // process-group kill in `wait_with_timeout` needs the child to be
+        // its own group leader, exactly like every real call site sets up
+        // via `timed_output_with_deadline` / `cat_file_stdin`.
+        let child = spawn_grouped(&mut cmd).unwrap();
+        let err = wait_with_timeout(
+            child,
+            std::time::Duration::from_millis(100),
+            DEFAULT_MAX_STDOUT_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
             "kill took too long: {:?}",
             start.elapsed()
+        );
+    }
+
+    /// The core P0-6 regression: a direct child that backgrounds a
+    /// descendant and exits, leaving the descendant holding stdout/stderr
+    /// open, must not wedge `wait_with_timeout` past its deadline. The old
+    /// implementation unconditionally `.join()`ed the reader threads after
+    /// `try_wait` saw the direct child exit — since the descendant (not the
+    /// direct child) still holds the pipe open, that join never returned.
+    /// Process-group kill is what fixes it: `sh` is spawned via
+    /// `spawn_grouped` into its own group, `sleep 5 &` inherits that group,
+    /// and once the deadline is hit the whole group is killed, not just the
+    /// (already-exited) direct child.
+    #[cfg(unix)]
+    #[test]
+    fn descendant_holding_pipe_does_not_wedge_past_deadline() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg("sleep 5 & exit 0")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let start = std::time::Instant::now();
+        let child = spawn_grouped(&mut cmd).unwrap();
+        let result = wait_with_timeout(
+            child,
+            std::time::Duration::from_millis(200),
+            DEFAULT_MAX_STDOUT_BYTES,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "a descendant holding the pipe open must not be mistaken for a clean exit, got {result:?}"
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "must return by ~deadline instead of wedging on the descendant: {elapsed:?}"
+        );
+    }
+
+    /// The regression test for the `cat_file_stdin` writer-join bug:
+    /// `join_writer_bounded` must not block past `grace` even when the
+    /// writer thread genuinely never finishes. In production this happens
+    /// when a tampered `git`'s direct child exits 0 (so `wait_with_timeout`
+    /// legitimately returns `Ok` — stdout/stderr both EOF'd) while a
+    /// descendant it spawned keeps the stdin *read* end open without ever
+    /// reading it; a `--batch` request for a large diff is easily past the
+    /// ~64 KiB pipe buffer (see the doc comment on `join_writer_bounded`),
+    /// so `write_all` blocks forever on the old unconditional `.join()`.
+    ///
+    /// This constructs that "full pipe, nothing draining it" condition
+    /// directly with a raw `libc::pipe`, rather than via a shell descendant.
+    /// An earlier version of this test used `sh`/`sleep` to play the
+    /// tampered-git role, mirroring the existing `wait_with_timeout`
+    /// regression tests' style — but that turned out to be fragile in
+    /// practice for the write side specifically: getting a *descendant*
+    /// process to reliably retain a duplicated read end of the stdin pipe,
+    /// across dash vs bash, job-control, and `spawn_grouped`'s
+    /// `process_group(0)`, proved to not generalize the way the
+    /// already-existing reader-side tests do (a `dash`-as-`/bin/sh` fixture
+    /// that verified correct in isolation still failed the same way inside
+    /// the actual `Command`/`spawn_grouped` harness). A raw pipe removes
+    /// all of that: `read_fd` is simply never read from and never closed
+    /// until this test says so, so the writer is guaranteed to block once
+    /// the kernel pipe buffer (~64 KiB) fills, on every platform, with no
+    /// shell or subprocess involved at all.
+    ///
+    /// The whole check still runs on a background thread with a generous
+    /// `recv_timeout` on the main thread: if `join_writer_bounded`
+    /// regresses back to an unbounded block, this test fails promptly
+    /// instead of hanging the entire suite.
+    #[cfg(unix)]
+    #[test]
+    fn cat_file_stdin_writer_does_not_block_forever_on_stuck_reader() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                use std::os::unix::io::FromRawFd;
+
+                let mut fds = [0 as libc::c_int; 2];
+                // SAFETY: `fds` is a valid, correctly-sized out-pointer for
+                // `pipe(2)`; the call either fills both slots with fresh
+                // fds or returns -1 (checked immediately below).
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                let read_fd = fds[0];
+                let write_fd = fds[1];
+                // SAFETY: `write_fd` was just returned by `pipe(2)` above,
+                // is open, and is not owned by anything else yet.
+                let mut w = unsafe { std::fs::File::from_raw_fd(write_fd) };
+
+                // Comfortably larger than any real pipe buffer (typically
+                // 16-64 KiB) so `write_all` is guaranteed to block once the
+                // kernel buffer fills, since `read_fd` is deliberately never
+                // read from below.
+                let payload = vec![b'x'; 8 * 1024 * 1024];
+                let writer = std::thread::spawn(move || -> std::io::Result<()> {
+                    use std::io::Write;
+                    w.write_all(&payload)
+                });
+
+                let start = std::time::Instant::now();
+                let result = join_writer_bounded(writer, KILL_GRACE);
+                let elapsed = start.elapsed();
+                assert!(
+                    result.is_err(),
+                    "a writer stuck on a full pipe (nothing draining it) must not be \
+                     mistaken for a completed write: {result:?}"
+                );
+                assert!(
+                    elapsed < KILL_GRACE + std::time::Duration::from_secs(3),
+                    "join_writer_bounded must return by ~KILL_GRACE instead of blocking \
+                     forever on the stuck writer: {elapsed:?}"
+                );
+
+                // `join_writer_bounded` already detached the writer thread
+                // (it never finished within `grace`); closing `read_fd` now
+                // makes its blocked `write_all` fail with EPIPE so that
+                // leaked thread unwinds instead of staying blocked for the
+                // life of the test process.
+                // SAFETY: `read_fd` is still open (never touched since the
+                // `pipe(2)` call above) and not aliased by anything else.
+                unsafe { libc::close(read_fd) };
+            });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(_) => panic!(
+                "join_writer_bounded did not return within 30s: it has regressed to an \
+                 unbounded block"
+            ),
+        }
+    }
+
+    /// A hostile or misbehaving git that streams unbounded stdout must be
+    /// caught at the cap — not buffered without limit, and not only
+    /// discovered at the wall-clock deadline. `cat /dev/zero` never
+    /// produces EOF on its own, so a passing test here proves the cap is
+    /// what stops the read, not the (much longer) timeout.
+    #[cfg(unix)]
+    #[test]
+    fn stdout_overflow_is_bounded_and_kills() {
+        let mut cmd = std::process::Command::new("cat");
+        cmd.arg("/dev/zero")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let cap = 64 * 1024;
+        let start = std::time::Instant::now();
+        let child = spawn_grouped(&mut cmd).unwrap();
+        let err = wait_with_timeout(child, std::time::Duration::from_secs(5), cap).unwrap_err();
+        let elapsed = start.elapsed();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "an overflowing stdout must be caught promptly at the cap, not only at the 5s deadline: {elapsed:?}"
+        );
+    }
+
+    /// stderr is a ring buffer, not a truncating `Vec`: when a command
+    /// emits more than [`STDERR_CAP`], the *tail* (most recent bytes) must
+    /// survive, since that's where git actually puts its error message.
+    #[cfg(unix)]
+    #[test]
+    fn stderr_overflow_keeps_the_tail_not_the_head() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(r#"awk 'BEGIN{for(i=0;i<3000;i++) printf "LINE-%05d\n", i}' 1>&2; exit 1"#);
+        let output = timed_output_with_deadline(
+            cmd,
+            std::time::Duration::from_secs(10),
+            DEFAULT_MAX_STDOUT_BYTES,
+        )
+        .unwrap();
+        assert!(!output.status.success(), "the script exits 1");
+        assert!(
+            output.stderr.len() <= STDERR_CAP,
+            "stderr must be bounded at {STDERR_CAP} bytes, got {}",
+            output.stderr.len()
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("LINE-00000"),
+            "the head of a >cap stderr must have been evicted from the ring buffer: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("LINE-02999"),
+            "the tail of stderr (where git's actual error is) must be kept: {stderr:?}"
         );
     }
 
@@ -2804,8 +3562,12 @@ mod git_tests {
         let mut cmd = std::process::Command::new("sleep");
         cmd.arg("60");
         let start = std::time::Instant::now();
-        let err =
-            timed_output_with_deadline(cmd, std::time::Duration::from_millis(100)).unwrap_err();
+        let err = timed_output_with_deadline(
+            cmd,
+            std::time::Duration::from_millis(100),
+            DEFAULT_MAX_STDOUT_BYTES,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
         assert!(
             start.elapsed() < std::time::Duration::from_secs(5),
@@ -2863,5 +3625,60 @@ mod git_tests {
         // Fail closed on an entry shape this parser doesn't understand.
         assert!(parse_status_v2_z(b"x whatever\0").is_err());
         assert!(parse_status_v2_z(b"1 .M\0").is_err());
+    }
+
+    /// Builds a synthetic `git status --porcelain=v2 -z` buffer with `n`
+    /// distinct untracked (`?`) entries.
+    fn untracked_entries(n: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for i in 0..n {
+            buf.extend_from_slice(format!("? file{i}.txt\0").as_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn status_exactly_at_cap_is_not_overflowed() {
+        // Boundary: exactly STATUS_MAX_ENTRIES entries must be enumerated
+        // in full, not treated as an overflow (avoids a false positive on
+        // a merely very messy, but still enumerable, worktree).
+        let bytes = untracked_entries(STATUS_MAX_ENTRIES);
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert!(status.overflow.is_none());
+        assert_eq!(status.untracked.len(), STATUS_MAX_ENTRIES);
+        assert!(!status.is_clean());
+    }
+
+    #[test]
+    fn status_overflow_blocks_as_dirty() {
+        // One entry past the cap: parsing must stop enumerating paths and
+        // report the worktree as dirty via a summary, never as clean.
+        let bytes = untracked_entries(STATUS_MAX_ENTRIES + 1);
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert!(
+            status.overflow.is_some(),
+            "expected overflow to be set: {status:?}"
+        );
+        let msg = status.overflow.as_ref().unwrap();
+        assert!(
+            msg.contains(&STATUS_MAX_ENTRIES.to_string()),
+            "overflow message should mention the cap: {msg}"
+        );
+        // fail-closed: an overflowed status must never read as clean, and
+        // must not have silently enumerated every path either (that would
+        // defeat the point of the cap).
+        assert!(!status.is_clean());
+        assert!(status.untracked.len() <= STATUS_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn status_overflow_is_bounded_not_just_the_final_check() {
+        // A much larger stream (10x the cap) still bails promptly with a
+        // partial enumeration rather than collecting every path first.
+        let bytes = untracked_entries(STATUS_MAX_ENTRIES * 10);
+        let status = parse_status_v2_z(&bytes).unwrap();
+        assert!(status.overflow.is_some());
+        assert!(status.untracked.len() <= STATUS_MAX_ENTRIES);
+        assert!(!status.is_clean());
     }
 }

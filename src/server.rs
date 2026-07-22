@@ -625,7 +625,7 @@ index 1111111..2222222 100644
                 },
             ],
         };
-        let mapping = resolve_mapping(&files, &input);
+        let mapping = resolve_mapping(&files, &input).unwrap();
         // c1 claims hunk 0; c2 claims nothing; hunk 1 is left unmapped.
         assert_eq!(mapping.unmapped.len(), 1);
 
@@ -681,7 +681,7 @@ index 1111111..2222222 100644
                 },
             ],
         };
-        let mapping = resolve_mapping(&files, &input);
+        let mapping = resolve_mapping(&files, &input).unwrap();
         assert_eq!(mapping.unmapped.len(), 1);
 
         let mut snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
@@ -740,7 +740,7 @@ index 1111111..2222222 100644
                 }],
             }],
         };
-        let mapping = resolve_mapping(&files, &input);
+        let mapping = resolve_mapping(&files, &input).unwrap();
         assert!(mapping.unmapped.is_empty());
 
         let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);
@@ -807,7 +807,7 @@ index 1111111..2222222 100644
                 ],
             }],
         };
-        let mapping = resolve_mapping(&files, &input);
+        let mapping = resolve_mapping(&files, &input).unwrap();
         assert!(mapping.unmapped.is_empty());
 
         let snapshot = crate::snapshot::ReviewSnapshot::without_git("main", &files, &input);

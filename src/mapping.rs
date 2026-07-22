@@ -8,7 +8,7 @@
 //! line inside it. Changed lines (and hunk-less files) claimed by no
 //! concern are reported in `Mapping.unmapped_lines` / `Mapping.unmapped`.
 
-use crate::gitdiff::{FileDiff, LineKind};
+use crate::gitdiff::{FileDiff, GitError, LineKind, ResourceBudget};
 use crate::model::{ConcernsInput, Severity, Side, Warning, SUPPORTED_VERSION};
 use crate::termsafe::sanitize;
 use serde::Serialize;
@@ -156,6 +156,84 @@ fn side_sort_key(side: Side) -> u8 {
     }
 }
 
+/// Merges a list of inclusive `[start, end]` `u32` intervals into the
+/// minimal disjoint, start-sorted set covering the same union of line
+/// numbers. Overlapping, fully-contained, adjacent (touching with no gap),
+/// and out-of-order input all collapse correctly.
+///
+/// Used to collapse a concern's (possibly many, possibly duplicate or
+/// overlapping) locations on the same `(path, side)` into the minimal set
+/// of ranges actually walked against a file's changed lines, so a
+/// pathological concern with hundreds of overlapping/duplicate locations
+/// re-walks each changed line at most once instead of once per location.
+/// This can never change which lines get claimed: the walk only ever
+/// registers a changed line that already exists in one of the merged
+/// ranges' union, which by construction equals the union of the original
+/// (unmerged) ranges.
+fn merge_intervals(mut intervals: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    intervals.sort_unstable_by_key(|&(start, _)| start);
+    let mut merged: Vec<(u32, u32)> = Vec::with_capacity(intervals.len());
+    for (start, end) in intervals {
+        match merged.last_mut() {
+            // `start <= last_end + 1` (saturating, since `end` may be
+            // `u32::MAX`) treats touching intervals — e.g. `[1,5]` and
+            // `[6,10]` — as mergeable: walking the merged `[1,10]` visits
+            // exactly the same changed lines as walking both separately,
+            // since changed lines (not the interval itself) are the walk
+            // target, so merging adjacent ranges can never claim a line
+            // neither original range could have claimed.
+            Some(&mut (_, ref mut last_end)) if start <= last_end.saturating_add(1) => {
+                if end > *last_end {
+                    *last_end = end;
+                }
+            }
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// A concern's locations on one `(path, side)`, accumulated before merging:
+/// every location's resolved `[start, end]` range, plus whether any of them
+/// was a true whole-file location (no `start` and no `end`) — tracked
+/// separately since that gates hunk-less whole-file capture independently
+/// of the numeric range a `None`/`None` location resolves to.
+#[derive(Default)]
+struct LocationGroup {
+    intervals: Vec<(u32, u32)>,
+    whole_file: bool,
+}
+
+/// Whether `sorted` (ascending by line number, as `adds`/`removes` are kept)
+/// contains at least one entry in `[start, end]`, via a single binary
+/// search — O(log n) regardless of how many entries the range would
+/// contain. Used for the per-location "matched nothing" warning check,
+/// which must reflect each location's own range individually and so can't
+/// be answered from the (merged, per-group) claim walk.
+fn range_has_entry(sorted: &[(usize, u32)], start: u32, end: u32) -> bool {
+    let lo = sorted.partition_point(|&(_, no)| no < start);
+    sorted.get(lo).is_some_and(|&(_, no)| no <= end)
+}
+
+// Test-only instrumentation: the total changed-line claim registrations
+// (`resolved_edges`) performed by the most recent `resolve_mapping` /
+// `resolve_mapping_with_budget` call on the current thread. Lets tests
+// assert the interval-merge optimization actually bounds the walk to
+// O(changed lines) per concern rather than O(locations x changed lines),
+// without exposing the counter on the public `Mapping` type. Safe across
+// tests: the test harness runs one test function to completion (no
+// interleaving with another test's `resolve_mapping` call) before reusing a
+// worker thread, and this is unconditionally overwritten on every call.
+#[cfg(test)]
+thread_local! {
+    static LAST_RESOLVED_EDGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn last_resolved_edges() -> usize {
+    LAST_RESOLVED_EDGES.with(|c| c.get())
+}
+
 /// Resolves every concern's locations against the diff's individual changed
 /// lines.
 ///
@@ -182,7 +260,36 @@ fn side_sort_key(side: Side) -> u8 {
 ///   hunk that still contains at least one line in `unmapped_lines` — a
 ///   concern partially claiming a hunk no longer hides the rest of that
 ///   hunk's changes.
-pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
+///
+/// Resolves against the default [`ResourceBudget`]; see
+/// [`resolve_mapping_with_budget`] for a caller-supplied budget.
+pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Result<Mapping, GitError> {
+    resolve_mapping_with_budget(files, input, &ResourceBudget::default())
+}
+
+/// [`resolve_mapping`] with an explicit [`ResourceBudget`] (the default
+/// budget minus the ability to override it in tests, which need adversarial
+/// fixtures — or a tiny budget — to exercise the hard caps below without
+/// timing out).
+///
+/// Two hard caps, on top of everything [`resolve_mapping`] already
+/// documents, bound the concern x location sweep itself: up to 200 concerns
+/// x 200 locations each is legal input, and a pathological-but-legal
+/// instance (e.g. every location pointing at the same maximal file) could
+/// otherwise multiply into an unbounded amount of work even after
+/// per-concern interval merging collapses duplicate/overlapping locations
+/// within a single concern. `budget.max_resolved_edges` bounds the total
+/// claimed changed-line registrations across *all* concerns (merging can't
+/// help across concerns — 200 concerns each fully claiming the same large
+/// file is still 200x the work); `budget.max_hunk_refs` bounds the total
+/// `HunkRef` entries across all concerns' displayed hunks. Either cap being
+/// exceeded returns `GitError::BudgetExceeded` — the review is refused
+/// before an oversized session is built, never silently truncated.
+pub fn resolve_mapping_with_budget(
+    files: &[FileDiff],
+    input: &ConcernsInput,
+    budget: &ResourceBudget,
+) -> Result<Mapping, GitError> {
     use std::collections::{BTreeSet, HashMap, HashSet};
 
     // Step 1: per-file changed-line lists, and path -> file-index maps so
@@ -261,9 +368,28 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
     let mut claimed_hunkless: HashSet<usize> = HashSet::new();
     let mut concerns = Vec::new();
 
-    // Step 3: each concern's each location.
+    // Step 3: each concern's each location. Split into two passes:
+    //
+    // 3a. Per-location "matched nothing" detection, via a single O(log n)
+    //     existence check per location — cheap and independent of how large
+    //     the location's range is, so it stays correct (and bounded) without
+    //     needing the merge below.
+    // 3b. Per-(path, side) interval merge, then a claim walk over the
+    //     *merged* intervals only. A pathological concern with up to 200
+    //     overlapping/duplicate locations on the same file collapses to a
+    //     handful of merged ranges instead of re-walking the file's changed
+    //     lines once per location; see `merge_intervals` for why this can't
+    //     change which lines get claimed. `resolved_edges` and
+    //     `total_hunk_refs` accumulate across *all* concerns (merging is a
+    //     per-concern optimization — it can't stop 200 different concerns
+    //     from each fully claiming the same large file), enforcing the hard
+    //     caps that bound that cross-concern multiplication.
+    let mut resolved_edges: usize = 0;
+    let mut total_hunk_refs: usize = 0;
     for c in &input.concerns {
         let mut covered_hunks: BTreeSet<(usize, Option<usize>)> = BTreeSet::new();
+
+        // 3a: warnings, computed per original location.
         for loc in &c.locations {
             let file_indices: &[usize] = match loc.side.unwrap_or(Side::New) {
                 Side::New => by_new_path.get(loc.path.as_str()),
@@ -280,32 +406,14 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
             for &fi in file_indices {
                 let file = &files[fi];
                 if file.hunks.is_empty() && loc.start.is_none() && loc.end.is_none() {
-                    covered_hunks.insert((fi, None));
-                    claimed_hunkless.insert(fi);
                     matched = true;
                     continue;
                 }
-                if want_adds {
-                    let lo = adds[fi].partition_point(|&(_, no)| no < start);
-                    for &(hi, no) in &adds[fi][lo..] {
-                        if no > end {
-                            break;
-                        }
-                        claimed_adds.insert((fi, no));
-                        covered_hunks.insert((fi, Some(hi)));
-                        matched = true;
-                    }
+                if want_adds && range_has_entry(&adds[fi], start, end) {
+                    matched = true;
                 }
-                if want_removes {
-                    let lo = removes[fi].partition_point(|&(_, no)| no < start);
-                    for &(hi, no) in &removes[fi][lo..] {
-                        if no > end {
-                            break;
-                        }
-                        claimed_removes.insert((fi, no));
-                        covered_hunks.insert((fi, Some(hi)));
-                        matched = true;
-                    }
+                if want_removes && range_has_entry(&removes[fi], start, end) {
+                    matched = true;
                 }
             }
 
@@ -328,16 +436,105 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
             }
         }
 
+        // 3b: group locations by (path, side), merge each group's
+        // intervals, then walk the merged intervals once to register
+        // claims.
+        let mut groups: HashMap<(&str, Option<Side>), LocationGroup> = HashMap::new();
+        for loc in &c.locations {
+            let start = loc.start.unwrap_or(1);
+            let end = loc.end.unwrap_or(u32::MAX);
+            let whole_file = loc.start.is_none() && loc.end.is_none();
+            let group = groups.entry((loc.path.as_str(), loc.side)).or_default();
+            group.intervals.push((start, end));
+            group.whole_file |= whole_file;
+        }
+
+        for ((path, side), group) in groups {
+            let LocationGroup {
+                intervals,
+                whole_file,
+            } = group;
+            let file_indices: &[usize] = match side.unwrap_or(Side::New) {
+                Side::New => by_new_path.get(path),
+                Side::Old => by_old_path.get(path),
+            }
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+            let want_adds = !matches!(side, Some(Side::Old));
+            let want_removes = !matches!(side, Some(Side::New));
+            let merged = merge_intervals(intervals);
+
+            for &fi in file_indices {
+                let file = &files[fi];
+                if file.hunks.is_empty() {
+                    if whole_file {
+                        covered_hunks.insert((fi, None));
+                        claimed_hunkless.insert(fi);
+                    }
+                    continue;
+                }
+                for &(start, end) in &merged {
+                    if want_adds {
+                        let lo = adds[fi].partition_point(|&(_, no)| no < start);
+                        for &(hi, no) in &adds[fi][lo..] {
+                            if no > end {
+                                break;
+                            }
+                            resolved_edges += 1;
+                            if resolved_edges > budget.max_resolved_edges {
+                                return Err(GitError::BudgetExceeded(format!(
+                                    "too many resolved edges: over {} claimed changed-line \
+                                     registrations across all concerns (maximum {})",
+                                    resolved_edges, budget.max_resolved_edges
+                                )));
+                            }
+                            claimed_adds.insert((fi, no));
+                            covered_hunks.insert((fi, Some(hi)));
+                        }
+                    }
+                    if want_removes {
+                        let lo = removes[fi].partition_point(|&(_, no)| no < start);
+                        for &(hi, no) in &removes[fi][lo..] {
+                            if no > end {
+                                break;
+                            }
+                            resolved_edges += 1;
+                            if resolved_edges > budget.max_resolved_edges {
+                                return Err(GitError::BudgetExceeded(format!(
+                                    "too many resolved edges: over {} claimed changed-line \
+                                     registrations across all concerns (maximum {})",
+                                    resolved_edges, budget.max_resolved_edges
+                                )));
+                            }
+                            claimed_removes.insert((fi, no));
+                            covered_hunks.insert((fi, Some(hi)));
+                        }
+                    }
+                }
+            }
+        }
+
         // Step 4: concern's display hunks, sorted (file, hunk).
         let hunks: Vec<HunkRef> = covered_hunks
             .into_iter()
             .map(|(file, hunk)| HunkRef { file, hunk })
             .collect();
+        total_hunk_refs += hunks.len();
+        if total_hunk_refs > budget.max_hunk_refs {
+            return Err(GitError::BudgetExceeded(format!(
+                "too many hunk refs: over {} displayed hunk references across all concerns \
+                 (maximum {})",
+                total_hunk_refs, budget.max_hunk_refs
+            )));
+        }
         concerns.push(MappedConcern {
             id: c.id.clone(),
             hunks,
         });
     }
+
+    #[cfg(test)]
+    LAST_RESOLVED_EDGES.with(|c| c.set(resolved_edges));
 
     // Step 5: every changed line no concern claimed, tracking which hunks
     // they live in as we go (needed for step 6).
@@ -390,12 +587,12 @@ pub fn resolve_mapping(files: &[FileDiff], input: &ConcernsInput) -> Mapping {
         }
     }
 
-    Mapping {
+    Ok(Mapping {
         concerns,
         unmapped,
         unmapped_lines,
         warnings,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -548,7 +745,7 @@ mod tests {
     fn whole_file_location_claims_every_hunk() {
         let files = vec![fd("a.ts", &[(1, 2, 1, 2), (10, 3, 10, 3)])];
         let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, None)])]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![
@@ -576,7 +773,7 @@ mod tests {
                 loc("a.ts", None, Some(20), None),
             ],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         // first location (19-30) matches; second (20-) does not
         assert_eq!(
             mapping.concerns[0].hunks,
@@ -632,7 +829,7 @@ mod tests {
             "c1",
             vec![loc("gone.txt", Some(Side::Old), None, None)],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -650,7 +847,7 @@ mod tests {
             concern("c1", vec![loc("a.ts", None, None, None)]),
             concern("c2", vec![loc("a.ts", None, Some(5), Some(6))]),
         ]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         let expect = vec![HunkRef {
             file: 0,
             hunk: Some(0),
@@ -667,7 +864,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", None, Some(1), Some(2))],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.unmapped,
             vec![HunkRef {
@@ -678,7 +875,7 @@ mod tests {
 
         // Whole-file location claims both hunks -> nothing unmapped.
         let inp_full = input(vec![concern("c1", vec![loc("a.ts", None, None, None)])]);
-        let mapping_full = resolve_mapping(&files, &inp_full);
+        let mapping_full = resolve_mapping(&files, &inp_full).unwrap();
         assert!(mapping_full.unmapped.is_empty());
     }
 
@@ -689,7 +886,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", None, Some(5), Some(10))],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(mapping.concerns[0].hunks, Vec::new());
         assert_eq!(
             mapping
@@ -738,7 +935,7 @@ mod tests {
             },
         ];
         let inp = input(vec![concern("c1", vec![loc("logo.png", None, None, None)])]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -761,7 +958,7 @@ mod tests {
         // matches nothing and must warn with the end bound preserved.
         let files = vec![fd("a.ts", &[(100, 5, 100, 5)])];
         let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, Some(30))])]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(mapping.concerns[0].hunks, Vec::new());
         assert_eq!(
             mapping
@@ -785,7 +982,7 @@ mod tests {
                 loc("a.ts", None, Some(4), Some(8)),
             ],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -812,7 +1009,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", Some(Side::New), Some(5), Some(5))],
         )]);
-        let mapping_new = resolve_mapping(&files, &new_side);
+        let mapping_new = resolve_mapping(&files, &new_side).unwrap();
         assert_eq!(mapping_new.concerns[0].hunks, Vec::new());
         assert_eq!(
             mapping_new
@@ -828,7 +1025,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", Some(Side::Old), Some(5), Some(7))],
         )]);
-        let mapping_old = resolve_mapping(&files, &old_side);
+        let mapping_old = resolve_mapping(&files, &old_side).unwrap();
         assert_eq!(
             mapping_old.concerns[0].hunks,
             vec![HunkRef {
@@ -859,7 +1056,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", None, Some(10), Some(12))],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert!(mapping.concerns[0].hunks.is_empty());
         assert_eq!(mapping.warnings.len(), 1);
         assert!(mapping.warnings[0]
@@ -906,7 +1103,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", None, Some(13), Some(13))],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -952,7 +1149,7 @@ mod tests {
             concern("a", vec![loc("a.ts", None, Some(13), Some(13))]),
             concern("b", vec![loc("a.ts", None, Some(15), Some(15))]),
         ]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -991,7 +1188,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", None, Some(10), Some(10))],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert!(mapping.unmapped.is_empty());
         assert!(mapping.unmapped_lines.is_empty());
     }
@@ -1014,7 +1211,7 @@ mod tests {
             "c1",
             vec![loc("a.ts", Some(Side::Old), Some(10), Some(10))],
         )]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         // The add at new10 is left unclaimed.
         assert_eq!(
             mapping.unmapped_lines,
@@ -1144,7 +1341,7 @@ mod tests {
             &[],
         )];
         let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, None)])]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -1206,7 +1403,7 @@ mod tests {
             "c1",
             vec![loc("gone.txt", Some(Side::Old), None, None)],
         )]);
-        let mapping_old = resolve_mapping(&files, &old_side);
+        let mapping_old = resolve_mapping(&files, &old_side).unwrap();
         assert_eq!(
             mapping_old.concerns[0].hunks,
             vec![HunkRef {
@@ -1218,7 +1415,7 @@ mod tests {
         assert!(mapping_old.unmapped.is_empty());
 
         let unspecified_side = input(vec![concern("c1", vec![loc("gone.txt", None, None, None)])]);
-        let mapping_unspecified = resolve_mapping(&files, &unspecified_side);
+        let mapping_unspecified = resolve_mapping(&files, &unspecified_side).unwrap();
         assert!(mapping_unspecified.concerns[0].hunks.is_empty());
         assert_eq!(mapping_unspecified.warnings.len(), 1);
         assert_eq!(
@@ -1276,7 +1473,7 @@ mod tests {
             }],
         }];
         let inp = input(vec![concern("c1", vec![loc("new.ts", None, None, None)])]);
-        let mapping = resolve_mapping(&files, &inp);
+        let mapping = resolve_mapping(&files, &inp).unwrap();
         assert_eq!(
             mapping.concerns[0].hunks,
             vec![HunkRef {
@@ -1290,5 +1487,100 @@ mod tests {
             "the remove line (old_no-keyed) must have been claimed too, not just the add"
         );
         assert!(mapping.unmapped_lines.is_empty());
+    }
+
+    #[test]
+    fn interval_merge_handles_overlap_containment_adjacency_and_reversed_order() {
+        // Fed out of order on purpose. Expected collapse:
+        //   (1,5)+(3,8)        overlap    -> (1,8)
+        //   (10,20)+(12,15)    containment -> (10,20)
+        //   ...+(21,25)+(26,30) adjacency  -> (10,30) (touching, no gap)
+        //   (50,60)            disjoint (real gap) -> stays separate
+        let merged = merge_intervals(vec![
+            (26, 30),
+            (3, 8),
+            (12, 15),
+            (50, 60),
+            (1, 5),
+            (21, 25),
+            (10, 20),
+        ]);
+        assert_eq!(merged, vec![(1, 8), (10, 30), (50, 60)]);
+    }
+
+    #[test]
+    fn adversarial_40k_locations_same_file_is_bounded() {
+        // 200 concerns x 200 locations (the legal maximum of each, per
+        // `validate_concerns`), every single one a whole-file location on
+        // the same file with N changed (Add) lines. Without per-concern
+        // interval merging this would walk the file's changed lines once
+        // per location: 200 x 200 x N. With merging, each concern's 200
+        // identical whole-file locations collapse to a single merged range,
+        // so the walk is only 200 x N.
+        const N: u32 = 3_000;
+        let files = vec![fd("big.ts", &[(1, 0, 1, N)])];
+        let locations: Vec<Location> = (0..200).map(|_| loc("big.ts", None, None, None)).collect();
+        let concerns: Vec<Concern> = (0..200)
+            .map(|i| concern(&format!("c{i}"), locations.clone()))
+            .collect();
+        let inp = input(concerns);
+
+        let mapping = resolve_mapping(&files, &inp).expect("bounded by the default budget");
+
+        // Correctness: every concern claims the file's one hunk, and every
+        // changed line is claimed -- the same result a single [1,N]
+        // location per concern would have produced.
+        assert_eq!(mapping.concerns.len(), 200);
+        for c in &mapping.concerns {
+            assert_eq!(
+                c.hunks,
+                vec![HunkRef {
+                    file: 0,
+                    hunk: Some(0)
+                }]
+            );
+        }
+        assert!(mapping.warnings.is_empty());
+        assert!(mapping.unmapped.is_empty());
+        assert!(mapping.unmapped_lines.is_empty());
+
+        // Boundedness: the walk counter proves the merge actually ran --
+        // 200 concerns x N, not 200 x 200 x N (which would be 120,000,000,
+        // far past the default 1,000,000-edge budget).
+        assert_eq!(last_resolved_edges(), 200 * N as usize);
+    }
+
+    #[test]
+    fn resolved_edges_cap_refuses() {
+        let files = vec![fd("a.ts", &[(1, 0, 1, 10)])]; // 10 Add lines
+        let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, None)])]);
+        let budget = crate::gitdiff::ResourceBudget {
+            max_resolved_edges: 5,
+            ..crate::gitdiff::ResourceBudget::default()
+        };
+        match resolve_mapping_with_budget(&files, &inp, &budget) {
+            Err(GitError::BudgetExceeded(msg)) => {
+                assert!(msg.contains("resolved edges"), "unexpected message: {msg}");
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hunk_refs_cap_refuses() {
+        // 3 separate hunks, one concern claiming all of them via a
+        // whole-file location -> 3 hunk refs, over a budget of 2.
+        let files = vec![fd("a.ts", &[(1, 1, 1, 1), (10, 1, 10, 1), (20, 1, 20, 1)])];
+        let inp = input(vec![concern("c1", vec![loc("a.ts", None, None, None)])]);
+        let budget = crate::gitdiff::ResourceBudget {
+            max_hunk_refs: 2,
+            ..crate::gitdiff::ResourceBudget::default()
+        };
+        match resolve_mapping_with_budget(&files, &inp, &budget) {
+            Err(GitError::BudgetExceeded(msg)) => {
+                assert!(msg.contains("hunk refs"), "unexpected message: {msg}");
+            }
+            other => panic!("expected BudgetExceeded, got {other:?}"),
+        }
     }
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { rs } from './state.svelte'
+  import { shouldCollapseAllHunks } from './collapse'
   import HunkView from './HunkView.svelte'
   import type { CommentLineInfo } from './anchors'
   import { hasControlChars, hasInvisibles, reveal } from './invisibles'
@@ -28,6 +29,25 @@
     }
     return out
   })
+
+  // Sum of rendered lines across every hunk the SELECTED concern owns
+  // (not just the ones in a single file group) — the input to the
+  // many-small-hunks collapse rule. A concern with hundreds of small hunks
+  // can build unbounded DOM even though no individual hunk crosses
+  // HunkView's own per-hunk threshold; see collapse.ts.
+  const selectedTotalLines = $derived.by((): number => {
+    const concern = rs.selected
+    const session = rs.session
+    if (!concern || !session) return 0
+    let total = 0
+    for (const ref of concern.hunks) {
+      if (ref.hunk == null) continue
+      total += session.files[ref.file].hunks[ref.hunk].lines.length
+    }
+    return total
+  })
+
+  const forceCollapseAll = $derived(shouldCollapseAllHunks(selectedTotalLines))
 
   // Only called for content_kind === 'text' files with no hunks — opaque
   // files get the detail card + ack checkbox below instead.
@@ -79,91 +99,107 @@
   {#if rs.selected.unmapped && rs.session.unmapped_lines.length > 0}
     <p class="unmapped-legend">Highlighted lines were not assigned to any concern.</p>
   {/if}
-  {#each groups as group (group.fileIndex)}
-    {@const file = rs.session.files[group.fileIndex]}
-    <section class="file-group">
-      <header class="file-header">
-        {#if file.old_path && file.new_path && file.old_path !== file.new_path}
-          <span class="file-path">{reveal(file.old_path)} → {reveal(file.new_path)}</span>
-        {:else}
-          <span class="file-path">{reveal(file.new_path ?? file.old_path)}</span>
-        {/if}
-        <span class="file-status kind-{file.change_kind}">{file.change_kind}</span>
-        {#if file.content_kind !== 'text'}
-          <span class="file-status kind-{file.content_kind}">{file.content_kind}</span>
-        {/if}
-        {#if modeChangeBadge(file)}
-          <span class="file-status kind-meta">{modeChangeBadge(file)}</span>
-        {/if}
-        {#if typeChangeBadge(file)}
-          <span class="file-status kind-meta">{typeChangeBadge(file)}</span>
-        {/if}
-        {#if fileHasInvisibles(file, group.refs)}
-          <span
-            class="file-status kind-invisible"
-            title="Contains invisible or bidirectional Unicode characters (revealed inline as ⟨U+XXXX⟩)"
-            >hidden unicode</span
-          >
-        {/if}
-      </header>
-      {#each fileNotices(file) as notice (notice)}
-        <p class="file-notice">{notice}</p>
-      {/each}
-      {#each group.refs as hunkRef (hunkRef.hunk ?? -1)}
-        {#if hunkRef.hunk === null}
-          {#if file.content_kind === 'text'}
-            <div class="status-card">{statusCardText(file)}</div>
+  <!-- Keyed on the selected concern id so switching concerns forces a full
+       remount of every HunkView below, not just a props update. Without
+       this, `{#each group.refs as hunkRef (hunkRef.hunk ?? -1)}` keys purely
+       on (file, hunk) — a hunk shared by two concerns keeps the SAME
+       HunkView instance across a concern switch, so its `collapsed` $state
+       (seeded once from `forceCollapsed`/the per-hunk threshold, see
+       HunkView.svelte) never re-evaluates: a shared hunk could stay
+       expanded under a concern whose total exceeds the force-collapse
+       threshold, silently escaping the DOM bound this feature exists to
+       enforce. Remounting on every concern switch does mean a manually
+       expanded/collapsed hunk resets when you switch away and back — that's
+       fine, all persisted state (comments, verdicts, buffers) lives in the
+       store, not in HunkView. -->
+  {#key rs.selected.id}
+    {#each groups as group (group.fileIndex)}
+      {@const file = rs.session.files[group.fileIndex]}
+      <section class="file-group">
+        <header class="file-header">
+          {#if file.old_path && file.new_path && file.old_path !== file.new_path}
+            <span class="file-path">{reveal(file.old_path)} → {reveal(file.new_path)}</span>
           {:else}
-            <div class="opaque-card">
-              <p class="opaque-note">{contentNote(file.content_kind)}</p>
-              {#if opaqueDetails(file).length > 0}
-                <dl class="opaque-details">
-                  {#each opaqueDetails(file) as row (row.label)}
-                    <dt>{row.label}</dt>
-                    <dd>{row.value}</dd>
-                  {/each}
-                </dl>
-              {/if}
-              <label class="opaque-ack">
-                <input
-                  type="checkbox"
-                  checked={rs.isAcked(group.fileIndex)}
-                  disabled={rs.phase !== 'review'}
-                  onchange={() => rs.toggleAck(group.fileIndex)}
-                />
-                I acknowledge this change without reviewing its contents
-              </label>
-            </div>
+            <span class="file-path">{reveal(file.new_path ?? file.old_path)}</span>
           {/if}
-        {:else}
-          <HunkView
-            {file}
-            hunk={file.hunks[hunkRef.hunk]}
-            {hunkRef}
-            concernId={rs.selected.id}
-            oncommentline={handleCommentLine}
-          />
-        {/if}
-      {/each}
-      <!-- Text files can still require an ack (gitlink, mode change — see
-           requiresAck): the header badges above explain why, and the same
-           ack checkbox as the opaque card gates submission. Opaque files
-           already carry theirs inside the opaque card. -->
-      {#if file.content_kind === 'text' && requiresAck(file)}
-        <div class="opaque-card">
-          <label class="opaque-ack">
-            <input
-              type="checkbox"
-              checked={rs.isAcked(group.fileIndex)}
-              disabled={rs.phase !== 'review'}
-              onchange={() => rs.toggleAck(group.fileIndex)}
+          <span class="file-status kind-{file.change_kind}">{file.change_kind}</span>
+          {#if file.content_kind !== 'text'}
+            <span class="file-status kind-{file.content_kind}">{file.content_kind}</span>
+          {/if}
+          {#if modeChangeBadge(file)}
+            <span class="file-status kind-meta">{modeChangeBadge(file)}</span>
+          {/if}
+          {#if typeChangeBadge(file)}
+            <span class="file-status kind-meta">{typeChangeBadge(file)}</span>
+          {/if}
+          {#if fileHasInvisibles(file, group.refs)}
+            <span
+              class="file-status kind-invisible"
+              title="Contains invisible or bidirectional Unicode characters (revealed inline as ⟨U+XXXX⟩)"
+              >hidden unicode</span
+            >
+          {/if}
+        </header>
+        {#each fileNotices(file) as notice (notice)}
+          <p class="file-notice">{notice}</p>
+        {/each}
+        {#each group.refs as hunkRef (hunkRef.hunk ?? -1)}
+          {#if hunkRef.hunk === null}
+            {#if file.content_kind === 'text'}
+              <div class="status-card">{statusCardText(file)}</div>
+            {:else}
+              <div class="opaque-card">
+                <p class="opaque-note">{contentNote(file.content_kind)}</p>
+                {#if opaqueDetails(file).length > 0}
+                  <dl class="opaque-details">
+                    {#each opaqueDetails(file) as row (row.label)}
+                      <dt>{row.label}</dt>
+                      <dd>{row.value}</dd>
+                    {/each}
+                  </dl>
+                {/if}
+                <label class="opaque-ack">
+                  <input
+                    type="checkbox"
+                    checked={rs.isAcked(group.fileIndex)}
+                    disabled={rs.phase !== 'review'}
+                    onchange={() => rs.toggleAck(group.fileIndex)}
+                  />
+                  I acknowledge this change without reviewing its contents
+                </label>
+              </div>
+            {/if}
+          {:else}
+            <HunkView
+              {file}
+              hunk={file.hunks[hunkRef.hunk]}
+              {hunkRef}
+              concernId={rs.selected.id}
+              forceCollapsed={forceCollapseAll}
+              oncommentline={handleCommentLine}
             />
-            I acknowledge this change
-          </label>
-        </div>
-      {/if}
-    </section>
-  {/each}
+          {/if}
+        {/each}
+        <!-- Text files can still require an ack (gitlink, mode change — see
+             requiresAck): the header badges above explain why, and the same
+             ack checkbox as the opaque card gates submission. Opaque files
+             already carry theirs inside the opaque card. -->
+        {#if file.content_kind === 'text' && requiresAck(file)}
+          <div class="opaque-card">
+            <label class="opaque-ack">
+              <input
+                type="checkbox"
+                checked={rs.isAcked(group.fileIndex)}
+                disabled={rs.phase !== 'review'}
+                onchange={() => rs.toggleAck(group.fileIndex)}
+              />
+              I acknowledge this change
+            </label>
+          </div>
+        {/if}
+      </section>
+    {/each}
+  {/key}
 {/if}
 
 <style>

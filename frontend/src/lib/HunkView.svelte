@@ -14,10 +14,15 @@
     hunk: Hunk
     hunkRef: HunkRef
     concernId: string
+    /** True when the selected concern's total rendered line count (across
+     * all its hunks) exceeds CONCERN_TOTAL_LINES_COLLAPSE_THRESHOLD (see
+     * collapse.ts) — bounds initial DOM for concerns owning many small
+     * hunks, none of which individually cross COLLAPSE_THRESHOLD below. */
+    forceCollapsed: boolean
     oncommentline: (info: CommentLineInfo) => void
   }
 
-  let { file, hunk, hunkRef, concernId, oncommentline }: Props = $props()
+  let { file, hunk, hunkRef, concernId, forceCollapsed, oncommentline }: Props = $props()
 
   const lang = $derived(langForPath(file.new_path ?? file.old_path))
   const comments = $derived(rs.draft.concerns[concernId]?.comments ?? [])
@@ -54,9 +59,12 @@
   // Deliberately captures only the initial value: each hunk gets its own
   // component instance (keyed by hunkRef.hunk in DiffView), so this seeds
   // the starting collapsed state once per hunk; `collapsed` itself is a
-  // separate piece of state the user toggles afterward.
+  // separate piece of state the user toggles afterward. Two independent
+  // rules OR together here (see collapse.ts): this hunk alone is too big,
+  // or the selected concern's hunks are collectively too big — either one
+  // starts it collapsed, expandable on demand either way.
   // svelte-ignore state_referenced_locally
-  let collapsed = $state(hunk.lines.length > COLLAPSE_THRESHOLD)
+  let collapsed = $state(hunk.lines.length > COLLAPSE_THRESHOLD || forceCollapsed)
 
   const otherOwners = $derived(
     rs
@@ -189,7 +197,7 @@
         </tbody>
       </table>
     </div>
-    {#if hunk.lines.length > COLLAPSE_THRESHOLD}
+    {#if hunk.lines.length > COLLAPSE_THRESHOLD || forceCollapsed}
       <button type="button" class="collapse-toggle" onclick={() => (collapsed = true)}
         >Collapse</button
       >

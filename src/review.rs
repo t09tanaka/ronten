@@ -391,6 +391,10 @@ pub async fn run(args: ReviewArgs) -> u8 {
             eprintln!("review too large: {msg}");
             return exitcode::REVIEW_TOO_LARGE;
         }
+        Err(GitError::OutputOverflow(msg)) => {
+            eprintln!("git failed: {}", sanitize(msg.trim()));
+            return exitcode::GIT_FAILED;
+        }
     };
     let files = diff_output.files;
     let diff_warnings = diff_output.warnings;
@@ -439,7 +443,8 @@ pub async fn run(args: ReviewArgs) -> u8 {
             }
             Err(GitError::BadBase(msg))
             | Err(GitError::GitFailed(msg))
-            | Err(GitError::BudgetExceeded(msg)) => {
+            | Err(GitError::BudgetExceeded(msg))
+            | Err(GitError::OutputOverflow(msg)) => {
                 // The gate cannot run at all. Under the (default) Error
                 // policy an unverifiable worktree must not silently pass;
                 // under Warn the review proceeds with a notice.
@@ -468,6 +473,9 @@ pub async fn run(args: ReviewArgs) -> u8 {
         }
         for path in &status.submodules_dirty {
             eprintln!("  dirty submodule: {}", sanitize(path));
+        }
+        if let Some(msg) = &status.overflow {
+            eprintln!("  {}", sanitize(msg));
         }
     };
     if let Some(status) = &dirty {
@@ -519,7 +527,23 @@ pub async fn run(args: ReviewArgs) -> u8 {
     };
 
     // 4. Build the session state.
-    let mut mapping = resolve_mapping(&files, &input);
+    let mut mapping = match resolve_mapping(&files, &input) {
+        Ok(mapping) => mapping,
+        Err(GitError::BudgetExceeded(msg)) => {
+            eprintln!("review too large: {msg}");
+            return exitcode::REVIEW_TOO_LARGE;
+        }
+        // `resolve_mapping` never returns any other `GitError` variant; kept
+        // exhaustive (not a wildcard) so a future variant added to
+        // `GitError` fails to compile here instead of silently falling
+        // through unhandled.
+        Err(
+            e @ (GitError::NotARepo
+            | GitError::BadBase(_)
+            | GitError::GitFailed(_)
+            | GitError::OutputOverflow(_)),
+        ) => unreachable!("resolve_mapping does not produce {e:?}"),
+    };
     // Surface diff-level warnings (e.g. files too large to display) ahead
     // of mapping warnings.
     if !diff_warnings.is_empty() {

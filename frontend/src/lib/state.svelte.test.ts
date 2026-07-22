@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import type { SaveDraftResult, Session } from './types'
+import type { HunkRef, SaveDraftResult, Session } from './types'
 
 vi.mock('./api', () => ({
   fetchSession: vi.fn(),
@@ -569,5 +569,69 @@ describe('outcome-unknown recovery', () => {
 
     expect(rs.phase).toBe('review')
     expect(rs.saveState).toBe('saved')
+  })
+})
+
+describe('hunkOwners owner index', () => {
+  function ref(file: number, hunk: number | null): HunkRef {
+    return { file, hunk }
+  }
+
+  function sessionWithSharedHunks(): Session {
+    return {
+      ...makeSession(),
+      concerns: [
+        {
+          id: 'c1',
+          title: 'Concern 1',
+          description: null,
+          risk: null,
+          unmapped: false,
+          hunks: [ref(0, 0), ref(0, 1)],
+        },
+        {
+          id: 'c2',
+          title: 'Concern 2',
+          description: null,
+          risk: null,
+          unmapped: false,
+          hunks: [ref(0, 1), ref(1, 0)],
+        },
+        { id: 'c3', title: 'Concern 3', description: null, risk: null, unmapped: false, hunks: [] },
+      ],
+    }
+  }
+
+  it('owner_index_is_o1_lookup', async () => {
+    fetchSessionMock.mockResolvedValue(sessionWithSharedHunks())
+    const rs = new ReviewState()
+    await rs.load()
+
+    // A hunk owned by exactly one concern.
+    expect(rs.hunkOwners(ref(0, 0))).toEqual(['c1'])
+    // A hunk shared by two concerns (the whole point of the "shared with"
+    // badge this powers) must list both, matching the old filter-based
+    // hunkOwners' concern-order semantics.
+    expect(rs.hunkOwners(ref(0, 1))).toEqual(['c1', 'c2'])
+    expect(rs.hunkOwners(ref(1, 0))).toEqual(['c2'])
+    // A ref no concern claims: empty list, never undefined.
+    expect(rs.hunkOwners(ref(5, 0))).toEqual([])
+
+    // A fresh load (e.g. recovery/reload) must rebuild the index rather
+    // than leave stale owners from the previous session around.
+    fetchSessionMock.mockResolvedValue({
+      ...makeSession(),
+      concerns: [
+        { id: 'd1', title: 'D1', description: null, risk: null, unmapped: false, hunks: [ref(0, 0)] },
+      ],
+    })
+    await rs.load()
+    expect(rs.hunkOwners(ref(0, 0))).toEqual(['d1'])
+    expect(rs.hunkOwners(ref(0, 1))).toEqual([])
+  })
+
+  it('hunkOwners on an unloaded store returns an empty list, not a throw', () => {
+    const rs = new ReviewState()
+    expect(rs.hunkOwners(ref(0, 0))).toEqual([])
   })
 })

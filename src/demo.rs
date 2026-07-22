@@ -33,7 +33,8 @@ pub async fn run(args: DemoArgs) -> u8 {
     validate_concerns(&input).expect("embedded demo concerns fixture passes validation");
 
     let files = parse_unified_diff(DEMO_DIFF);
-    let mapping = resolve_mapping(&files, &input);
+    let mapping = resolve_mapping(&files, &input)
+        .expect("embedded demo fixture resolves within the default resource budget");
     // No git repo behind the demo: digests are still real, commit oids are
     // absent, and the submit-time HEAD re-check is skipped (repo_root: None).
     let snapshot = crate::snapshot::ReviewSnapshot::without_git("demo", &files, &input);
