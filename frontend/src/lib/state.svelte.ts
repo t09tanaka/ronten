@@ -371,7 +371,26 @@ export class ReviewState {
     // response for the id, the client would mark it saved, and whatever
     // changed between the two attempts would be silently lost. Same id must
     // always mean same bytes.
-    const draftSnapshot = structuredClone(this.draft)
+    // Plain `structuredClone(this.draft)` is not enough on its own:
+    // `this.draft` is a `$state` field, which under the real CLIENT compile
+    // is a Proxy with internal slots `structuredClone` refuses
+    // (`DataCloneError`) — it only appeared to work under vitest because
+    // Vite's SSR module pipeline compiles `$state` fields to plain objects,
+    // not proxies, there.
+    // `$state.snapshot` alone is not enough either: on the CLIENT compile it
+    // does a real deep clone (unwrapping the proxy), but the SERVER/SSR
+    // compile — the one vitest runs — optimizes `$state.snapshot(x)` away to
+    // the bare identity `x` (verified via `svelte/compiler`'s `compileModule`
+    // output), since server-side `$state` fields are already plain and the
+    // compiler assumes nothing needs unwrapping. Used alone under test, the
+    // "snapshot" would just be the same live object, silently reintroducing
+    // this exact bug in a way tests can't see.
+    // Composing both closes both gaps: `$state.snapshot` first strips any
+    // client-side proxy down to a plain object (a no-op under SSR), and the
+    // outer `structuredClone` then deep-clones that plain object for real —
+    // on the client it's a cheap redundant clone of already-plain data; on
+    // SSR/vitest it's what actually performs the clone.
+    const draftSnapshot = structuredClone($state.snapshot(this.draft))
     const revisionSnapshot = this.#revision
     try {
       let result: SaveDraftResult
@@ -524,6 +543,12 @@ export class ReviewState {
       if (result.missing && result.missing.length > 0) parts.push(result.missing.join(', '))
       if (result.details && result.details.length > 0) parts.push(result.details.join(', '))
       this.submitError = parts.join(': ')
+      // A clean validation error (e.g. 422) is a definite, known server
+      // response — proof the session is alive, same reasoning as the two
+      // liveness paths in #runSave above. Clear a standing outcome-unknown
+      // banner here too, so it doesn't linger after a response that
+      // actually resolved the ambiguity.
+      if (this.phase === 'outcome_unknown') this.phase = 'review'
       // Unlock before rescheduling: scheduleSave is a no-op while locked.
       this.#actionLocked = false
       // Make sure the latest draft still gets persisted now that the
