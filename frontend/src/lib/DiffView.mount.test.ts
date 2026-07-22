@@ -51,7 +51,13 @@ function baseSession(): Omit<Session, 'files' | 'concerns'> {
     warnings: [],
     draft: { concerns: {}, general_comments: [], acknowledgements: [] },
     draft_revision: 0,
-    limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
+    limits: {
+      max_comments: 500,
+      max_comment_chars: 10_000,
+      max_total_comments: 1000,
+      max_total_comment_chars: 1_500_000,
+      max_draft_bytes: 8 * 1024 * 1024,
+    },
     finished: null,
     unmapped_lines: [],
   }
@@ -145,7 +151,13 @@ function makeSession(): Session {
     warnings: [],
     draft: { concerns: {}, general_comments: [], acknowledgements: [] },
     draft_revision: 0,
-    limits: { max_comments: 500, max_comment_chars: 10_000, max_draft_bytes: 8 * 1024 * 1024 },
+    limits: {
+      max_comments: 500,
+      max_comment_chars: 10_000,
+      max_total_comments: 1000,
+      max_total_comment_chars: 1_500_000,
+      max_draft_bytes: 8 * 1024 * 1024,
+    },
     finished: null,
     unmapped_lines: [],
   }

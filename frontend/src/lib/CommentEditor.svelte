@@ -1,5 +1,6 @@
 <script lang="ts">
   import { commentTargetKey, rs } from './state.svelte'
+  import { scalarLength, truncateToScalars } from './textLimits'
   import type { Side } from './types'
 
   interface Props {
@@ -19,6 +20,14 @@
 
   const maxChars = $derived(rs.limits?.max_comment_chars)
 
+  // Truncates by Unicode scalar count, matching the server's
+  // `chars().count()` — NOT the native `maxlength` attribute, which counts
+  // UTF-16 code units and could split an astral character's surrogate pair
+  // (P1-6).
+  function setBody(v: string): void {
+    rs.setEditorBuffer(key, maxChars != null ? truncateToScalars(v, maxChars) : v)
+  }
+
   function add(): void {
     const trimmed = body.trim()
     if (!trimmed) return
@@ -35,17 +44,21 @@
 <div class="comment-editor">
   <!-- svelte-ignore a11y_autofocus -->
   <textarea
-    bind:value={() => body, (v) => rs.setEditorBuffer(key, v)}
+    bind:value={() => body, setBody}
     placeholder="Add a comment…"
     rows="3"
-    maxlength={maxChars}
     autofocus
   ></textarea>
-  {#if maxChars != null && body.length > maxChars * 0.9}
-    <span class="char-count">{body.length}/{maxChars}</span>
+  {#if maxChars != null && scalarLength(body) > maxChars * 0.9}
+    <span class="char-count">{scalarLength(body)}/{maxChars}</span>
   {/if}
   <div class="comment-editor-actions">
-    <button type="button" class="editor-add" onclick={add} disabled={!body.trim()}>Add comment</button>
+    <button
+      type="button"
+      class="editor-add"
+      onclick={add}
+      disabled={!body.trim() || rs.draftByteBlocked}>Add comment</button
+    >
     <button type="button" class="editor-cancel" onclick={cancel}>Cancel</button>
   </div>
 </div>

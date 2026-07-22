@@ -44,8 +44,28 @@ pub enum Phase {
 
 /// Maximum number of comments per concern (and of general comments).
 pub const MAX_COMMENTS: usize = 500;
-/// Maximum comment body length in characters.
+/// Maximum comment body length in characters (Unicode scalar values, i.e.
+/// `str::chars().count()` — NOT UTF-16 code units, which is what a browser's
+/// `String.prototype.length` counts; the frontend must count the same way
+/// for its limit to actually match this one, see P1-6).
 pub const MAX_COMMENT_CHARS: usize = 10_000;
+/// Review-wide cap on the total number of comments across every concern's
+/// comments AND the general comments — not just the per-concern/per-general
+/// `MAX_COMMENTS` above. This is what actually keeps a draft that satisfies
+/// every per-field limit submittable on the wire: per-concern/per-comment
+/// caps alone permit far more content than [`crate::server::MAX_BODY_BYTES`]
+/// (8 MiB) can carry (200 concerns x 500 comments x 10,000 chars is nowhere
+/// near submittable) — see P1-6.
+pub const MAX_TOTAL_COMMENTS: usize = 1000;
+/// Review-wide cap on the summed character length (Unicode scalars, same
+/// counting as [`MAX_COMMENT_CHARS`]) of every comment body — concern
+/// comments plus general comments together. Sized so a draft at every
+/// advertised limit still serializes under
+/// [`crate::server::MAX_BODY_BYTES`]: even at the UTF-8 worst case of 4
+/// bytes/scalar this is 6 MiB, leaving headroom under the 8 MiB body cap for
+/// JSON structure, paths, and anchors (see the `limits_are_wire_consistent`
+/// test in server.rs).
+pub const MAX_TOTAL_COMMENT_CHARS: usize = 1_500_000;
 
 /// The draft plus its monotonically increasing revision. Every accepted
 /// `PUT /draft` must present the current revision and bumps it by one, so
@@ -70,6 +90,10 @@ pub struct DraftSlot {
 pub struct Limits {
     pub max_comments: usize,
     pub max_comment_chars: usize,
+    /// See [`MAX_TOTAL_COMMENTS`].
+    pub max_total_comments: usize,
+    /// See [`MAX_TOTAL_COMMENT_CHARS`].
+    pub max_total_comment_chars: usize,
     pub max_draft_bytes: usize,
 }
 
@@ -414,14 +438,86 @@ impl SessionState {
         anchors
     }
 
+    /// Resource-only violations across the whole draft: per-concern and
+    /// per-general comment counts (`MAX_COMMENTS`), per-comment body length
+    /// (`MAX_COMMENT_CHARS`), and the two review-wide totals
+    /// (`MAX_TOTAL_COMMENTS`/`MAX_TOTAL_COMMENT_CHARS`). Deliberately
+    /// excludes everything [`validate_draft`](Self::validate_draft)
+    /// additionally checks — blank bodies, anchor validity, unknown concern
+    /// ids, acknowledgements — those are meaningful only at submit time.
+    /// `PUT /draft` runs only this narrower check, so the draft stays a
+    /// lenient scratchpad while still being kept truthfully within the
+    /// limits advertised to the UI (and therefore always submittable on the
+    /// wire — see P1-6).
+    pub fn resource_cap_violations(&self, draft: &Draft) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut total_comments = 0usize;
+        let mut total_chars = 0usize;
+
+        let mut ids: Vec<&String> = draft.concerns.keys().collect();
+        ids.sort();
+        for id in ids {
+            let cd = &draft.concerns[id];
+            total_comments += cd.comments.len();
+            if cd.comments.len() > MAX_COMMENTS {
+                violations.push(format!(
+                    "concern {id:?}: too many comments: {} (maximum {MAX_COMMENTS})",
+                    cd.comments.len()
+                ));
+            }
+            for c in &cd.comments {
+                let n = c.body.chars().count();
+                total_chars += n;
+                if n > MAX_COMMENT_CHARS {
+                    violations.push(format!(
+                        "concern {id:?}: comment body at {}:{}:{} exceeds {MAX_COMMENT_CHARS} characters",
+                        c.path, side_name(c.side), c.line
+                    ));
+                }
+            }
+        }
+
+        total_comments += draft.general_comments.len();
+        if draft.general_comments.len() > MAX_COMMENTS {
+            violations.push(format!(
+                "too many general comments: {} (maximum {MAX_COMMENTS})",
+                draft.general_comments.len()
+            ));
+        }
+        for (i, g) in draft.general_comments.iter().enumerate() {
+            let n = g.chars().count();
+            total_chars += n;
+            if n > MAX_COMMENT_CHARS {
+                violations.push(format!(
+                    "general comment #{}: exceeds {MAX_COMMENT_CHARS} characters",
+                    i + 1
+                ));
+            }
+        }
+
+        if total_comments > MAX_TOTAL_COMMENTS {
+            violations.push(format!(
+                "too many comments across the review: {total_comments} (maximum {MAX_TOTAL_COMMENTS})"
+            ));
+        }
+        if total_chars > MAX_TOTAL_COMMENT_CHARS {
+            violations.push(format!(
+                "too many comment characters across the review: {total_chars} (maximum {MAX_TOTAL_COMMENT_CHARS})"
+            ));
+        }
+
+        violations
+    }
+
     /// Fully validates a draft against the session's contract before submit:
     /// unknown concern ids, comment anchors outside the concern's assigned
-    /// hunks, blank or oversized bodies, and comment-count limits. Returns
+    /// hunks, blank bodies, and the resource caps from
+    /// [`resource_cap_violations`](Self::resource_cap_violations). Returns
     /// human-readable violation descriptions (empty = valid). `PUT /draft`
-    /// deliberately skips this — the draft is a lenient scratchpad — so
-    /// submit must always run the full check.
+    /// runs only the narrower resource check — the draft is otherwise a
+    /// lenient scratchpad — so submit must always run this full check.
     pub fn validate_draft(&self, draft: &Draft) -> Vec<String> {
-        let mut violations = Vec::new();
+        let mut violations = self.resource_cap_violations(draft);
         let required: HashSet<String> = self.required_ids().into_iter().collect();
         // Mirrors the frontend's `isVerdictConfirmed` (frontend/src/lib/confirmation.ts):
         // a request-changes verdict needs a reason, either a comment on the
@@ -445,10 +541,9 @@ impl SessionState {
                 ));
             }
             if cd.comments.len() > MAX_COMMENTS {
-                violations.push(format!(
-                    "concern {id:?}: too many comments: {} (maximum {MAX_COMMENTS})",
-                    cd.comments.len()
-                ));
+                // Already recorded by resource_cap_violations above; skip
+                // the (potentially huge) anchor/blank pass below for this
+                // concern.
                 continue;
             }
             let anchors = self.valid_anchors_for(id);
@@ -456,10 +551,6 @@ impl SessionState {
                 let at = format!("{}:{}:{}", c.path, side_name(c.side), c.line);
                 if c.body.trim().is_empty() {
                     violations.push(format!("concern {id:?}: blank comment body at {at}"));
-                } else if c.body.chars().count() > MAX_COMMENT_CHARS {
-                    violations.push(format!(
-                        "concern {id:?}: comment body at {at} exceeds {MAX_COMMENT_CHARS} characters"
-                    ));
                 }
                 if !anchors.contains(&(c.path.as_str(), c.side, c.line)) {
                     violations.push(format!(
@@ -469,20 +560,10 @@ impl SessionState {
             }
         }
 
-        if draft.general_comments.len() > MAX_COMMENTS {
-            violations.push(format!(
-                "too many general comments: {} (maximum {MAX_COMMENTS})",
-                draft.general_comments.len()
-            ));
-        } else {
+        if draft.general_comments.len() <= MAX_COMMENTS {
             for (i, g) in draft.general_comments.iter().enumerate() {
                 if g.trim().is_empty() {
                     violations.push(format!("general comment #{}: blank body", i + 1));
-                } else if g.chars().count() > MAX_COMMENT_CHARS {
-                    violations.push(format!(
-                        "general comment #{}: exceeds {MAX_COMMENT_CHARS} characters",
-                        i + 1
-                    ));
                 }
             }
         }

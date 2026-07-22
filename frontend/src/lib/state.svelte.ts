@@ -3,6 +3,7 @@
 import { SvelteMap } from 'svelte/reactivity'
 import { abortSession, fetchSession, saveDraft, submit } from './api'
 import { isVerdictConfirmed } from './confirmation'
+import { scalarLength } from './textLimits'
 import type {
   Comment,
   ConcernDraft,
@@ -114,6 +115,61 @@ export class ReviewState {
   /** Server-side validation limits (null until the session has loaded). */
   get limits() {
     return this.session?.limits ?? null
+  }
+
+  /** Bytes the draft would take on the wire — `JSON.stringify` + UTF-8 byte
+   * count via `TextEncoder`, the same measure `PUT /draft`'s body-size cap
+   * (`limits.max_draft_bytes`) is checked against server-side. Recomputed
+   * from `this.draft` on every access, but that's cheap in practice:
+   * `draft` itself only changes on a committed mutation (add/remove
+   * comment, set verdict, toggle ack), never on every keystroke — in-
+   * progress text lives in `editorBuffers` instead (see its own doc
+   * comment), so this never runs on a keystroke cadence. */
+  get draftByteSize(): number {
+    return new TextEncoder().encode(JSON.stringify(this.draft)).length
+  }
+
+  /** `draftByteSize` / `limits.max_draft_bytes`, or `null` before the
+   * session (and its limits) has loaded. */
+  get draftByteUsageRatio(): number | null {
+    const max = this.limits?.max_draft_bytes
+    if (!max) return null
+    return this.draftByteSize / max
+  }
+
+  /** True once the draft is within 10% of the wire body-size cap — the UI
+   * should warn but not yet block. */
+  get draftByteWarning(): boolean {
+    return (this.draftByteUsageRatio ?? 0) >= 0.9
+  }
+
+  /** True once the draft is at (or over) the wire body-size cap —
+   * `addComment`/`addGeneralComment` refuse further growth while this is
+   * true, so a draft this store holds can never itself become
+   * unsubmittable on size grounds alone. */
+  get draftByteBlocked(): boolean {
+    return (this.draftByteUsageRatio ?? 0) >= 1
+  }
+
+  /** Total comments across every concern plus general comments — what the
+   * server checks against `limits.max_total_comments` (see
+   * `MAX_TOTAL_COMMENTS` in session.rs, P1-6). */
+  get totalCommentCount(): number {
+    let n = this.draft.general_comments.length
+    for (const cd of Object.values(this.draft.concerns)) n += cd.comments.length
+    return n
+  }
+
+  /** Total comment-body characters (Unicode scalars, matching the server's
+   * `chars().count()`) across every concern plus general comments — what
+   * the server checks against `limits.max_total_comment_chars`. */
+  get totalCommentChars(): number {
+    let n = 0
+    for (const g of this.draft.general_comments) n += scalarLength(g)
+    for (const cd of Object.values(this.draft.concerns)) {
+      for (const c of cd.comments) n += scalarLength(c.body)
+    }
+    return n
   }
 
   get selected(): ConcernView | null {
@@ -260,7 +316,7 @@ export class ReviewState {
   }
 
   addComment(id: string, c: Comment): void {
-    if (this.#locked) return
+    if (this.#locked || this.draftByteBlocked) return
     this.#ensureConcernDraft(id).comments.push(c)
     this.scheduleSave()
   }
@@ -272,7 +328,7 @@ export class ReviewState {
   }
 
   addGeneralComment(body: string): void {
-    if (this.#locked) return
+    if (this.#locked || this.draftByteBlocked) return
     const trimmed = body.trim()
     if (!trimmed) return
     this.draft.general_comments.push(trimmed)

@@ -142,6 +142,14 @@ export interface Warning {
 export interface Limits {
   max_comments: number
   max_comment_chars: number
+  /** Review-wide cap on the total number of comments across every concern
+   * plus general comments — not just the per-concern/per-general
+   * `max_comments` above (see `MAX_TOTAL_COMMENTS` in session.rs, P1-6). */
+  max_total_comments: number
+  /** Review-wide cap on the summed character length of every comment body
+   * (same Unicode-scalar counting as `max_comment_chars`) — see
+   * `MAX_TOTAL_COMMENT_CHARS` in session.rs, P1-6. */
+  max_total_comment_chars: number
   max_draft_bytes: number
 }
 
