@@ -667,12 +667,25 @@ fn wait_with_timeout(
     })
 }
 
-/// Runs `cmd` to completion under [`GIT_TIMEOUT`] with stdin closed.
-fn timed_output(mut cmd: std::process::Command) -> std::io::Result<std::process::Output> {
+/// Runs `cmd` to completion under a caller-supplied `timeout`, with stdin
+/// closed. Shared by [`timed_output`] (the [`GIT_TIMEOUT`] default, used by
+/// every plumbing call in this module except the one below) and
+/// [`rev_parse_commit_with_deadline`] (a shorter, caller-chosen deadline for
+/// the submit-path freshness check, which must fail fast enough to stay
+/// under the server's own request timeout).
+fn timed_output_with_deadline(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    wait_with_timeout(cmd.spawn()?, GIT_TIMEOUT)
+    wait_with_timeout(cmd.spawn()?, timeout)
+}
+
+/// Runs `cmd` to completion under [`GIT_TIMEOUT`] with stdin closed.
+fn timed_output(cmd: std::process::Command) -> std::io::Result<std::process::Output> {
+    timed_output_with_deadline(cmd, GIT_TIMEOUT)
 }
 
 /// Repo root of cwd, or `NotARepo`. Uses `git rev-parse --show-toplevel`.
@@ -1053,6 +1066,21 @@ pub(crate) fn is_tracked(root: &std::path::Path, rel_path: &str) -> Result<bool,
 /// doesn't resolve), that's `BadBase` here; callers resolving `HEAD` remap
 /// that to `GitFailed` since `HEAD` is never the user-supplied base.
 pub(crate) fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<String, GitError> {
+    rev_parse_commit_with_deadline(root, rev, GIT_TIMEOUT)
+}
+
+/// Same as [`rev_parse_commit`], under a caller-chosen `timeout` instead of
+/// the [`GIT_TIMEOUT`] default. `check_head_freshness` in `server.rs` uses
+/// this with a short deadline: the timeout hierarchy for a submit must be
+/// internal-deadline < server request timeout < client timeout, so this
+/// single rev-parse (the only git call on the submit path) has to fail well
+/// inside the server's own request timeout rather than sharing the generous
+/// 60s budget the initial diff computation gets.
+pub(crate) fn rev_parse_commit_with_deadline(
+    root: &std::path::Path,
+    rev: &str,
+    timeout: std::time::Duration,
+) -> Result<String, GitError> {
     let mut cmd = git_cmd(root);
     cmd.args([
         "rev-parse",
@@ -1060,7 +1088,8 @@ pub(crate) fn rev_parse_commit(root: &std::path::Path, rev: &str) -> Result<Stri
         "--end-of-options",
         &format!("{rev}^{{commit}}"),
     ]);
-    let output = timed_output(cmd).map_err(|e| GitError::GitFailed(e.to_string()))?;
+    let output =
+        timed_output_with_deadline(cmd, timeout).map_err(|e| GitError::GitFailed(e.to_string()))?;
     if !output.status.success() {
         return Err(GitError::BadBase(
             String::from_utf8_lossy(&output.stderr).to_string(),
@@ -2752,6 +2781,48 @@ mod git_tests {
             "kill took too long: {:?}",
             start.elapsed()
         );
+    }
+
+    /// `rev_parse_commit_with_deadline` must honor whatever timeout its
+    /// caller passes rather than always falling back to the 60s
+    /// [`GIT_TIMEOUT`] default — that's the whole point of adding it:
+    /// `check_head_freshness` in `server.rs` needs a 10s deadline so a
+    /// wedged rev-parse can't hold the submit past the server's own 30s
+    /// request timeout, let alone the client's 40s.
+    ///
+    /// Spawning a genuinely wedged `git` process would mean swapping `git`
+    /// out on `PATH` for the duration of the test, which is a process-wide
+    /// mutation that would race every other test in this module that shells
+    /// out to a real `git` concurrently. Instead this exercises
+    /// `timed_output_with_deadline` — the exact spawn-with-piped-io-then-wait
+    /// helper `rev_parse_commit_with_deadline` calls with its `timeout`
+    /// argument — the same way `wedged_subprocess_is_killed_at_the_deadline`
+    /// above substitutes `sleep` for `wait_with_timeout` directly.
+    #[cfg(unix)]
+    #[test]
+    fn rev_parse_honors_short_deadline() {
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("60");
+        let start = std::time::Instant::now();
+        let err =
+            timed_output_with_deadline(cmd, std::time::Duration::from_millis(100)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "kill took too long: {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The 60s diff-computation path must keep its generous default: passing
+    /// a real, fast rev-parse through `rev_parse_commit` (which delegates to
+    /// `rev_parse_commit_with_deadline(.., GIT_TIMEOUT)`) still succeeds —
+    /// adding the deadline parameter must not have narrowed the default.
+    #[test]
+    fn rev_parse_commit_default_still_resolves_head() {
+        let td = base_repo();
+        let head = rev_parse_commit(td.path(), "HEAD").unwrap();
+        assert_eq!(head.len(), 40, "expected a full oid, got {head:?}");
     }
 
     #[test]

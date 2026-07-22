@@ -313,7 +313,9 @@ The UI is keyboard-first — a full review pass is possible without a mouse:
 - Every session gets a random per-session token embedded in the URL path
   (`/r/<token>`); all API routes require it, preventing same-machine snooping or forged
   submissions via port scanning.
-- Submission is accepted once per process lifetime; a second `submit` call gets `409`.
+- Submission is accepted once per process lifetime; a second `submit` call with a
+  different mutation id gets `409` (a repeat call with the *same* mutation id — a
+  retry of a lost response — replays the original outcome instead).
 
 **Trust boundary**: the token (together with the localhost bind and single-submit rule)
 protects against port scanning and accidental access by other processes on the same

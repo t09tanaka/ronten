@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { saveDraft } from './api'
+import { saveDraft, submit } from './api'
 import type { Draft } from './types'
 
 const draft: Draft = { concerns: {}, general_comments: ['hi'], acknowledged_opaque: [] }
@@ -22,17 +22,21 @@ afterEach(() => {
 })
 
 describe('saveDraft', () => {
-  it('sends the revision alongside the draft and returns the new one', async () => {
+  it('sends the revision and mutation id alongside the draft and returns the new revision', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { revision: 4 }))
     vi.stubGlobal('fetch', fetchMock)
 
-    const result = await saveDraft(draft, 3)
+    const result = await saveDraft(draft, 3, 'mutation-a')
 
     expect(result).toEqual({ ok: true, revision: 4 })
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
     expect(url).toBe('/api/tok123/draft')
     expect(init.method).toBe('PUT')
-    expect(JSON.parse(init.body as string)).toEqual({ revision: 3, draft })
+    expect(JSON.parse(init.body as string)).toEqual({
+      revision: 3,
+      draft,
+      mutation_id: 'mutation-a',
+    })
   })
 
   it('returns a draft conflict 409 as a result instead of throwing', async () => {
@@ -43,7 +47,7 @@ describe('saveDraft', () => {
     }
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(409, body)))
 
-    const result = await saveDraft(draft, 3)
+    const result = await saveDraft(draft, 3, 'mutation-a')
 
     expect(result).toEqual({ ok: false, ...body })
   })
@@ -54,7 +58,7 @@ describe('saveDraft', () => {
       vi.fn().mockResolvedValue(jsonResponse(409, { error: 'already submitted' })),
     )
 
-    const result = await saveDraft(draft, 3)
+    const result = await saveDraft(draft, 3, 'mutation-a')
 
     expect(result).toEqual({ ok: false, error: 'already submitted' })
   })
@@ -65,10 +69,10 @@ describe('saveDraft', () => {
       vi.fn().mockResolvedValue(jsonResponse(413, { error: 'payload too large', details: [] })),
     )
 
-    await expect(saveDraft(draft, 3)).rejects.toThrow('saveDraft failed: 413')
+    await expect(saveDraft(draft, 3, 'mutation-a')).rejects.toThrow('saveDraft failed: 413')
   })
 
-  it('aborts a stalled request after the 15s timeout', async () => {
+  it('aborts a stalled request after the 40s timeout', async () => {
     vi.useFakeTimers()
     const fetchMock = vi.fn(
       (_url: string, init?: RequestInit) =>
@@ -80,9 +84,28 @@ describe('saveDraft', () => {
     )
     vi.stubGlobal('fetch', fetchMock)
 
-    const pending = saveDraft(draft, 3)
+    const pending = saveDraft(draft, 3, 'mutation-a')
     const assertion = expect(pending).rejects.toThrow(/abort/i)
-    await vi.advanceTimersByTimeAsync(15_000)
+    await vi.advanceTimersByTimeAsync(40_000)
     await assertion
+  })
+})
+
+describe('submit', () => {
+  it('sends the revision and mutation id alongside the draft', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { ok: true }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await submit(draft, 3, 'mutation-b')
+
+    expect(result).toEqual({ ok: true })
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    expect(url).toBe('/api/tok123/submit')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({
+      revision: 3,
+      draft,
+      mutation_id: 'mutation-b',
+    })
   })
 })

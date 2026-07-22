@@ -51,6 +51,7 @@ pub async fn run(args: DemoArgs) -> u8 {
         snapshot,
         repo_root: None,
         started_at: chrono::Utc::now(),
+        deadline_at: None,
         phase: Mutex::new(Phase::Reviewing(DraftSlot::default())),
         outcome_tx: tx,
     });
