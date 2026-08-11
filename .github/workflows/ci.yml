@@ -34,7 +34,7 @@ jobs:
           # is what CI actually resolves, so the two must agree.
           toolchain: "1.92.0"
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -59,7 +59,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # (same pinned action commit)
         with:
           toolchain: "1.85"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
       - name: Check at MSRV
         # `cargo check` still runs build.rs (which shells out to npm), hence
         # setup-node here too — kept as a single straightforward step rather
@@ -91,7 +91,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch
         with:
           toolchain: "1.92.0"
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
       - name: Build frontend dist
         run: cargo build --locked
       - name: Verify build didn't modify tracked files
